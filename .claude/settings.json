@@ -1,0 +1,39 @@
+{
+  "$schema_comment": "Hooks que automatizan la verificación. El harness los ejecuta, no el agente, así que no se pueden saltar.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f Cargo.toml ] && cargo check --quiet --all-targets 2>&1 | tail -20 || echo '[hook] Cargo.toml no existe aún — se omite cargo check (ver feature scaffolding)'",
+            "description": "Tras editar o escribir archivos, compila en modo check (rápido) y muestra los últimos errores/warnings, sin correr la suite completa de tests."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./init.sh > /tmp/harness_init.log 2>&1 && echo '[harness] init.sh OK' || (echo '[harness] init.sh FALLÓ — revisa /tmp/harness_init.log antes de cerrar' && cat /tmp/harness_init.log | tail -20)",
+            "description": "Antes de cerrar la sesión, fuerza una verificación completa (fmt, clippy, test, doc) vía init.sh."
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(./init.sh)",
+      "Bash(cargo build*)",
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo doc*)"
+    ]
+  }
+}

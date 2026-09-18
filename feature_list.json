@@ -1,0 +1,172 @@
+{
+  "project": "gateway",
+  "description": "API Manager / Gateway: único componente público de la plataforma. Hace el login OIDC contra Google (RF-01), centraliza el enrutamiento hacia ms-usuarios y el Broker ocultando su ubicación real (RF-09/RF-10), encola solicitudes de escaneo validadas (RF-02/RF-03/RF-04), relaya su estado en tiempo real vía SSE (RF-07/RF-08), aplica rate limiting por usuario (RF-12) y documenta su API (RNF-08).",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "valid_status": ["pending", "in_progress", "done", "blocked"]
+  },
+  "features": [
+    {
+      "id": 1,
+      "name": "scaffolding",
+      "title": "Scaffolding del crate Rust",
+      "description": "Inicializar el crate Rust con tokio, axum, lapin, tracing y la estructura de módulos base (lib + main delgado).",
+      "acceptance": [
+        "Existe Cargo.toml (edition 2021 o superior) con dependencias: tokio (rt-multi-thread, macros), axum, lapin (con soporte TLS/rustls), tracing, tracing-subscriber, serde (derive), serde_json",
+        "El crate expone src/lib.rs con los módulos (config, domain, auth, usuarios_client, broker, realtime, api) declarados pub, para que los tests de integración en tests/ puedan importarlos",
+        "src/main.rs es un envoltorio delgado: inicializa el runtime tokio y tracing_subscriber, y llama a una función pública de la lib (p. ej. lib::run()) para el resto de la lógica",
+        "src/lib.rs (o el módulo raíz) activa #![deny(missing_docs)] para forzar rustdoc en todo ítem público futuro",
+        "Cargo.toml incluye testcontainers como dev-dependency",
+        "cargo build compila sin warnings"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 2,
+      "name": "config",
+      "title": "Configuración del servicio",
+      "description": "Carga y valida la configuración del servicio desde variables de entorno: OAuth de Google, secreto de sesión propia, Broker (AMQPS) y ms-usuarios.",
+      "acceptance": [
+        "src/config.rs carga desde variables de entorno: HTTP_HOST/HTTP_PORT, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, SESSION_SIGNING_KEY, SESSION_TTL_SECS, BROKER_AMQPS_URL, BROKER_VHOST, MS_USUARIOS_BASE_URL, MS_USUARIOS_SHARED_SECRET — y devuelve un error explícito si falta una requerida, sin panics",
+        "GOOGLE_CLIENT_SECRET, SESSION_SIGNING_KEY, BROKER_AMQPS_URL (contiene la credencial) y MS_USUARIOS_SHARED_SECRET usan un tipo que redacta su contenido en Debug/Display (p. ej. secrecy::SecretString)",
+        "Ningún valor de configuración queda hardcodeado en el código",
+        "Test cubre: config válida se carga correctamente; falta cada variable requerida produce un error tipado; Debug no filtra ningún secreto"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 3,
+      "name": "oidc_login",
+      "title": "Login delegado en Google OIDC y emisión de sesión propia",
+      "description": "Flujo completo de login: redirección a Google, callback, validación del ID token, y emisión de la sesión propia de Gateway como cookie HttpOnly.",
+      "acceptance": [
+        "GET /auth/login redirige (302) al endpoint de autorización de Google con los parámetros OIDC correctos (client_id, redirect_uri, scope openid email profile, state anti-CSRF)",
+        "GET /auth/callback intercambia el código por tokens, valida el ID token de Google (firma vía JWKS, aud, iss, exp) usando la crate openidconnect, y rechaza (401/400) un token inválido/expirado/con audiencia incorrecta sin crear sesión",
+        "Tras validar, se emite una sesión propia firmada (jsonwebtoken) con la identidad (sub, email, nombre) y un exp acorde a SESSION_TTL_SECS, entregada como cookie HttpOnly + Secure + SameSite=Strict",
+        "El parámetro state se valida contra un valor generado en /auth/login (rechaza un callback con state ausente o no coincidente, mitigación CSRF)",
+        "El ID token de Google se descarta tras extraer la identidad: no se persiste, no se loggea, no se reenvía en ninguna respuesta",
+        "POST /auth/logout invalida la sesión del lado del navegador (borra la cookie)",
+        "Tests de integración (#[ignore = \"requiere Docker\"] si usan un contenedor, o un servidor HTTP de test en memoria si no): callback con ID token válido (firmado con una clave JWKS de prueba) crea sesión; ID token con audiencia incorrecta, expirado, o firma inválida es rechazado; state ausente/incorrecto es rechazado; logout borra la cookie"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 4,
+      "name": "session_middleware_and_me",
+      "title": "Middleware de sesión y GET /api/me",
+      "description": "Middleware axum que exige sesión propia válida en toda ruta protegida, y el endpoint que expone la identidad de la sesión activa a front.",
+      "acceptance": [
+        "src/auth expone un middleware axum que extrae y valida la cookie de sesión (firma, exp, aud, iss propios de este Gateway — RNF-02) antes de dejar pasar a una ruta protegida; una sesión ausente/inválida/expirada responde 401 sin ejecutar el handler",
+        "GET /api/me es una ruta protegida que devuelve la identidad de la sesión activa (sub/email/nombre), sin tocar ms-usuarios en esta feature",
+        "Las rutas /auth/login, /auth/callback y una ruta de salud quedan explícitamente fuera del middleware (públicas)",
+        "Ninguna ruta nueva queda protegida u desprotegida por accidente: existe un test que enumera las rutas del router y verifica cuáles llevan el middleware",
+        "Tests de integración: sesión válida accede a /api/me y recibe la identidad correcta; sesión ausente, con firma inválida, o expirada recibe 401 en una ruta protegida de ejemplo"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 5,
+      "name": "usuarios_profile_proxy",
+      "title": "Proxy síncrono hacia el perfil de ms-usuarios",
+      "description": "Único módulo que llama a ms-usuarios; expone el perfil del usuario autenticado sin revelar la URL/tecnología interna a front.",
+      "acceptance": [
+        "src/usuarios_client expone get_profile(identity) y upsert_profile(identity, ...) que llaman a ms-usuarios (PUT/GET /users/me, ver user-service/docs) reenviando el header de identidad + MS_USUARIOS_SHARED_SECRET",
+        "Ningún otro módulo de este repo hace una petición HTTP directa hacia ms-usuarios",
+        "Un fallo de red o un 5xx de ms-usuarios se traduce en un error tipado (UsuariosClientError) y una respuesta 502/504 hacia el cliente, nunca un panic ni la URL interna expuesta en el cuerpo de error",
+        "GET /api/profile (ruta protegida) usa este cliente y devuelve el perfil del usuario de la sesión activa",
+        "Tests de integración: contra un servidor HTTP de test que implementa el contrato documentado de ms-usuarios — camino feliz, credencial de servicio incorrecta simulada como 401 de ms-usuarios, ms-usuarios caído simula 502/504 sin panic"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 6,
+      "name": "scan_submission",
+      "title": "Validación y encolado de una solicitud de escaneo",
+      "description": "Valida el formato de IP/rango, resuelve (vía ms-usuarios) los campos que exige ScanRequest, registra el histórico y publica en el Broker, devolviendo el scanId de inmediato (RNF-04).",
+      "acceptance": [
+        "POST /api/scans (ruta protegida) valida el formato de IP/CIDR del body (RF-02/RF-03) y responde 400 con un mensaje específico si es inválido, sin llegar a tocar ms-usuarios ni el Broker",
+        "Genera un correlation_id/scanId propio antes de cualquier llamada externa",
+        "Intenta resolver network_user/ssh_credentials_ref/has_sudo llamando a ms-usuarios; si esa API todavía no existe o no hay credenciales configuradas para el usuario/objetivo (ver docs/architecture.md §Dependencia pendiente), responde un error explícito y tipado (p. ej. 501/422 con motivo claro) — nunca un valor inventado ni un default",
+        "Cuando esos 3 campos sí se resuelven: registra la entrada de histórico (llamando al endpoint correspondiente de ms-usuarios, estado inicial Pendiente) y publica un ScanRequest válido contra broker/contracts/scan-request.schema.json en el exchange scan.requests (routing key scan.request)",
+        "La respuesta HTTP (scanId) se devuelve tan pronto se confirma el registro de histórico + la publicación, sin esperar ningún desenlace del escaneo",
+        "Un fallo al publicar en el Broker tras haber registrado el histórico se refleja actualizando ese registro a Fallido (nunca deja una entrada Pendiente huérfana) y se reporta como error al cliente",
+        "Tests de integración (#[ignore = \"requiere Docker\"]): IP/CIDR inválido -> 400 sin llamadas externas; dependencia de ms-usuarios no disponible -> error explícito documentado; camino feliz (con un stub de ms-usuarios que sí resuelve los 3 campos) publica un ScanRequest verificable en una cola de test bindeada a scan.requests y devuelve el scanId"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 7,
+      "name": "scan_outcome_relay",
+      "title": "Consumo de ScanOutcome y relay en tiempo real (SSE)",
+      "description": "Consume gateway.scan-outcomes, actualiza el histórico en ms-usuarios y relaya cada evento a los clientes SSE suscritos al scanId correspondiente (RF-07/RF-08).",
+      "acceptance": [
+        "src/broker consume la cola gateway.scan-outcomes (bindeada a scan.outcome.#) y decodifica cada mensaje contra broker/contracts/scan-outcome.schema.json (started/completed/failed)",
+        "Cada evento consumido actualiza el estado del scan_id correspondiente en ms-usuarios (llamando al endpoint de actualización de estado que documenta user-service) — un fallo de esa llamada se loggea y no bloquea el ack del mensaje ni el relay SSE (best-effort, documentado)",
+        "GET /api/scans/{scan_id}/events (ruta protegida) abre un stream SSE que emite cada evento nuevo del scan_id dado hasta alcanzar un estado terminal (completed/failed), y se cierra ordenadamente al llegar a uno",
+        "Un cliente SSE solo puede suscribirse a un scan_id que pertenezca a la sesión activa (verificado contra ms-usuarios o contra el correlation_id ya conocido de la sesión) — nunca a un scan_id de otro usuario",
+        "Un mensaje malformado en la cola se descarta con un log (sin credenciales) y no tumba el consumidor",
+        "Tests de integración (#[ignore = \"requiere Docker\"]): publicar manualmente started/completed/failed en la cola de test y verificar que el stream SSE los recibe en orden; un scan_id de otro usuario es rechazado; mensaje malformado no tumba el consumidor"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 8,
+      "name": "scan_history_and_cancellation",
+      "title": "Histórico y cancelación de escaneos",
+      "description": "Proxy del histórico de escaneos del usuario (RF-13) y endpoint de cancelación que publica ScanCancellation (RF-14).",
+      "acceptance": [
+        "GET /api/scans (ruta protegida) devuelve el histórico del usuario de la sesión activa, proxeando a ms-usuarios vía usuarios_client",
+        "POST /api/scans/{scan_id}/cancel (ruta protegida) verifica que el scan_id pertenece al usuario de la sesión, publica un ScanCancellation válido contra broker/contracts/scan-cancellation.schema.json (correlation_id = scan_id, requested_by = identidad de la sesión) en el exchange scan.cancellations",
+        "Cancelar un scan_id que no pertenece al usuario responde 404 (nunca revela que existe pero es de otro usuario)",
+        "Cancelar un scan_id que ya está en estado terminal (completed/failed) responde un error explícito sin publicar nada al Broker",
+        "Tests de integración (#[ignore = \"requiere Docker\"]): histórico devuelve las entradas del usuario correcto; cancelación de un scan propio en curso publica el mensaje verificable en una cola de test bindeada a scan.cancellations; cancelación de scan ajeno -> 404; cancelación de scan ya terminado -> error sin publicar"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 9,
+      "name": "rate_limiting",
+      "title": "Rate limiting por usuario en el encolado de escaneos",
+      "description": "Aplica un límite de tasa por usuario (no por IP) sobre POST /api/scans para evitar saturar los workers internos (RF-12).",
+      "acceptance": [
+        "Middleware de rate limiting (p. ej. tower_governor) aplicado a POST /api/scans, con la identidad de la sesión (no la IP) como clave del límite",
+        "El umbral (solicitudes por ventana de tiempo) es configurable vía Config, sin valor hardcodeado",
+        "Exceder el límite responde 429 con un mensaje explícito, sin publicar nada al Broker ni tocar ms-usuarios",
+        "Dos usuarios distintos con sesiones válidas tienen contadores independientes: uno alcanzando su límite no afecta al otro",
+        "Tests de integración: un usuario que excede el umbral recibe 429 en la solicitud que lo supera; un segundo usuario en paralelo sigue recibiendo 200/202 normalmente"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 10,
+      "name": "openapi_docs",
+      "title": "Documentación OpenAPI de la API pública",
+      "description": "Genera y expone la especificación OpenAPI/Swagger de toda ruta pública de este Gateway (RNF-08), derivada del propio código.",
+      "acceptance": [
+        "Toda ruta pública definida hasta esta feature (auth, /api/me, perfil, escaneos, cancelación, SSE) tiene su anotación OpenAPI (p. ej. vía utoipa) con request/response documentados",
+        "GET /api/openapi.json (o ruta equivalente, pública) sirve la especificación generada",
+        "Una ruta nueva sin su anotación OpenAPI hace fallar un test (no queda documentación desactualizada en silencio)",
+        "Test verifica que la especificación generada es JSON válido y lista todas las rutas públicas esperadas"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": 11,
+      "name": "containerization",
+      "title": "Imagen Docker de producción de gateway",
+      "description": "Dockerfile multi-stage que compila el binario gateway y produce una imagen final mínima, mismo patrón que nmap-service/user-service.",
+      "acceptance": [
+        "Existe Dockerfile multi-stage en la raíz: stage builder con la toolchain Rust que hace cargo build --release, stage final mínimo (distroless/cc o debian-slim) con solo el binario gateway y certificados CA (TLS saliente hacia Google, ms-usuarios y el Broker)",
+        "La imagen final no contiene toolchain de compilación ni código fuente",
+        "El contenedor corre como usuario no-root",
+        "El binario lee toda su configuración de variables de entorno (ya cubierto por config, feature 2); se documentan en README las env vars requeridas para docker run",
+        "Existe .dockerignore que excluye al menos target/, .git/, .claude/, progress/, docs/",
+        "Las imágenes base están fijadas por tag concreto (no latest), idealmente por digest",
+        "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
+        "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no, y la nota ya existente sobre terminación TLS pública fuera de este binario)"
+      ],
+      "status": "pending"
+    }
+  ]
+}
