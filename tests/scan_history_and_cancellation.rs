@@ -1,27 +1,27 @@
-//! Tests de integración de la feature `scan_submission`, `POST /api/scans`.
+//! Tests de integración de la feature `scan_history_and_cancellation`.
 //!
-//! Ejercen el router real de `gateway::api::app_router` servido sobre un
-//! puerto efímero con `axum::serve` (mismo patrón que
-//! `tests/usuarios_profile_proxy.rs`), con `AppState::usuarios_client`
-//! apuntando a un stub HTTP real de `ms-usuarios` y
-//! `AppState::broker_publisher` a un `gateway::broker::BrokerPublisher`
-//! real (o a un doble de prueba que nunca debe invocarse, según el
-//! escenario) — nunca a `user-service`/al Broker de producción (ver
-//! `docs/verification.md` Nivel 3).
-//!
-//! Solo el escenario de "camino feliz" necesita un RabbitMQ real
-//! (`testcontainers`, `#[ignore = "requiere Docker"]`, ver
-//! `docs/conventions.md`): los otros dos escenarios (IP/CIDR inválido,
-//! dependencia de `ms-usuarios` no disponible) nunca llegan a tocar el
-//! Broker, así que corren en `cargo test` normal con un doble de prueba que
-//! haría panic si se invocara.
+//! - `GET /api/scans` (histórico): ejerce el router real de
+//!   `gateway::api::app_router` contra un stub HTTP real de `ms-usuarios`
+//!   (`GET /users/me/scans`), con `AppState::scan_ownership` poblado a mano
+//!   para verificar tanto el caso con `scanId` propio conocido como el caso
+//!   sin mapeo (campo ausente). No necesita Docker.
+//! - `POST /api/scans/{scan_id}/cancel` de un scan ajeno o inexistente (404)
+//!   y de un scan ya terminado (409, sin publicar nada) tampoco necesitan
+//!   Docker: nunca llegan a publicar en el Broker (doble de prueba que haría
+//!   panic si se invocara).
+//! - `POST /api/scans/{scan_id}/cancel` de un scan propio en curso sí
+//!   necesita un RabbitMQ real (`testcontainers`,
+//!   `#[ignore = "requiere Docker"]`, ver `docs/conventions.md`): publica de
+//!   verdad un `ScanCancellation` y lo verifica contra una cola de prueba
+//!   bindeada a `scan.cancellations`/`scan.cancellation`, mismo patrón que
+//!   `tests/scan_submission.rs`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
-use axum::routing::{get, post};
+use axum::extract::State;
+use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry};
@@ -54,32 +54,21 @@ const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const MS_USUARIOS_SHARED_SECRET: &str = "lab-only-not-a-real-secret";
 
-/// Credenciales de laboratorio del usuario RabbitMQ `gateway`, copiadas de
-/// `broker/rabbitmq/README.md` (tabla "Credenciales de laboratorio") — el
-/// mismo usuario ya definido en `broker/rabbitmq/definitions.json`, con
-/// permiso `write` solo sobre `scan.requests`/`scan.cancellations`.
+const VHOST: &str = "security-app";
 const GATEWAY_RABBITMQ_USER: &str = "gateway";
 const GATEWAY_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret-gateway";
-
-/// Credenciales de laboratorio del usuario administrador de RabbitMQ, único
-/// con permiso para declarar/bindear la cola de verificación de este test
-/// (el usuario `gateway` tiene `configure: "^$"`, no puede declarar nada —
-/// ver `progress/explore_lapin_testcontainers.md` §3).
 const ADMIN_RABBITMQ_USER: &str = "lab-admin";
 const ADMIN_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret";
 
-const VHOST: &str = "security-app";
-
-/// Doble de prueba de [`ScanRequestPublisher`] para los escenarios que
-/// nunca deben llegar a publicar en el Broker (IP/CIDR inválido, o
-/// dependencia de `ms-usuarios` no disponible): si llegara a invocarse,
-/// sería un bug del flujo bajo prueba, no un resultado esperado.
+/// Doble de prueba de [`ScanRequestPublisher`]: los escenarios que nunca
+/// deben llegar a publicar nada en el Broker (scan ajeno/inexistente, scan
+/// ya terminado) usan este doble, que haría panic si se invocara.
 struct NeverPublishesToBroker;
 
 #[async_trait::async_trait]
 impl ScanRequestPublisher for NeverPublishesToBroker {
     async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
-        panic!("este escenario no debe llegar a publicar en el Broker");
+        panic!("este escenario no debe llegar a publicar un ScanRequest en el Broker");
     }
 
     async fn publish_scan_cancellation(
@@ -106,9 +95,9 @@ async fn serve_empty_jwks() -> Json<jsonwebtoken::jwk::JwkSet> {
     Json(jsonwebtoken::jwk::JwkSet { keys: vec![] })
 }
 
-/// IdP OIDC de prueba mínimo: esta feature no ejercita el login en sí, solo
-/// necesita un `AppState` completo para poder construir `app_router` (mismo
-/// patrón que `tests/usuarios_profile_proxy.rs`).
+/// IdP OIDC de prueba mínimo: estos tests no ejercitan el login en sí, solo
+/// necesitan un `AppState` completo para poder construir `app_router` (mismo
+/// patrón que `tests/scan_submission.rs`).
 async fn spawn_discovery_only_idp() -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -142,96 +131,16 @@ async fn unreachable_usuarios_base_url() -> String {
     format!("http://{addr}")
 }
 
-/// Stub de `ms-usuarios` que **no implementa ninguna ruta**: cualquier
-/// petición (incluida `GET /users/me/scan-targets`) recibe el `404` por
-/// defecto de `axum`, tal como respondería hoy el `user-service` real, que
-/// todavía no implementa esa API (ver `docs/architecture.md`
-/// §"Dependencia pendiente").
-async fn spawn_usuarios_stub_without_scan_target_api() -> String {
+/// Stub de `ms-usuarios` que sirve `GET /users/me/scans` devolviendo
+/// `history` tal cual, sin validar credenciales (los tests que sí ejercen
+/// ese camino viven en `tests/usuarios_client.rs`).
+async fn spawn_usuarios_history_stub(history: Value) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind del stub de ms-usuarios");
     let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
 
-    let app = Router::new();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("servidor del stub de ms-usuarios");
-    });
-
-    format!("http://{addr}")
-}
-
-/// Stub de `ms-usuarios` donde la API de resolución de credenciales de red
-/// **existe** pero responde que no hay ninguna configurada para este
-/// usuario/objetivo (`422`) — distinto del caso "la API no existe todavía"
-/// (`404`, ver [`spawn_usuarios_stub_without_scan_target_api`]).
-async fn spawn_usuarios_stub_with_scan_target_not_configured() -> String {
-    async fn serve_unprocessable() -> axum::http::StatusCode {
-        axum::http::StatusCode::UNPROCESSABLE_ENTITY
-    }
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind del stub de ms-usuarios");
-    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
-
-    let app = Router::new().route("/users/me/scan-targets", get(serve_unprocessable));
-
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("servidor del stub de ms-usuarios");
-    });
-
-    format!("http://{addr}")
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ScanTargetQuery {
-    target: String,
-}
-
-async fn serve_scan_target_credentials(Query(query): Query<ScanTargetQuery>) -> Json<Value> {
-    // El stub resuelve credenciales para cualquier `target`, pero exige que
-    // la query llegue con ese parámetro (mismo contrato especulativo que
-    // documenta `UsuariosClient::resolve_scan_target`).
-    assert!(!query.target.is_empty());
-    Json(json!({
-        "network_user": "netuser-lab",
-        "ssh_credentials_ref": "lab-only-not-a-real-secret",
-        "has_sudo": true,
-    }))
-}
-
-async fn serve_create_scan_history(Json(body): Json<Value>) -> Json<Value> {
-    let target = body["target"].clone();
-    Json(json!({
-        "scan_id": "ms-usuarios-history-1",
-        "user_id": "google-sub-123",
-        "target": target,
-        "status": "PENDIENTE",
-        "requested_at": "2024-01-01T00:00:00Z",
-        "updated_at": "2024-01-01T00:00:00Z",
-    }))
-}
-
-/// Stub de `ms-usuarios` que resuelve con éxito los 3 campos
-/// (`network_user`/`ssh_credentials_ref`/`has_sudo`, contrato especulativo
-/// asumido por `UsuariosClient::resolve_scan_target`, ver
-/// `src/usuarios_client.rs`) y registra el histórico
-/// (`POST /users/me/scans`, contrato real confirmado).
-async fn spawn_happy_usuarios_stub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind del stub de ms-usuarios");
-    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
-
-    let app = Router::new()
-        .route("/users/me/scan-targets", get(serve_scan_target_credentials))
-        .route("/users/me/scans", post(serve_create_scan_history));
+    let app = Router::new().route("/users/me/scans", get(move || async move { Json(history) }));
 
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -244,6 +153,7 @@ async fn spawn_happy_usuarios_stub() -> String {
 
 struct GatewayUnderTest {
     addr: std::net::SocketAddr,
+    scan_ownership: Arc<ScanOwnershipRegistry>,
 }
 
 async fn spawn_gateway(
@@ -267,6 +177,8 @@ async fn spawn_gateway(
     )
     .expect("cliente de laboratorio hacia ms-usuarios debe construirse");
 
+    let scan_ownership = Arc::new(ScanOwnershipRegistry::new());
+
     let state = AppState {
         oidc_client: Arc::new(oidc_client),
         login_states: Arc::new(LoginStateStore::new()),
@@ -276,7 +188,7 @@ async fn spawn_gateway(
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher,
-        scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
+        scan_ownership: scan_ownership.clone(),
         realtime: Arc::new(RealtimeRegistry::new()),
     };
 
@@ -293,7 +205,10 @@ async fn spawn_gateway(
             .expect("servidor del Gateway de prueba");
     });
 
-    GatewayUnderTest { addr }
+    GatewayUnderTest {
+        addr,
+        scan_ownership,
+    }
 }
 
 fn now_epoch_secs() -> u64 {
@@ -303,16 +218,18 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
-fn valid_session_cookie_value() -> String {
-    let session = Session {
-        sub: "google-sub-123".to_string(),
-        email: "user@example.com".to_string(),
+fn session_for(sub: &str) -> Session {
+    Session {
+        sub: sub.to_string(),
+        email: format!("{sub}@example.com"),
         name: "Test User".to_string(),
         exp: now_epoch_secs() + 3600,
-    };
+    }
+}
 
+fn session_cookie_value_for(sub: &str) -> String {
     issue_session_token(
-        &session,
+        &session_for(sub),
         &SecretString::from(SESSION_SIGNING_KEY.to_string()),
         SESSION_AUDIENCE,
         SESSION_ISSUER,
@@ -328,75 +245,163 @@ fn http_client() -> reqwest::Client {
 }
 
 #[tokio::test]
-async fn scan_submission_rejects_invalid_target_without_touching_ms_usuarios_or_broker() {
-    // Apunta a una URL sobre la que no hay nada escuchando: si la
-    // validación no cortara antes de cualquier llamada externa, el intento
-    // de contactar a ms-usuarios fallaría de un modo distinto a 400,
-    // delatando el bug.
+async fn scan_history_returns_the_entries_of_the_active_session_with_and_without_known_scan_id() {
+    let history = json!([
+        {
+            "scan_id": "ms-usuarios-known",
+            "user_id": "alice",
+            "target": "192.0.2.10",
+            "status": "EN_PROGRESO",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:05:00Z",
+        },
+        {
+            "scan_id": "ms-usuarios-unknown",
+            "user_id": "alice",
+            "target": "192.0.2.20",
+            "status": "COMPLETADO",
+            "requested_at": "2024-01-02T00:00:00Z",
+            "updated_at": "2024-01-02T01:00:00Z",
+        },
+    ]);
+    let usuarios_base_url = spawn_usuarios_history_stub(history).await;
+    let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
+
+    // Solo la primera entrada tiene un `scanId` propio todavía registrado
+    // (simula un proceso que no se reinició desde que se publicó ese
+    // escaneo); la segunda simula la limitación documentada de
+    // `ScanOwnershipRegistry` (sin mapeo conocido).
+    gateway.scan_ownership.register(
+        "gateway-scan-id-known",
+        "ms-usuarios-known".to_string(),
+        session_for("alice"),
+    );
+
+    let http = http_client();
+    let response = http
+        .get(format!("http://{}/api/scans", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("GET /api/scans debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("cuerpo JSON válido");
+    let entries = body.as_array().expect("debe ser un array JSON");
+    assert_eq!(entries.len(), 2);
+
+    let known = &entries[0];
+    assert_eq!(known["scanId"], json!("gateway-scan-id-known"));
+    assert_eq!(known["target"], json!("192.0.2.10"));
+    assert_eq!(known["status"], json!("EN_PROGRESO"));
+
+    let unknown = &entries[1];
+    assert!(
+        unknown.get("scanId").is_none(),
+        "una entrada sin scanId propio conocido no debe traer ese campo: {unknown}"
+    );
+    assert_eq!(unknown["target"], json!("192.0.2.20"));
+    assert_eq!(unknown["status"], json!("COMPLETADO"));
+}
+
+#[tokio::test]
+async fn cancel_scan_owned_by_another_session_returns_not_found() {
     let usuarios_base_url = unreachable_usuarios_base_url().await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
-    let http = http_client();
 
-    let response = http
-        .post(format!("http://{}/api/scans", gateway.addr))
-        .header(
-            reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
-        )
-        .json(&json!({ "target": "not-an-ip" }))
-        .send()
-        .await
-        .expect("POST /api/scans debe responder");
-
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    let body = response.text().await.expect("debe poder leer el cuerpo");
-    assert!(
-        body.contains("not-an-ip"),
-        "el mensaje de error debe ser específico sobre el valor inválido: {body}"
+    gateway.scan_ownership.register(
+        "scan-owned-by-alice",
+        "ms-usuarios-1".to_string(),
+        session_for("alice"),
     );
+
+    let http = http_client();
+    let response = http
+        .post(format!(
+            "http://{}/api/scans/scan-owned-by-alice/cancel",
+            gateway.addr
+        ))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={}", session_cookie_value_for("bob")),
+        )
+        .send()
+        .await
+        .expect("POST /api/scans/.../cancel debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn scan_submission_returns_an_explicit_error_when_ms_usuarios_scan_target_api_is_unavailable()
-{
-    let usuarios_base_url = spawn_usuarios_stub_without_scan_target_api().await;
+async fn cancel_scan_that_does_not_exist_returns_not_found() {
+    let usuarios_base_url = unreachable_usuarios_base_url().await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
-    let http = http_client();
 
+    let http = http_client();
     let response = http
-        .post(format!("http://{}/api/scans", gateway.addr))
+        .post(format!(
+            "http://{}/api/scans/no-existe/cancel",
+            gateway.addr
+        ))
         .header(
             reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
         )
-        .json(&json!({ "target": "10.0.0.5" }))
         .send()
         .await
-        .expect("POST /api/scans debe responder");
+        .expect("POST /api/scans/.../cancel debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn scan_submission_returns_an_explicit_error_when_ms_usuarios_has_no_credentials_configured()
-{
-    let usuarios_base_url = spawn_usuarios_stub_with_scan_target_not_configured().await;
+async fn cancel_scan_already_in_a_terminal_state_is_rejected_without_publishing() {
+    let history = json!([
+        {
+            "scan_id": "ms-usuarios-done",
+            "user_id": "alice",
+            "target": "192.0.2.10",
+            "status": "COMPLETADO",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:05:00Z",
+        },
+    ]);
+    let usuarios_base_url = spawn_usuarios_history_stub(history).await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
-    let http = http_client();
 
+    gateway.scan_ownership.register(
+        "scan-already-done",
+        "ms-usuarios-done".to_string(),
+        session_for("alice"),
+    );
+
+    let http = http_client();
     let response = http
-        .post(format!("http://{}/api/scans", gateway.addr))
+        .post(format!(
+            "http://{}/api/scans/scan-already-done/cancel",
+            gateway.addr
+        ))
         .header(
             reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
         )
-        .json(&json!({ "target": "10.0.0.5" }))
         .send()
         .await
-        .expect("POST /api/scans debe responder");
+        .expect("POST /api/scans/.../cancel debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
 }
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -414,9 +419,8 @@ fn install_crypto_provider_once() {
 }
 
 /// Levanta un `rabbitmq:4.3.5-management` real vía `testcontainers`, con la
-/// topología copiada literalmente de `broker/rabbitmq/definitions.json`
-/// (ver `docs/architecture.md`) y TLS habilitado con los certificados de
-/// laboratorio también copiados de `broker/rabbitmq/tls/`.
+/// topología copiada literalmente de `broker/rabbitmq/definitions.json` (ver
+/// `docs/architecture.md`) — mismo helper que `tests/scan_submission.rs`.
 async fn start_rabbitmq() -> ContainerAsync<GenericImage> {
     install_crypto_provider_once();
 
@@ -460,11 +464,11 @@ async fn start_rabbitmq() -> ContainerAsync<GenericImage> {
         .expect("el contenedor RabbitMQ de test debe arrancar")
 }
 
-/// Conexión AMQPS "a mano" (sin pasar por `gateway::broker`, que solo
-/// expone publicar) usada por el test para preparar/leer la cola de
-/// verificación con el usuario `lab-admin` (ver
-/// `progress/explore_lapin_testcontainers.md` §3: el usuario `gateway`
-/// tiene `configure: "^$"`, no puede declarar nada).
+/// Conexión AMQPS "a mano" (sin pasar por `gateway::broker`, que solo expone
+/// publicar) usada por el test para preparar/leer la cola de verificación
+/// con el usuario `lab-admin` (ver
+/// `progress/explore_lapin_testcontainers.md` §3: el usuario `gateway` tiene
+/// `configure: "^$"`, no puede declarar nada).
 async fn connect_lapin_as(
     user: &str,
     password: &str,
@@ -488,7 +492,7 @@ async fn connect_lapin_as(
 
 #[tokio::test]
 #[ignore = "requiere Docker"]
-async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_the_scan_id() {
+async fn cancel_scan_owned_and_in_progress_publishes_a_valid_scan_cancellation() {
     let container = start_rabbitmq().await;
     let host = container
         .get_host()
@@ -504,8 +508,8 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
         .expect("debe poder leer la CA de laboratorio");
 
     // Conexión de administración: declara y bindea la cola de verificación
-    // ad-hoc de este test (nunca la declara el código de producción, que
-    // usa el usuario `gateway`, sin permiso `configure`).
+    // ad-hoc de este test (nunca la declara el código de producción, que usa
+    // el usuario `gateway`, sin permiso `configure`).
     let admin_connection = connect_lapin_as(
         ADMIN_RABBITMQ_USER,
         ADMIN_RABBITMQ_PASSWORD,
@@ -521,7 +525,7 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
 
     admin_channel
         .queue_declare(
-            "test.scan-requests-verify",
+            "test.scan-cancellations-verify",
             QueueDeclareOptions {
                 durable: false,
                 exclusive: true,
@@ -535,9 +539,9 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
 
     admin_channel
         .queue_bind(
-            "test.scan-requests-verify",
-            "scan.requests",
-            "scan.request",
+            "test.scan-cancellations-verify",
+            "scan.cancellations",
+            "scan.cancellation",
             QueueBindOptions::default(),
             FieldTable::default(),
         )
@@ -551,7 +555,7 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
 
     let mut consumer = admin_channel
         .basic_consume(
-            "test.scan-requests-verify",
+            "test.scan-cancellations-verify",
             "test-consumer",
             BasicConsumeOptions::default(),
             FieldTable::default(),
@@ -560,7 +564,7 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
         .expect("consumir la cola de verificación de prueba");
 
     // Publicador real de producción, conectado como el usuario `gateway`
-    // (mínimo privilegio: solo `write` en `scan.requests`).
+    // (mínimo privilegio: `write` sobre `scan.requests`/`scan.cancellations`).
     let broker_publisher: Arc<dyn ScanRequestPublisher> = Arc::new(
         BrokerPublisher::connect_with_ca_pem(
             &SecretString::from(format!(
@@ -573,60 +577,62 @@ async fn scan_submission_happy_path_publishes_a_valid_scan_request_and_returns_t
         .expect("BrokerPublisher debe poder conectar contra el RabbitMQ de prueba"),
     );
 
-    let usuarios_base_url = spawn_happy_usuarios_stub().await;
+    let history = json!([
+        {
+            "scan_id": "ms-usuarios-in-progress",
+            "user_id": "alice",
+            "target": "192.0.2.10",
+            "status": "EN_PROGRESO",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:05:00Z",
+        },
+    ]);
+    let usuarios_base_url = spawn_usuarios_history_stub(history).await;
     let gateway = spawn_gateway(usuarios_base_url, broker_publisher).await;
-    let http = http_client();
 
+    const SCAN_ID: &str = "gateway-scan-id-in-progress";
+    gateway.scan_ownership.register(
+        SCAN_ID,
+        "ms-usuarios-in-progress".to_string(),
+        session_for("alice"),
+    );
+
+    let http = http_client();
     let response = http
-        .post(format!("http://{}/api/scans", gateway.addr))
+        .post(format!(
+            "http://{}/api/scans/{SCAN_ID}/cancel",
+            gateway.addr
+        ))
         .header(
             reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
         )
-        .json(&json!({ "target": "192.0.2.10" }))
         .send()
         .await
-        .expect("POST /api/scans debe responder");
+        .expect("POST /api/scans/.../cancel debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: Value = response.json().await.expect("cuerpo JSON válido");
-    let scan_id = body["scanId"]
-        .as_str()
-        .expect("la respuesta debe traer scanId")
-        .to_string();
-    assert!(!scan_id.is_empty());
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
     let delivery = tokio::time::timeout(Duration::from_secs(10), consumer.next())
         .await
-        .expect("no debe hacer timeout esperando el ScanRequest publicado")
+        .expect("no debe hacer timeout esperando el ScanCancellation publicado")
         .expect("debe llegar un mensaje a la cola de verificación")
         .expect("sin error de protocolo AMQP");
 
-    let scan_request: HashMap<String, Value> =
+    let scan_cancellation: HashMap<String, Value> =
         serde_json::from_slice(&delivery.data).expect("el mensaje debe ser JSON válido");
 
-    assert_eq!(scan_request["correlation_id"], json!(scan_id));
-    assert_eq!(scan_request["ip"], json!("192.0.2.10"));
-    assert_eq!(scan_request["network_user"], json!("netuser-lab"));
-    assert_eq!(
-        scan_request["ssh_credentials_ref"],
-        json!("lab-only-not-a-real-secret")
-    );
-    assert_eq!(scan_request["has_sudo"], json!(true));
-    assert_eq!(scan_request["requested_by"], json!("google-sub-123"));
+    assert_eq!(scan_cancellation["correlation_id"], json!(SCAN_ID));
+    assert_eq!(scan_cancellation["requested_by"], json!("alice"));
 
-    let expected_keys = [
-        "correlation_id",
-        "ip",
-        "network_user",
-        "ssh_credentials_ref",
-        "has_sudo",
-        "requested_by",
-    ];
+    let expected_keys = ["correlation_id", "requested_by"];
     assert_eq!(
-        scan_request.len(),
+        scan_cancellation.len(),
         expected_keys.len(),
-        "el ScanRequest publicado no debe traer campos extra (additionalProperties: false)"
+        "el ScanCancellation publicado no debe traer campos extra (additionalProperties: false)"
     );
 
     delivery

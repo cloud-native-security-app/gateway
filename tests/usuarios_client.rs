@@ -258,3 +258,94 @@ async fn upsert_profile_when_ms_usuarios_is_unreachable_returns_a_typed_error_wi
 
     assert!(matches!(result, Err(UsuariosClientError::Unreachable)));
 }
+
+/// Stub de `ms-usuarios` que solo implementa `GET /users/me/scans`,
+/// devolviendo `history` tal cual (feature `scan_history_and_cancellation`).
+async fn spawn_scan_history_stub(expected_secret: &str, history: Value) -> String {
+    #[derive(Clone)]
+    struct StubState {
+        expected_secret: String,
+        history: Value,
+    }
+
+    async fn get_users_me_scans(
+        State(state): State<StubState>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<Value>) {
+        if !secret_matches(&headers, &state.expected_secret) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "credencial de servicio inválida"})),
+            );
+        }
+        (StatusCode::OK, Json(state.history))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind del stub de ms-usuarios");
+    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
+
+    let state = StubState {
+        expected_secret: expected_secret.to_string(),
+        history,
+    };
+
+    let app = Router::new()
+        .route("/users/me/scans", get(get_users_me_scans))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("servidor del stub de ms-usuarios");
+    });
+
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn list_scan_history_happy_path_returns_the_history_from_ms_usuarios() {
+    let history = json!([
+        {
+            "scan_id": "ms-usuarios-1",
+            "user_id": "google-sub-123",
+            "target": "192.0.2.10",
+            "status": "PENDIENTE",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+        },
+        {
+            "scan_id": "ms-usuarios-2",
+            "user_id": "google-sub-123",
+            "target": "192.0.2.20",
+            "status": "COMPLETADO",
+            "requested_at": "2024-01-02T00:00:00Z",
+            "updated_at": "2024-01-02T01:00:00Z",
+        },
+    ]);
+    let base_url = spawn_scan_history_stub(LAB_SHARED_SECRET, history).await;
+    let client = UsuariosClient::new(base_url, SecretString::from(LAB_SHARED_SECRET.to_string()))
+        .expect("cliente de laboratorio debe construirse");
+
+    let entries = client
+        .list_scan_history(&lab_session())
+        .await
+        .expect("debe devolver el histórico del stub");
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].scan_id, "ms-usuarios-1");
+    assert_eq!(entries[1].scan_id, "ms-usuarios-2");
+}
+
+#[tokio::test]
+async fn list_scan_history_when_ms_usuarios_is_unreachable_returns_a_typed_error_without_panicking()
+{
+    let base_url = unreachable_base_url().await;
+    let client = UsuariosClient::new(base_url, SecretString::from(LAB_SHARED_SECRET.to_string()))
+        .expect("cliente de laboratorio debe construirse");
+
+    let result = client.list_scan_history(&lab_session()).await;
+
+    assert!(matches!(result, Err(UsuariosClientError::Unreachable)));
+}

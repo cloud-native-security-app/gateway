@@ -31,11 +31,13 @@
 //!
 //! ## Histórico de escaneos (feature `scan_submission`)
 //!
-//! [`UsuariosClient::create_scan_history`] (`POST /users/me/scans`) y
-//! [`UsuariosClient::update_scan_status`] (`PATCH /scans/{scan_id}`) están
-//! confirmados contra el contrato real de `user-service`
-//! (`user-service/src/api.rs`, handlers `create_scan`/`patch_scan_status`,
-//! y `user-service/src/domain.rs` para [`ScanStatus`]/`ScanHistoryEntry`).
+//! [`UsuariosClient::create_scan_history`] (`POST /users/me/scans`),
+//! [`UsuariosClient::list_scan_history`] (`GET /users/me/scans`, misma ruta
+//! de colección que `create_scan_history`, distinto verbo HTTP — feature
+//! `scan_history_and_cancellation`) y [`UsuariosClient::update_scan_status`]
+//! (`PATCH /scans/{scan_id}`) están confirmados contra el contrato real de
+//! `user-service` (`user-service/src/api.rs`, y `user-service/src/domain.rs`
+//! para [`ScanStatus`]/[`ScanHistoryEntry`]).
 //!
 //! [`UsuariosClient::resolve_scan_target`] es distinto: llama a un endpoint
 //! **especulativo**, `GET /users/me/scan-targets?target=<ip-o-cidr>`, que
@@ -318,6 +320,31 @@ impl UsuariosClient {
                 self.shared_secret.expose_secret(),
             )
             .json(&CreateScanHistoryRequest { target });
+
+        self.send_and_decode(request).await
+    }
+
+    /// Devuelve el histórico completo de escaneos de `identity`
+    /// (`GET /users/me/scans`, feature `scan_history_and_cancellation`, RF-13):
+    /// la autorización a nivel de fila (un usuario solo ve su propio
+    /// histórico) la aplica `ms-usuarios` a partir del header de identidad ya
+    /// verificada, este cliente no la reimplementa (ver
+    /// `docs/security-scope.md`).
+    ///
+    /// Mismos errores que [`Self::get_profile`].
+    pub async fn list_scan_history(
+        &self,
+        identity: &Session,
+    ) -> Result<Vec<ScanHistoryEntry>, UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .get(self.scans_url())
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            );
 
         self.send_and_decode(request).await
     }

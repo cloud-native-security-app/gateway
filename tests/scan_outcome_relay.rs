@@ -26,7 +26,8 @@ use futures_util::StreamExt;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
-    BrokerConsumer, BrokerError, ScanOutcomeHandler, ScanRequest, ScanRequestPublisher,
+    BrokerConsumer, BrokerError, ScanCancellation, ScanOutcomeHandler, ScanRequest,
+    ScanRequestPublisher,
 };
 use gateway::domain::{ScanOutcomeEvent, ScanResult, Session};
 use gateway::realtime::RealtimeRegistry;
@@ -63,6 +64,13 @@ struct NeverPublishesToBroker;
 impl ScanRequestPublisher for NeverPublishesToBroker {
     async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
         panic!("estos tests no deben llegar a publicar en el Broker");
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        panic!("estos tests no deben llegar a publicar una cancelación en el Broker");
     }
 }
 

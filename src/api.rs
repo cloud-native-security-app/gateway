@@ -25,10 +25,12 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
-use crate::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
+use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
-use crate::usuarios_client::{ScanStatus, UserProfile, UsuariosClient, UsuariosClientError};
+use crate::usuarios_client::{
+    ScanHistoryEntry, ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
+};
 
 /// Entrada de [`ScanOwnershipRegistry`]: qué `scan_id` le asignó
 /// `ms-usuarios` a la entrada de histórico de un `scanId` propio de este
@@ -107,6 +109,33 @@ impl ScanOwnershipRegistry {
             .read()
             .unwrap_or_else(|poison| poison.into_inner());
         entries.get(scan_id).cloned()
+    }
+
+    /// Traduce en sentido inverso: dado `ms_usuarios_scan_id` (el `scan_id`
+    /// que asigna `ms-usuarios` a una entrada de histórico, ver
+    /// [`ScanOwnership::ms_usuarios_scan_id`]), devuelve el `scanId` propio
+    /// de este Gateway que lo generó, si todavía está registrado (feature
+    /// `scan_history_and_cancellation`, para traducir cada entrada del
+    /// histórico de `ms-usuarios` al `scanId` que el cliente debe usar para
+    /// suscribirse a `GET /api/scans/{scan_id}/events` o cancelar con `POST
+    /// /api/scans/{scan_id}/cancel`).
+    ///
+    /// Recorrido lineal sobre el mapa: el volumen esperado es el de
+    /// escaneos en curso de este proceso (no miles de entradas históricas),
+    /// así que no se justifica mantener un segundo índice solo para esta
+    /// consulta. Devuelve `None` si no hay ningún `scanId` registrado con ese
+    /// `ms_usuarios_scan_id` — p. ej. porque el proceso se reinició desde que
+    /// se publicó ese escaneo (misma limitación documentada en
+    /// [`ScanOwnershipRegistry`]).
+    pub fn lookup_by_ms_usuarios_scan_id(&self, ms_usuarios_scan_id: &str) -> Option<String> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries
+            .iter()
+            .find(|(_, ownership)| ownership.ms_usuarios_scan_id == ms_usuarios_scan_id)
+            .map(|(scan_id, _)| scan_id.clone())
     }
 }
 
@@ -190,8 +219,9 @@ fn protected_router(state: AppState) -> Router {
     Router::new()
         .route("/api/me", get(me))
         .route("/api/profile", get(profile))
-        .route("/api/scans", post(submit_scan))
+        .route("/api/scans", post(submit_scan).get(list_scan_history))
         .route("/api/scans/:scan_id/events", get(scan_events))
+        .route("/api/scans/:scan_id/cancel", post(cancel_scan))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -241,6 +271,72 @@ async fn profile(
 ) -> Result<Json<UserProfile>, UsuariosClientError> {
     let profile = state.usuarios_client.get_profile(&session).await?;
     Ok(Json(profile))
+}
+
+/// Entrada del histórico de escaneos devuelta por `GET /api/scans` (RF-13):
+/// los mismos datos que reporta `ms-usuarios` para esta entrada
+/// (`target`/`status`/`requested_at`/`updated_at`), más el `scanId` propio de
+/// este Gateway que generó esa entrada, si todavía se conoce.
+///
+/// **Limitación conocida, aceptada, mismo patrón que
+/// [`ScanOwnershipRegistry`]**: `scan_id` viene de traducir el `scan_id` de
+/// `ms-usuarios` vía [`ScanOwnershipRegistry::lookup_by_ms_usuarios_scan_id`],
+/// que solo vive en la memoria de este proceso. Una entrada cuyo `scanId`
+/// propio ya no está registrado (p. ej. el proceso se reinició desde que se
+/// publicó ese escaneo) se devuelve igual, con `scan_id` ausente en el JSON
+/// (`skip_serializing_if`) en vez de fallar o inventar un valor — el cliente
+/// pierde la capacidad de reabrir el stream SSE o cancelar esa entrada
+/// concreta hasta que vuelva a haber un `scanId` conocido para ella, pero
+/// sigue viendo su histórico.
+#[derive(Debug, Serialize)]
+struct ScanHistoryEntryResponse {
+    /// `scanId` propio de este Gateway (ver la nota de diseño de este tipo),
+    /// ausente si no hay mapeo conocido en [`ScanOwnershipRegistry`].
+    #[serde(rename = "scanId", skip_serializing_if = "Option::is_none")]
+    scan_id: Option<String>,
+    /// Objetivo del escaneo (IP o rango), tal como lo reporta `ms-usuarios`.
+    target: String,
+    /// Estado actual de la entrada, tal como lo reporta `ms-usuarios`.
+    status: ScanStatus,
+    /// Marca de tiempo (RFC 3339) en la que se solicitó el escaneo.
+    requested_at: String,
+    /// Marca de tiempo (RFC 3339) de la última actualización de estado.
+    updated_at: String,
+}
+
+impl ScanHistoryEntryResponse {
+    /// Construye la entrada de respuesta a partir de la [`ScanHistoryEntry`]
+    /// que reportó `ms-usuarios`, traduciendo su `scan_id` interno al
+    /// `scanId` propio de este Gateway vía `ownership` (ver la nota de
+    /// diseño de este tipo).
+    fn from_history_entry(entry: ScanHistoryEntry, ownership: &ScanOwnershipRegistry) -> Self {
+        Self {
+            scan_id: ownership.lookup_by_ms_usuarios_scan_id(&entry.scan_id),
+            target: entry.target,
+            status: entry.status,
+            requested_at: entry.requested_at,
+            updated_at: entry.updated_at,
+        }
+    }
+}
+
+/// Devuelve el histórico de escaneos del usuario de la sesión activa (RF-13),
+/// proxeando `GET /users/me/scans` de `ms-usuarios` a través de
+/// [`crate::usuarios_client::UsuariosClient`] — la autorización a nivel de
+/// fila (un usuario solo ve su propio histórico) la aplica `ms-usuarios` a
+/// partir de la identidad ya verificada que reenvía este handler, nunca un
+/// identificador de otra fuente (ver `docs/security-scope.md`). Mismo mapeo
+/// de errores que [`profile`].
+async fn list_scan_history(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<Json<Vec<ScanHistoryEntryResponse>>, UsuariosClientError> {
+    let history = state.usuarios_client.list_scan_history(&session).await?;
+    let response = history
+        .into_iter()
+        .map(|entry| ScanHistoryEntryResponse::from_history_entry(entry, &state.scan_ownership))
+        .collect();
+    Ok(Json(response))
 }
 
 /// Cuerpo de `POST /api/scans`: el objetivo (IP o rango CIDR) del escaneo
@@ -406,6 +502,128 @@ async fn scan_events(
     Ok(Sse::new(state.realtime.subscribe_stream(scan_id)))
 }
 
+/// Errores de `POST /api/scans/{scan_id}/cancel`.
+#[derive(Debug, thiserror::Error)]
+enum ScanCancelError {
+    /// `scan_id` no tiene ninguna [`ScanOwnership`] registrada, o pertenece a
+    /// una sesión distinta de la activa. Mismo status en ambos casos
+    /// (`404`), para no revelar a un usuario que un `scan_id` ajeno existe
+    /// (mismo criterio que [`ScanEventsError::NotFound`]).
+    #[error("no existe un escaneo con ese identificador para la sesión activa")]
+    NotFound,
+    /// El escaneo ya está en un estado terminal (`Completado`/`Fallido`) en
+    /// `ms-usuarios`: no tiene sentido cancelarlo, y nunca se llega a
+    /// publicar nada en el Broker para este caso.
+    #[error("el escaneo ya finalizó y no puede cancelarse")]
+    AlreadyTerminal,
+    /// La entrada de histórico que `ms-usuarios` debería tener para
+    /// [`ScanOwnership::ms_usuarios_scan_id`] no apareció en
+    /// [`UsuariosClient::list_scan_history`] — inconsistencia del lado del
+    /// servidor (p. ej. la entrada fue borrada), no un error del cliente.
+    #[error("no se pudo confirmar el estado actual del escaneo antes de cancelarlo")]
+    HistoryEntryMissing,
+    /// Fallo al consultar `ms-usuarios` para conocer el estado actual del
+    /// escaneo antes de decidir si cancelarlo.
+    #[error(transparent)]
+    Usuarios(#[from] UsuariosClientError),
+    /// Fallo al publicar el `ScanCancellation` en el Broker.
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
+}
+
+impl IntoResponse for ScanCancelError {
+    fn into_response(self) -> Response {
+        match self {
+            ScanCancelError::NotFound => {
+                tracing::debug!(error = %self, "solicitud de cancelación rechazada");
+                (StatusCode::NOT_FOUND, self.to_string()).into_response()
+            }
+            ScanCancelError::AlreadyTerminal => {
+                tracing::debug!(error = %self, "solicitud de cancelación rechazada");
+                (StatusCode::CONFLICT, self.to_string()).into_response()
+            }
+            ScanCancelError::HistoryEntryMissing => {
+                tracing::error!(error = %self, "inconsistencia de histórico al cancelar un escaneo");
+                (StatusCode::BAD_GATEWAY, self.to_string()).into_response()
+            }
+            ScanCancelError::Usuarios(err) => err.into_response(),
+            ScanCancelError::Broker(err) => {
+                tracing::error!(error = %err, "fallo al publicar la cancelación de escaneo en el Broker");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "no se pudo encolar la cancelación del escaneo".to_string(),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+/// Cancela el escaneo `scan_id` (el `scanId` propio de este Gateway, RF-14):
+/// verifica que pertenece a la sesión activa, consulta a `ms-usuarios` el
+/// estado actual de su entrada de histórico y, si todavía no llegó a un
+/// estado terminal, publica un [`ScanCancellation`] válido en
+/// [`crate::broker::EXCHANGE_SCAN_CANCELLATIONS`].
+///
+/// Decisión de diseño: el estado "actual" se resuelve consultando a
+/// `ms-usuarios` (vía [`UsuariosClient::list_scan_history`], buscando la
+/// entrada cuyo `scan_id` coincide con
+/// [`ScanOwnership::ms_usuarios_scan_id`]) en vez de rastrear un estado local
+/// en [`ScanOwnershipRegistry`]/`AppState`: `ms-usuarios` ya es la fuente de
+/// verdad del estado del histórico (lo actualiza el relay de
+/// `gateway.scan-outcomes`, feature `scan_outcome_relay`), así que consultarlo
+/// evita mantener un segundo estado que podría desincronizarse — más simple
+/// de razonar, al costo de una llamada HTTP adicional antes de publicar.
+///
+/// - `scan_id` sin [`ScanOwnership`] registrada, o de otra sesión, responde
+///   `404` ([`ScanCancelError::NotFound`], nunca revela que un `scan_id`
+///   ajeno existe).
+/// - Un escaneo ya `Completado`/`Fallido` responde `409`
+///   ([`ScanCancelError::AlreadyTerminal`]) sin publicar nada en el Broker.
+/// - En cualquier otro estado (`Pendiente`/`EnProgreso`), publica el
+///   `ScanCancellation` (`correlation_id` = `scan_id` del path,
+///   `requested_by` = `sub` de la sesión activa, nunca un identificador
+///   reenviado sin verificar) y responde `202 Accepted`.
+async fn cancel_scan(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(scan_id): Path<String>,
+) -> Result<StatusCode, ScanCancelError> {
+    let ownership = state
+        .scan_ownership
+        .lookup(&scan_id)
+        .ok_or(ScanCancelError::NotFound)?;
+
+    if ownership.owner.sub != session.sub {
+        return Err(ScanCancelError::NotFound);
+    }
+
+    let history = state.usuarios_client.list_scan_history(&session).await?;
+    let current_entry = history
+        .into_iter()
+        .find(|entry| entry.scan_id == ownership.ms_usuarios_scan_id)
+        .ok_or(ScanCancelError::HistoryEntryMissing)?;
+
+    if matches!(
+        current_entry.status,
+        ScanStatus::Completado | ScanStatus::Fallido
+    ) {
+        return Err(ScanCancelError::AlreadyTerminal);
+    }
+
+    let cancellation = ScanCancellation {
+        correlation_id: scan_id,
+        requested_by: session.sub,
+    };
+
+    state
+        .broker_publisher
+        .publish_scan_cancellation(&cancellation)
+        .await?;
+
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Descripción de una ruta expuesta por [`app_router`], usada tanto para
 /// construirlo como para que los tests de la feature
 /// `session_middleware_and_me` puedan enumerar el router completo y
@@ -467,7 +685,17 @@ pub const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/scans",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/scans/:scan_id/events",
+        protected: true,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/scans/:scan_id/cancel",
         protected: true,
     },
 ];

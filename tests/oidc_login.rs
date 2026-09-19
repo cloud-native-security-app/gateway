@@ -19,7 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use gateway::api::{auth_router, AppState, ScanOwnershipRegistry};
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
-use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
+use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::{
@@ -49,6 +49,13 @@ struct NeverPublishesToBroker;
 impl ScanRequestPublisher for NeverPublishesToBroker {
     async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
         panic!("esta prueba no debe llegar a publicar en el Broker");
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        panic!("esta prueba no debe llegar a publicar una cancelación en el Broker");
     }
 }
 

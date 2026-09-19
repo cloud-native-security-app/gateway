@@ -122,7 +122,7 @@
         "Cancelar un scan_id que ya está en estado terminal (completed/failed) responde un error explícito sin publicar nada al Broker",
         "Tests de integración (#[ignore = \"requiere Docker\"]): histórico devuelve las entradas del usuario correcto; cancelación de un scan propio en curso publica el mensaje verificable en una cola de test bindeada a scan.cancellations; cancelación de scan ajeno -> 404; cancelación de scan ya terminado -> error sin publicar"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 9,

@@ -491,3 +491,97 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_scan_outcome_relay.md`.
 - **Estado final:** feature 7 (`scan_outcome_relay`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 8: scan_history_and_cancellation — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers: el
+  leader confirmó directamente, leyendo repos hermanos de solo lectura, el
+  shape de `ScanCancellation` y el contrato real de `GET /users/me/scans`
+  antes de despachar).
+- **Investigación previa:** el leader confirmó
+  `broker/contracts/scan-cancellation.schema.json` (`{correlation_id,
+  requested_by}`, ambos `string`, `additionalProperties: false`;
+  `correlation_id` es explícitamente el del `ScanRequest` a cancelar, o sea
+  el `scanId` propio de Gateway, nunca el `scan_id` de `ms-usuarios`) y que
+  el usuario RabbitMQ `gateway` ya tenía `write` sobre `scan.cancellations`
+  desde la topología copiada en la feature 6. Detectó que `GET /api/scans`
+  necesitaría exponer ese `scanId` propio por entrada para que el cliente
+  pueda cancelar/reabrir SSE con el mismo id, lo que exige un lookup inverso
+  nuevo en `ScanOwnershipRegistry` (feature 7): decisión acordada con el
+  usuario de añadir `lookup_by_ms_usuarios_scan_id` (recorrido lineal,
+  documentado, sin segundo índice) y de que el campo `scanId` sea opcional
+  (ausente si no hay mapeo conocido, misma limitación ya documentada de
+  "memoria de proceso, no persistente").
+- **Qué se hizo:** `GET /api/scans` (histórico, RF-13) y
+  `POST /api/scans/{scan_id}/cancel` (cancelación, RF-14).
+  `src/usuarios_client.rs` gana `list_scan_history` (`GET
+  /users/me/scans`, mismo endpoint de colección que ya usaba
+  `create_scan_history` con otro verbo, contrato confirmado real contra
+  `user-service/src/api.rs`). `src/broker.rs` gana `ScanCancellation`
+  (shape copiado literal del schema), las constantes
+  `EXCHANGE_SCAN_CANCELLATIONS`/`ROUTING_KEY_SCAN_CANCELLATION`, y
+  `publish_scan_cancellation` añadido al trait `ScanRequestPublisher` ya
+  existente (decisión explícita: extender el trait en vez de crear uno
+  hermano, porque ambos métodos comparten la misma conexión/canal/usuario
+  RabbitMQ y separar habría exigido un segundo campo en `AppState` sin
+  beneficio real); se extrajo un helper privado `publish_and_confirm` en
+  `BrokerPublisher` para no duplicar la lógica de serializar+publicar+ack
+  entre ambos métodos. `src/api.rs` gana
+  `ScanOwnershipRegistry::lookup_by_ms_usuarios_scan_id` (lookup inverso),
+  el handler `list_scan_history` (`GET /api/scans`, traduce cada entrada a
+  `ScanHistoryEntryResponse` con `scanId` propio opcional, sin exponer el
+  `scan_id` interno de `ms-usuarios` a `front`, RF-09) y el handler
+  `cancel_scan` (`POST /api/scans/:scan_id/cancel`, sintaxis axum 0.7):
+  verifica ownership igual que `scan_events` de la feature 7 (404 uniforme
+  para scan ajeno o inexistente), consulta `list_scan_history` para conocer
+  el estado actual del `scan_id` de `ms-usuarios` antes de decidir si
+  publicar (decisión documentada: preferir consultar a `ms-usuarios`, la
+  fuente de verdad ya actualizada por el relay de la feature 7, en vez de
+  duplicar estado local que podría desincronizarse), responde `409` sin
+  publicar si el estado ya es `Completado`/`Fallido`, y en cualquier otro
+  caso publica el `ScanCancellation` (`correlation_id` = `scan_id` del
+  path, `requested_by` = `sub` de la sesión activa, nunca un identificador
+  reenviado sin verificar) y responde `202 Accepted`. Nuevas entradas en
+  `ROUTES` (`GET /api/scans`, `POST /api/scans/:scan_id/cancel`, ambas
+  protegidas), cubiertas automáticamente por el test de enumeración de
+  rutas de la feature 4 sin cambios en ese test. Los 5 dobles de prueba
+  `NeverPublishesToBroker` de `tests/oidc_login.rs`,
+  `tests/session_middleware_and_me.rs`, `tests/usuarios_profile_proxy.rs`,
+  `tests/scan_submission.rs` y `tests/scan_outcome_relay.rs` se actualizaron
+  para implementar también `publish_scan_cancellation` (panicking, mismo
+  patrón ya usado para `publish_scan_request`), porque el trait extendido
+  lo exige. Nuevo archivo `tests/scan_history_and_cancellation.rs` (5 tests:
+  4 sin Docker — histórico con/sin `scanId` conocido, cancelación de scan
+  ajeno, cancelación de scan inexistente, cancelación de scan ya terminado
+  sin publicar — y 1 `#[ignore = "requiere Docker"]` con el camino feliz de
+  cancelación contra RabbitMQ real, verificando el mensaje consumido de una
+  cola bindeada a `scan.cancellations`/`scan.cancellation`). 2 tests nuevos
+  en `tests/usuarios_client.rs` para `list_scan_history` (camino feliz +
+  `ms-usuarios` caído).
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (48 unitarios + tests de
+  integración sin Docker de las features 1-8, todos verdes, ninguna feature
+  anterior se rompió), `cargo test -- --ignored` (Docker disponible: 4
+  tests con RabbitMQ real, incluido el nuevo de esta feature, todos verdes,
+  sin contenedores huérfanos), `cargo doc --no-deps` y `./init.sh` — todo en
+  verde, 0 warnings. Detalle completo en
+  `progress/impl_scan_history_and_cancellation.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el test
+  Docker), validar los 5 criterios de aceptación uno por uno contra el
+  código/tests, confirmar leyendo `user-service/src/api.rs` que `GET
+  /users/me/scans` (handler `list_scans`) es un endpoint real, no
+  inventado, confirmar que el usuario RabbitMQ `gateway` sí tiene `write`
+  sobre `scan.cancellations` en `broker/rabbitmq/definitions.json`, y
+  confirmar por `grep` que `update_scan_status` sigue invocándose solo
+  desde `submit_scan` (feature 6) y que `cancel_scan` nunca lo duplica.
+  Evaluó las 3 decisiones de diseño (extender el trait en vez de uno
+  hermano, lookup inverso lineal, consultar `ms-usuarios` en vez de estado
+  local) como razonables y bien documentadas. Confirmó que ningún log o
+  cuerpo de error expone credenciales, y que `requested_by` siempre es la
+  identidad de sesión ya verificada. Sin cambios requeridos. Detalle
+  completo en `progress/review_scan_history_and_cancellation.md`.
+- **Estado final:** feature 8 (`scan_history_and_cancellation`) pasó a
+  `"done"` en `feature_list.json`.

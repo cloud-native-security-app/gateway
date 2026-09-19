@@ -18,7 +18,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ROUTES};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
-use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
+use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
 use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
@@ -43,6 +43,13 @@ struct NeverPublishesToBroker;
 impl ScanRequestPublisher for NeverPublishesToBroker {
     async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
         panic!("esta prueba no debe llegar a publicar en el Broker");
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        panic!("esta prueba no debe llegar a publicar una cancelación en el Broker");
     }
 }
 

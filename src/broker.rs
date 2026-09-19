@@ -2,9 +2,16 @@
 //! `ScanCancellation` y consumo de `gateway.scan-outcomes`.
 //!
 //! La feature `scan_submission` implementó
-//! [`publish_scan_request`](BrokerPublisher::publish_scan_request); esta
-//! feature (`scan_outcome_relay`) añade [`BrokerConsumer`], el consumidor de
-//! `gateway.scan-outcomes`.
+//! [`publish_scan_request`](ScanRequestPublisher::publish_scan_request); la
+//! feature `scan_outcome_relay` añadió [`BrokerConsumer`], el consumidor de
+//! `gateway.scan-outcomes`; la feature `scan_history_and_cancellation` añade
+//! [`publish_scan_cancellation`](ScanRequestPublisher::publish_scan_cancellation)
+//! al mismo trait [`ScanRequestPublisher`] (en vez de uno nuevo) para no
+//! introducir un segundo campo en `AppState`/otro doble de prueba por cada
+//! test de features anteriores que ya construyen un `AppState` completo —
+//! ambos métodos comparten la misma conexión/canal AMQPS del usuario
+//! `gateway`, que ya tiene permiso `write` sobre `scan.requests` **y**
+//! `scan.cancellations` (ver `docs/security-scope.md`).
 //!
 //! ## Decisiones de diseño
 //!
@@ -86,6 +93,14 @@ pub const EXCHANGE_SCAN_REQUESTS: &str = "scan.requests";
 /// Routing key con la que este Gateway publica cada `ScanRequest`.
 pub const ROUTING_KEY_SCAN_REQUEST: &str = "scan.request";
 
+/// Exchange donde este Gateway publica cada `ScanCancellation` (topic, ya
+/// declarado por `broker/rabbitmq/definitions.json` — no se redeclara aquí,
+/// feature `scan_history_and_cancellation`).
+pub const EXCHANGE_SCAN_CANCELLATIONS: &str = "scan.cancellations";
+
+/// Routing key con la que este Gateway publica cada `ScanCancellation`.
+pub const ROUTING_KEY_SCAN_CANCELLATION: &str = "scan.cancellation";
+
 /// Cola de la que este Gateway consume cada [`ScanOutcomeEvent`] (bindeada a
 /// `scan.outcome.#` en `broker/rabbitmq/definitions.json` — no se redeclara
 /// aquí, ver [`BrokerConsumer`]).
@@ -138,6 +153,27 @@ impl std::fmt::Debug for ScanRequest {
             .field("requested_by", &self.requested_by)
             .finish()
     }
+}
+
+/// Mensaje publicado en [`EXCHANGE_SCAN_CANCELLATIONS`] (routing key
+/// [`ROUTING_KEY_SCAN_CANCELLATION`]), consumido por `ms-nmap`. Shape copiado
+/// literalmente de `broker/contracts/scan-cancellation.schema.json` (2
+/// campos, ambos `string`, requeridos, `additionalProperties: false` en el
+/// schema — este `struct` no añade ni omite ninguno).
+///
+/// No transporta ninguna credencial (a diferencia de [`ScanRequest`]), así
+/// que puede derivar `Debug` sin necesidad de redactar nada.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanCancellation {
+    /// El `correlation_id` del `ScanRequest` cuyo escaneo se quiere
+    /// cancelar: el `scanId` propio de este Gateway, el mismo que generó
+    /// `POST /api/scans` (feature `scan_submission`) — nunca el `scan_id`
+    /// que asigna `ms-usuarios`.
+    pub correlation_id: String,
+    /// Identidad (ya verificada por este Gateway) de quien solicitó la
+    /// cancelación — nunca un identificador reenviado sin verificar (ver
+    /// `docs/security-scope.md`).
+    pub requested_by: String,
 }
 
 /// Errores al comunicarse con el Broker desde este Gateway (publicar o
@@ -222,6 +258,15 @@ pub trait ScanRequestPublisher: Send + Sync {
     /// [`ROUTING_KEY_SCAN_REQUEST`]), devolviendo éxito solo una vez que el
     /// Broker confirmó (`ack`) su recepción.
     async fn publish_scan_request(&self, request: &ScanRequest) -> Result<(), BrokerError>;
+
+    /// Publica `cancellation` en [`EXCHANGE_SCAN_CANCELLATIONS`] (routing key
+    /// [`ROUTING_KEY_SCAN_CANCELLATION`]), devolviendo éxito solo una vez que
+    /// el Broker confirmó (`ack`) su recepción (feature
+    /// `scan_history_and_cancellation`).
+    async fn publish_scan_cancellation(
+        &self,
+        cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError>;
 }
 
 /// Cliente `lapin` sobre AMQPS de este Gateway: conexión y canal
@@ -293,23 +338,34 @@ impl BrokerPublisher {
     }
 }
 
-#[async_trait::async_trait]
-impl ScanRequestPublisher for BrokerPublisher {
-    async fn publish_scan_request(&self, request: &ScanRequest) -> Result<(), BrokerError> {
-        let payload = serde_json::to_vec(request).map_err(BrokerError::SerializationFailed)?;
+impl BrokerPublisher {
+    /// Serializa `message` a JSON y lo publica en `exchange` (routing key
+    /// `routing_key`), esperando el ack/nack real del Broker antes de
+    /// devolver éxito (ver la nota de diseño "Confirms del Broker" al inicio
+    /// de este módulo) — lógica compartida entre
+    /// [`ScanRequestPublisher::publish_scan_request`] y
+    /// [`ScanRequestPublisher::publish_scan_cancellation`], que solo difieren
+    /// en el tipo de mensaje y el exchange/routing key de destino.
+    async fn publish_and_confirm(
+        &self,
+        exchange: &'static str,
+        routing_key: &'static str,
+        message: &impl Serialize,
+    ) -> Result<(), BrokerError> {
+        let payload = serde_json::to_vec(message).map_err(BrokerError::SerializationFailed)?;
 
         let publisher_confirm = self
             .channel
             .basic_publish(
-                EXCHANGE_SCAN_REQUESTS,
-                ROUTING_KEY_SCAN_REQUEST,
+                exchange,
+                routing_key,
                 BasicPublishOptions::default(),
                 &payload,
                 BasicProperties::default().with_content_type("application/json".into()),
             )
             .await
             .map_err(|source| BrokerError::PublishFailed {
-                exchange: EXCHANGE_SCAN_REQUESTS.to_string(),
+                exchange: exchange.to_string(),
                 source,
             })?;
 
@@ -317,17 +373,37 @@ impl ScanRequestPublisher for BrokerPublisher {
             publisher_confirm
                 .await
                 .map_err(|source| BrokerError::PublishFailed {
-                    exchange: EXCHANGE_SCAN_REQUESTS.to_string(),
+                    exchange: exchange.to_string(),
                     source,
                 })?;
 
         if !confirmation.is_ack() {
             return Err(BrokerError::NotAcknowledged {
-                exchange: EXCHANGE_SCAN_REQUESTS.to_string(),
+                exchange: exchange.to_string(),
             });
         }
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for BrokerPublisher {
+    async fn publish_scan_request(&self, request: &ScanRequest) -> Result<(), BrokerError> {
+        self.publish_and_confirm(EXCHANGE_SCAN_REQUESTS, ROUTING_KEY_SCAN_REQUEST, request)
+            .await
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        self.publish_and_confirm(
+            EXCHANGE_SCAN_CANCELLATIONS,
+            ROUTING_KEY_SCAN_CANCELLATION,
+            cancellation,
+        )
+        .await
     }
 }
 
@@ -568,5 +644,28 @@ mod tests {
         for key in expected_keys {
             assert!(object.contains_key(key), "falta la clave '{key}'");
         }
+    }
+
+    #[test]
+    fn scan_cancellation_serializes_with_exactly_the_contract_fields() {
+        let cancellation = ScanCancellation {
+            correlation_id: "scan-1".to_string(),
+            requested_by: "google-sub-123".to_string(),
+        };
+
+        let value = serde_json::to_value(&cancellation).expect("debe serializar a JSON");
+        let object = value.as_object().expect("debe ser un objeto JSON");
+
+        let expected_keys = ["correlation_id", "requested_by"];
+        assert_eq!(
+            object.len(),
+            expected_keys.len(),
+            "el ScanCancellation publicado no debe traer campos extra (additionalProperties: false)"
+        );
+        for key in expected_keys {
+            assert!(object.contains_key(key), "falta la clave '{key}'");
+        }
+        assert_eq!(object["correlation_id"], serde_json::json!("scan-1"));
+        assert_eq!(object["requested_by"], serde_json::json!("google-sub-123"));
     }
 }
