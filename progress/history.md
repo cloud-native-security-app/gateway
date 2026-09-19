@@ -262,3 +262,29 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_usuarios_profile_proxy.md`.
 - **Estado final:** feature 5 (`usuarios_profile_proxy`) pasó a `"done"` en
   `feature_list.json`.
+
+## Corrección post-feature-5: nombres reales de header hacia ms-usuarios (2026-09-19)
+
+- **Hallazgo:** investigando el contrato real de `ms-usuarios` para preparar
+  la feature 6 (leyendo el repo hermano `user-service/src/api.rs`, de solo
+  lectura), se confirmó que los headers reales son `X-Gateway-Secret`
+  (credencial de servicio) y `X-Forwarded-User` (identidad) — distintos de
+  `X-Gateway-Identity`/`X-Gateway-Service-Secret` que la feature 5
+  (`usuarios_profile_proxy`) había implementado como suposición documentada
+  (aprobada en su momento porque el contrato no era verificable).
+- También se confirmó que la ruta `GET/PUT /users/me` sí coincidía con lo
+  asumido, y que `user-service` ya expone `POST /users/me/scans` (body
+  `{target}` -> `ScanHistoryEntry` con `status: Pendiente`) y
+  `PATCH /scans/{scan_id}` (body `{status}` -> 204), endpoints que la
+  feature 6 necesitará para el histórico. El vacío de diseño de
+  `network_user`/`ssh_credentials_ref`/`has_sudo` sigue sin resolver en
+  `user-service` — la feature 6 debe seguir el camino de error explícito
+  501/422 ya previsto en `docs/architecture.md`.
+- **Decisión del usuario:** corregir el fix antes de empezar la feature 6.
+- **Fix:** `src/usuarios_client.rs` y sus tests renombrados a los headers
+  reales, cambio mínimo y mecánico (confirmado por el reviewer vía grep:
+  cero referencias a los nombres viejos en todo el repo). `feature_list.json`
+  no se tocó (feature 5 sigue `"done"`, sus criterios de aceptación
+  formales seguían cumpliéndose). `./init.sh` en verde, 41 tests.
+  Detalle en `progress/impl_fix_usuarios_client_headers.md` y
+  `progress/review_fix_usuarios_client_headers.md`.

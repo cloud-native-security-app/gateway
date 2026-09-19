@@ -17,13 +17,17 @@
 //! disponible en este checkout; mientras tanto, este cliente no asume ni
 //! valida ningún campo concreto del perfil.
 //!
-//! El nombre exacto del header de identidad ([`IDENTITY_HEADER_NAME`]) es
-//! también una decisión de diseño explícita de este repo, no un dato tomado
-//! de `user-service/docs`: transporta un JSON `{"sub": "...", "email": "..."}`
-//! con la identidad ya verificada de la sesión activa — nunca el JWT de
-//! sesión completo, nunca el token de Google (ver `docs/security-scope.md`).
-//! Junto a él viaja la credencial de servicio compartida
-//! (`MS_USUARIOS_SHARED_SECRET`) en [`SERVICE_SECRET_HEADER_NAME`].
+//! Los nombres exactos de los headers de identidad
+//! ([`FORWARDED_USER_HEADER_NAME`]) y de credencial de servicio
+//! ([`GATEWAY_SECRET_HEADER_NAME`]) están confirmados contra el contrato real
+//! de `user-service` (`user-service/src/api.rs`, constantes
+//! `FORWARDED_USER_HEADER`/`GATEWAY_SECRET_HEADER`), no son una suposición de
+//! este repo. El header de identidad transporta un JSON
+//! `{"sub": "...", "email": "..."}` con la identidad ya verificada de la
+//! sesión activa — nunca el JWT de sesión completo, nunca el token de Google
+//! (ver `docs/security-scope.md`). Junto a él viaja la credencial de
+//! servicio compartida (`MS_USUARIOS_SHARED_SECRET`) en
+//! [`GATEWAY_SECRET_HEADER_NAME`].
 
 use reqwest::{Client, RequestBuilder};
 use secrecy::{ExposeSecret, SecretString};
@@ -34,13 +38,17 @@ use crate::domain::Session;
 /// Nombre del header que transporta la identidad ya verificada de la sesión
 /// activa hacia `ms-usuarios`, en formato JSON (`{"sub", "email"}`).
 ///
-/// Decisión de diseño documentada al inicio de este módulo: el contrato real
-/// de `user-service` no está disponible en este checkout.
-pub const IDENTITY_HEADER_NAME: &str = "X-Gateway-Identity";
+/// Confirmado contra el contrato real de `user-service`
+/// (`user-service/src/api.rs::FORWARDED_USER_HEADER`), ver la nota de diseño
+/// al inicio de este módulo.
+pub const FORWARDED_USER_HEADER_NAME: &str = "X-Forwarded-User";
 
 /// Nombre del header que transporta la credencial de servicio compartida
 /// (`MS_USUARIOS_SHARED_SECRET`) hacia `ms-usuarios`.
-pub const SERVICE_SECRET_HEADER_NAME: &str = "X-Gateway-Service-Secret";
+///
+/// Confirmado contra el contrato real de `user-service`
+/// (`user-service/src/api.rs::GATEWAY_SECRET_HEADER`).
+pub const GATEWAY_SECRET_HEADER_NAME: &str = "X-Gateway-Secret";
 
 /// Perfil de usuario devuelto o enviado a `ms-usuarios`, tratado como JSON
 /// opaco: ver la nota de diseño al inicio de este módulo sobre por qué este
@@ -76,8 +84,9 @@ pub enum UsuariosClientError {
     RequestBuild,
 }
 
-/// Cuerpo del header [`IDENTITY_HEADER_NAME`]: la identidad ya verificada de
-/// la sesión activa, nunca el JWT de sesión completo ni el token de Google.
+/// Cuerpo del header [`FORWARDED_USER_HEADER_NAME`]: la identidad ya
+/// verificada de la sesión activa, nunca el JWT de sesión completo ni el
+/// token de Google.
 #[derive(Debug, Serialize)]
 struct IdentityHeaderPayload<'a> {
     sub: &'a str,
@@ -131,9 +140,9 @@ impl UsuariosClient {
         let request = self
             .http
             .get(self.profile_url())
-            .header(IDENTITY_HEADER_NAME, identity_header)
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
             .header(
-                SERVICE_SECRET_HEADER_NAME,
+                GATEWAY_SECRET_HEADER_NAME,
                 self.shared_secret.expose_secret(),
             );
 
@@ -154,9 +163,9 @@ impl UsuariosClient {
         let request = self
             .http
             .put(self.profile_url())
-            .header(IDENTITY_HEADER_NAME, identity_header)
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
             .header(
-                SERVICE_SECRET_HEADER_NAME,
+                GATEWAY_SECRET_HEADER_NAME,
                 self.shared_secret.expose_secret(),
             )
             .json(profile);

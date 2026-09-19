@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gateway::domain::Session;
 use gateway::usuarios_client::{
-    UsuariosClient, UsuariosClientError, IDENTITY_HEADER_NAME, SERVICE_SECRET_HEADER_NAME,
+    UsuariosClient, UsuariosClientError, FORWARDED_USER_HEADER_NAME, GATEWAY_SECRET_HEADER_NAME,
 };
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -44,7 +44,7 @@ struct StubState {
 
 fn secret_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
-        .get(SERVICE_SECRET_HEADER_NAME)
+        .get(GATEWAY_SECRET_HEADER_NAME)
         .and_then(|value| value.to_str().ok())
         == Some(expected)
 }
@@ -59,7 +59,7 @@ async fn get_users_me(
             Json(json!({"error": "credencial de servicio inválida"})),
         );
     }
-    if headers.get(IDENTITY_HEADER_NAME).is_none() {
+    if headers.get(FORWARDED_USER_HEADER_NAME).is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "falta el header de identidad"})),
