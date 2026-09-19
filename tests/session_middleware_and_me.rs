@@ -19,6 +19,7 @@ use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ROUTES};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::domain::Session;
+use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::JwkSet;
 use secrecy::SecretString;
 use serde_json::json;
@@ -89,6 +90,15 @@ async fn spawn_gateway() -> GatewayUnderTest {
     .await
     .expect("discovery contra el IdP de prueba debe funcionar");
 
+    // Esta feature no ejercita `usuarios_client` (solo enumera rutas y
+    // valida `/api/me`): apunta a una URL de laboratorio que nunca se
+    // contacta en estos tests.
+    let usuarios_client = UsuariosClient::new(
+        "http://ms-usuarios.invalid".to_string(),
+        SecretString::from("lab-only-not-a-real-secret".to_string()),
+    )
+    .expect("cliente de laboratorio hacia ms-usuarios debe construirse");
+
     let state = AppState {
         oidc_client: Arc::new(oidc_client),
         login_states: Arc::new(LoginStateStore::new()),
@@ -96,6 +106,7 @@ async fn spawn_gateway() -> GatewayUnderTest {
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        usuarios_client: Arc::new(usuarios_client),
     };
 
     let app = app_router(state);

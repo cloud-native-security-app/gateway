@@ -77,7 +77,7 @@
         "GET /api/profile (ruta protegida) usa este cliente y devuelve el perfil del usuario de la sesión activa",
         "Tests de integración: contra un servidor HTTP de test que implementa el contrato documentado de ms-usuarios — camino feliz, credencial de servicio incorrecta simulada como 401 de ms-usuarios, ms-usuarios caído simula 502/504 sin panic"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 6,

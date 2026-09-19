@@ -207,3 +207,58 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_session_middleware_and_me.md`.
 - **Estado final:** feature 4 (`session_middleware_and_me`) pasó a
   `"done"` en `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 5: usuarios_profile_proxy — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  `reqwest` ya presente como dev-dependency con `rustls-tls`, sin crates ni
+  API desconocida).
+- **Qué se hizo:** único módulo que conoce la URL y el contrato HTTP de
+  `ms-usuarios`. `Cargo.toml` promueve `reqwest` de `dev-dependencies` a
+  `dependencies` (mismas features `rustls-tls`, sin `native-tls`, más
+  `json` para simplificar el (de)serializado). `src/usuarios_client.rs`
+  (antes vacío) implementa `UsuariosClient::{new, get_profile,
+  upsert_profile}` (`GET`/`PUT /users/me`), reenviando en cada llamada un
+  header de identidad `X-Gateway-Identity` (JSON `{"sub","email"}`, nunca
+  el JWT de sesión completo ni el token de Google) y la credencial de
+  servicio `MS_USUARIOS_SHARED_SECRET` en `X-Gateway-Service-Secret`; y
+  `UsuariosClientError` (`thiserror`: `Unreachable`, `UnexpectedResponse`,
+  `MalformedResponse`, `RequestBuild`), ninguna variante expone la URL base
+  ni la credencial. Como el contrato real de `user-service/docs` no está
+  disponible en este checkout, el perfil se trata como JSON opaco
+  (`UserProfile = serde_json::Value`, reenviado tal cual en vez de inventar
+  campos) — decisión documentada explícitamente como suposición a
+  confirmar, no como contrato cerrado. `src/api.rs` gana
+  `AppState::usuarios_client`, la ruta `GET /api/profile` (protegida,
+  dentro de `protected_router`, listada en `ROUTES`) y
+  `impl IntoResponse for UsuariosClientError`
+  (`Unreachable→504`, `UnexpectedResponse`/`MalformedResponse→502`,
+  `RequestBuild→500`). `tests/oidc_login.rs` y
+  `tests/session_middleware_and_me.rs` se actualizaron solo para pasar un
+  `UsuariosClient` de laboratorio al nuevo campo obligatorio de `AppState`,
+  sin tocar su lógica.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (19 unitarios lib + 8
+  `oidc_login` + 5 `session_middleware_and_me` + 6 `usuarios_client` nuevos
+  + 3 `usuarios_profile_proxy` nuevos = 41 tests verdes, ninguna feature
+  1-4 se rompió), `cargo doc --no-deps` y `./init.sh` — todo en verde, 0
+  warnings. Ningún test de esta feature está `#[ignore]` (no depende de
+  Docker: servidor HTTP de test real en puerto efímero, mismo patrón que
+  `oidc_login`). Detalle completo en
+  `progress/impl_usuarios_profile_proxy.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación y validar los 5
+  criterios de aceptación uno por uno contra el código y los tests (líneas
+  concretas citadas), con `grep` propio para confirmar que ningún otro
+  módulo hace HTTP directo hacia `ms-usuarios`, que la credencial de
+  servicio nunca se loggea, y que no hay `unwrap`/`expect`/`panic!` fuera
+  de tests en el código nuevo. Confirmó explícitamente que las suposiciones
+  sobre el contrato de `ms-usuarios` (nombres de header, shape de perfil
+  como JSON opaco) están marcadas como suposición a confirmar y no como
+  contrato cerrado, coherente con `docs/architecture.md` §"Qué NO hacer".
+  Sin cambios requeridos. Detalle completo en
+  `progress/review_usuarios_profile_proxy.md`.
+- **Estado final:** feature 5 (`usuarios_profile_proxy`) pasó a `"done"` en
+  `feature_list.json`.

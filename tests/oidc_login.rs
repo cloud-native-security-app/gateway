@@ -19,6 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use gateway::api::{auth_router, AppState};
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
+use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
     RSAKeyParameters, RSAKeyType,
@@ -218,6 +219,14 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
 
     let session_signing_key = SecretString::from("lab-only-not-a-real-secret".to_string());
 
+    // Esta feature no ejercita `usuarios_client`: apunta a una URL de
+    // laboratorio que nunca se contacta en estos tests.
+    let usuarios_client = UsuariosClient::new(
+        "http://ms-usuarios.invalid".to_string(),
+        SecretString::from("lab-only-not-a-real-secret".to_string()),
+    )
+    .expect("cliente de laboratorio hacia ms-usuarios debe construirse");
+
     let state = AppState {
         oidc_client: Arc::new(oidc_client),
         login_states: Arc::new(LoginStateStore::new()),
@@ -225,6 +234,7 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        usuarios_client: Arc::new(usuarios_client),
     };
 
     let app = auth_router(state);

@@ -1,10 +1,11 @@
 //! Handlers y router `axum` de toda ruta pública de este Gateway.
 //!
 //! Expone las rutas de login/callback/logout OIDC (feature `oidc_login`),
-//! una ruta de salud, y `GET /api/me` (feature `session_middleware_and_me`),
-//! la primera ruta protegida por el middleware de sesión de
-//! [`crate::auth::require_session`]. El resto de rutas públicas (perfil,
-//! escaneos, SSE, documentación) se añaden en features posteriores.
+//! una ruta de salud, `GET /api/me` (feature `session_middleware_and_me`) y
+//! `GET /api/profile` (feature `usuarios_profile_proxy`), protegidas por el
+//! middleware de sesión de [`crate::auth::require_session`]. El resto de
+//! rutas públicas (escaneos, SSE, documentación) se añaden en features
+//! posteriores.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::domain::Session;
+use crate::usuarios_client::{UserProfile, UsuariosClient, UsuariosClientError};
 
 /// Estado compartido por los handlers de autenticación de este router.
 #[derive(Clone)]
@@ -37,6 +39,9 @@ pub struct AppState {
     pub session_audience: String,
     /// Emisor (`iss`) que se embebe en la sesión propia emitida.
     pub session_issuer: String,
+    /// Cliente HTTP hacia `ms-usuarios` (único módulo que le habla
+    /// directamente, ver `docs/architecture.md` capa `usuarios_client`).
+    pub usuarios_client: Arc<UsuariosClient>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -80,10 +85,12 @@ fn protected_router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/me", get(me))
+        .route("/api/profile", get(profile))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
         ))
+        .with_state(state)
 }
 
 /// Identidad de la sesión activa devuelta por `GET /api/me`.
@@ -114,6 +121,20 @@ impl From<Session> for MeResponse {
 /// (`usuarios_profile_proxy`).
 async fn me(Extension(session): Extension<Session>) -> Json<MeResponse> {
     Json(session.into())
+}
+
+/// Devuelve el perfil del usuario de la sesión activa, proxeando
+/// `GET /users/me` de `ms-usuarios` a través de
+/// [`crate::usuarios_client::UsuariosClient`] — único módulo de este repo
+/// que le habla directamente (RF-09). Un fallo de red o un 5xx de
+/// `ms-usuarios` se traduce en `502`/`504` sin exponer su URL interna en el
+/// cuerpo de la respuesta (ver `docs/security-scope.md`).
+async fn profile(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<Json<UserProfile>, UsuariosClientError> {
+    let profile = state.usuarios_client.get_profile(&session).await?;
+    Ok(Json(profile))
 }
 
 /// Descripción de una ruta expuesta por [`app_router`], usada tanto para
@@ -163,6 +184,11 @@ pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
         path: "/api/me",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/profile",
         protected: true,
     },
 ];
@@ -293,6 +319,28 @@ impl IntoResponse for AuthError {
         };
 
         tracing::warn!(error = %self, %status, "fallo de autenticación");
+
+        (status, self.to_string()).into_response()
+    }
+}
+
+impl IntoResponse for UsuariosClientError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            // Fallo de red/timeout hacia ms-usuarios: el Gateway no obtuvo
+            // ninguna respuesta.
+            UsuariosClientError::Unreachable => StatusCode::GATEWAY_TIMEOUT,
+            // ms-usuarios respondió, pero con un status inesperado (incluye
+            // 5xx propio y un 401 por credencial de servicio rechazada) o un
+            // cuerpo 2xx que no se pudo interpretar.
+            UsuariosClientError::UnexpectedResponse { .. }
+            | UsuariosClientError::MalformedResponse => StatusCode::BAD_GATEWAY,
+            // Fallo al construir la propia solicitud: un bug de este
+            // Gateway, no de ms-usuarios.
+            UsuariosClientError::RequestBuild => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+
+        tracing::warn!(error = %self, %status, "fallo al comunicarse con el servicio de usuarios");
 
         (status, self.to_string()).into_response()
     }
