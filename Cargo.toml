@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 axum = "0.7"
 axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
 cookie = { version = "0.18.2", default-features = false }
@@ -31,6 +31,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # 2.5.5 usa `async fn` en un trait sin soporte nativo para objetos `dyn`.
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+# `.next()` sobre el `Consumer` (`Stream`) de `lapin` en el consumidor de
+# producción de `gateway.scan-outcomes` (`src/broker.rs`) y `stream::unfold`
+# para construir el `Stream<Item = Result<Event, Infallible>>` del handler
+# SSE (`src/realtime.rs`, feature `scan_outcome_relay`) — código de
+# producción, no solo de test (antes solo estaba en `[dev-dependencies]`,
+# ver `progress/explore_sse.md`).
+futures-util = "0.3"
 
 [dev-dependencies]
 testcontainers = "0.20"
@@ -42,7 +49,12 @@ url = "2"
 # primera conexión AMQPS en tests (ver `progress/explore_lapin_testcontainers.md`
 # §4, gotcha de doble-proveedor `rustls`).
 rustls = "0.23"
-# `.next()` sobre el `Consumer` (`Stream`) de `lapin` en el test de
-# integración de `scan_submission`, que consume la cola de verificación con
-# el usuario `lab-admin`.
-futures-util = "0.3"
+# `Response::bytes_stream()` en los tests de integración del stream SSE
+# (feature `scan_outcome_relay`) está tras este feature de `reqwest`, no
+# activo en `[dependencies]` (ver `progress/explore_sse.md`).
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+# `bytes::Bytes` es el `Item` de `Response::bytes_stream()`, usado para leer
+# a mano el `text/event-stream` en los tests de `scan_outcome_relay` (ya es
+# una dependencia transitiva de `reqwest`, se declara explícita para poder
+# nombrarla en `tests/`).
+bytes = "1"

@@ -24,10 +24,11 @@ use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use gateway::api::{app_router, AppState};
+use gateway::api::{app_router, AppState, ScanOwnershipRegistry};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, BrokerPublisher, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
+use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, ConfirmSelectOptions, QueueBindOptions,
@@ -266,6 +267,8 @@ async fn spawn_gateway(
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher,
+        scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
+        realtime: Arc::new(RealtimeRegistry::new()),
     };
 
     let app = app_router(state);

@@ -17,9 +17,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use gateway::api::{auth_router, AppState};
+use gateway::api::{auth_router, AppState, ScanOwnershipRegistry};
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
+use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
@@ -249,6 +250,8 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher: Arc::new(NeverPublishesToBroker),
+        scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
+        realtime: Arc::new(RealtimeRegistry::new()),
     };
 
     let app = auth_router(state);

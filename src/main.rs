@@ -3,5 +3,9 @@
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    gateway::run().await;
+
+    if let Err(err) = gateway::run().await {
+        tracing::error!(error = %err, "el proceso de gateway terminó con un error fatal");
+        std::process::exit(1);
+    }
 }

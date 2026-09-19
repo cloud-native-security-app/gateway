@@ -388,3 +388,106 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   Detalle completo en `progress/review_scan_submission.md`.
 - **Estado final:** feature 6 (`scan_submission`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 7: scan_outcome_relay — DONE
+
+- **Agente:** leader (orquestando 2 explorers en paralelo + implementer +
+  reviewer).
+- **Investigación previa:** el leader confirmó directamente (sin
+  subagente, leyendo repos hermanos de solo lectura) el shape exacto de
+  `ScanOutcome` (`broker/contracts/scan-outcome.schema.json`: 3 variantes
+  `started`/`completed`/`failed` discriminadas por `status`, todas con
+  `correlation_id` — el `scanId` propio de Gateway generado en la feature
+  6, no un identificador nuevo) y detectó un problema de diseño heredado
+  de la feature 6: `PATCH /scans/{scan_id}` de `ms-usuarios` exige SU
+  PROPIO `scan_id`, distinto del `correlation_id`. Resuelto con el usuario:
+  registro en memoria en `AppState`, poblado por `submit_scan` (feature 6,
+  ya cerrada, extendida sin reabrirse) y consultado por esta feature. Se
+  despacharon 2 explorers en paralelo:
+  `progress/explore_lapin_consume.md` (API de consumo de `lapin` 2.5.5:
+  `basic_consume`/`Consumer` como `Stream`/`Acker::ack`/`nack`; sin
+  reconexión automática por diseño; mensaje malformado ->
+  `nack(requeue=false)`, justificado contra el comportamiento real de
+  `x-delivery-limit`; no hace falta declarar cola/binding, topología y
+  permisos ya existen) y `progress/explore_sse.md` (`axum::response::sse`
+  0.7.9, diseño de `RealtimeRegistry` con `broadcast::Sender` tras
+  `RwLock`, cierre de stream con `stream::unfold`, patrón de test SSE con
+  `reqwest::bytes_stream()`; 2 gotchas de dependencias corregidos y aviso
+  crítico de sintaxis de ruta `:scan_id` en axum 0.7, no `{scan_id}`).
+- **Qué se hizo:** consumo de `gateway.scan-outcomes` y relay en tiempo
+  real vía SSE (RF-07/RF-08). `src/domain.rs` gana `ScanOutcomeEvent`
+  (enum `Started`/`Completed`/`Failed`, tag `status`,
+  `deny_unknown_fields`, copiado literal del schema real) y
+  `ScanResult`/`PortFinding`/`VulnFinding`. `src/broker.rs` gana
+  `BrokerConsumer` (conexión/canal `lapin` dedicados, reutilizando la
+  lógica de conexión AMQPS ya factorizada junto a `BrokerPublisher`) y el
+  trait `ScanOutcomeHandler`: `run()` consume la cola sin declarar
+  topología (coherente con `configure: "^$"` del usuario `gateway`), hace
+  `ack` en cuanto decodifica con éxito (antes de invocar al handler, para
+  que un fallo downstream nunca bloquee el ack) y `nack(requeue: false)`
+  en mensaje malformado (log sin payload crudo: solo el error de
+  deserialización, `routing_key`, tamaño en bytes). `src/realtime.rs` gana
+  `RealtimeRegistry` (`HashMap<scan_id, broadcast::Sender>` tras `RwLock`,
+  `subscribe_stream` construido con `stream::unfold` que cierra
+  ordenadamente al emitir un evento terminal, `SubscriptionGuard` con
+  `Drop` para limpiar el registro tanto en cierre ordenado como en
+  desconexión temprana del cliente). `src/api.rs` gana
+  `ScanOwnershipRegistry`/`ScanOwnership` (registro en memoria acordado
+  con el usuario: `scanId` propio -> `{ms_usuarios_scan_id, owner:
+  Session}`, mismo patrón/limitación que `auth::LoginStateStore`),
+  `AppState::scan_ownership`/`AppState::realtime`, la ruta
+  `GET /api/scans/:scan_id/events` (protegida, sintaxis axum 0.7) con
+  autorización estricta por sesión dueña (404 idéntico para scan_id
+  ausente o ajeno, nunca revela si existe), y **una única línea añadida**
+  a `submit_scan` (feature 6, ya aprobada, no reabierta) que registra la
+  propiedad justo después de `create_scan_history`. Como ninguna feature
+  anterior había necesitado un proceso realmente en marcha (todas
+  probaban su router a mano), esta feature materializó por primera vez la
+  capa `wiring` ya prevista (pero diferida) en `docs/architecture.md`:
+  `src/wiring.rs` (nuevo) construye `OidcClient`/`UsuariosClient`/
+  `BrokerPublisher`/`BrokerConsumer`/`ScanOwnershipRegistry`/
+  `RealtimeRegistry` y el `ScanOutcomeRelay` (puente privado que ata el
+  consumidor a `ms-usuarios` + SSE, best-effort); `src/lib.rs::run()` pasó
+  de un stub a un arranque real (`Config::from_env` -> `wiring::build` ->
+  `tokio::spawn` del consumidor de fondo -> `axum::serve`), con `RunError`
+  tipado y `main.rs` loggeando y saliendo con código 1 en caso de fallo,
+  sin panics. Nuevo archivo `tests/scan_outcome_relay.rs` (2 tests sin
+  Docker para el rechazo de `scan_id` ajeno/inexistente + 1
+  `#[ignore = "requiere Docker"]` que publica manualmente
+  `started`/malformado/`completed` en la cola real, verifica el stream SSE
+  en orden con cierre tras el evento terminal, y confirma que `ms-usuarios`
+  recibe `EN_PROGRESO`/`COMPLETADO` en orden). `Cargo.toml`: `futures-util`
+  promovida a `[dependencies]` (ya usada en producción), `tokio` con
+  feature `sync` explícito, `reqwest`+`bytes` añadidos a
+  `[dev-dependencies]` para `bytes_stream()` en el test SSE.
+  `tests/oidc_login.rs`/`tests/session_middleware_and_me.rs`/
+  `tests/usuarios_profile_proxy.rs`/`tests/scan_submission.rs`
+  actualizados mecánicamente para los 2 campos nuevos de `AppState`.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (47 unitarios + 27 de
+  integración sin Docker en verde, ninguna feature 1-6 se rompió),
+  `cargo test -- --ignored` (Docker disponible: ambos tests Docker —el
+  nuevo de esta feature y el ya existente de `scan_submission`— pasan, sin
+  contenedores huérfanos), `cargo doc --no-deps` y `./init.sh` — todo en
+  verde, 0 warnings. Detalle completo en
+  `progress/impl_scan_outcome_relay.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el test
+  Docker), validar los 6 criterios de aceptación uno por uno contra el
+  código/tests (líneas concretas citadas), confirmar por `git diff` que el
+  único cambio dentro de `submit_scan` (feature 6) es la inserción de 3
+  líneas sin alterar el resto de su lógica ya aprobada, y confirmar que
+  ningún log nuevo incluye la credencial AMQPS, `ssh_credentials_ref`, la
+  credencial de servicio hacia `ms-usuarios`, ni la sesión firmada
+  completa. Evaluó explícitamente la expansión hacia `wiring`/`run()` real
+  (antes un stub) y la consideró proporcional y necesaria, no una
+  expansión de alcance injustificada: la capa `wiring` ya estaba prevista
+  en `docs/architecture.md` y diferida explícitamente por la feature 1
+  "para cuando una feature futura lo requiera explícitamente" — esta es
+  esa feature (primera con una tarea de fondo que debe vivir todo el ciclo
+  de vida del proceso). Sin cambios requeridos. Detalle completo en
+  `progress/review_scan_outcome_relay.md`.
+- **Estado final:** feature 7 (`scan_outcome_relay`) pasó a `"done"` en
+  `feature_list.json`.

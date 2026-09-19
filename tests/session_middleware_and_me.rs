@@ -16,10 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use gateway::api::{app_router, AppState, ROUTES};
+use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ROUTES};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
+use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::JwkSet;
 use secrecy::SecretString;
@@ -122,6 +123,8 @@ async fn spawn_gateway() -> GatewayUnderTest {
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher: Arc::new(NeverPublishesToBroker),
+        scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
+        realtime: Arc::new(RealtimeRegistry::new()),
     };
 
     let app = app_router(state);

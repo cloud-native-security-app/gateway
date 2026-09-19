@@ -108,7 +108,7 @@
         "Un mensaje malformado en la cola se descarta con un log (sin credenciales) y no tumba el consumidor",
         "Tests de integración (#[ignore = \"requiere Docker\"]): publicar manualmente started/completed/failed en la cola de test y verificar que el stream SSE los recibe en orden; un scan_id de otro usuario es rechazado; mensaje malformado no tumba el consumidor"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,

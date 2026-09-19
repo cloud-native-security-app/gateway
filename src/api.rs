@@ -7,23 +7,114 @@
 //! rutas públicas (escaneos, SSE, documentación) se añaden en features
 //! posteriores.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::CookieJar;
+use futures_util::Stream;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
 use crate::domain::{ScanSubmission, ScanSubmissionError, Session};
+use crate::realtime::RealtimeRegistry;
 use crate::usuarios_client::{ScanStatus, UserProfile, UsuariosClient, UsuariosClientError};
+
+/// Entrada de [`ScanOwnershipRegistry`]: qué `scan_id` le asignó
+/// `ms-usuarios` a la entrada de histórico de un `scanId` propio de este
+/// Gateway, y qué sesión (usuario) lo generó.
+#[derive(Clone)]
+pub struct ScanOwnership {
+    /// `scan_id` asignado por `ms-usuarios` (`ScanHistoryEntry::scan_id`,
+    /// ver [`crate::usuarios_client::UsuariosClient::create_scan_history`]),
+    /// distinto del `scanId`/`correlation_id` propio de este Gateway usado
+    /// como clave de [`ScanOwnershipRegistry`].
+    pub ms_usuarios_scan_id: String,
+    /// Sesión (identidad ya verificada) que generó este `scanId` en `POST
+    /// /api/scans` — usada tanto para llamar a `ms-usuarios` con la
+    /// identidad correcta ([`crate::usuarios_client::UsuariosClient::update_scan_status`])
+    /// como para verificar que solo su dueño puede suscribirse al stream SSE
+    /// correspondiente (feature `scan_outcome_relay`, criterio de
+    /// aceptación 4).
+    pub owner: Session,
+}
+
+/// Registro en memoria, por `scanId`/`correlation_id` propio de este
+/// Gateway, de a qué [`ScanOwnership`] pertenece cada solicitud de escaneo
+/// en curso.
+///
+/// Poblado por `submit_scan` (handler de `POST /api/scans`, feature
+/// `scan_submission`) justo después de registrar con éxito la entrada de
+/// histórico en `ms-usuarios`, y
+/// consultado tanto por el consumidor de `gateway.scan-outcomes` (feature
+/// `scan_outcome_relay`, para saber qué `scan_id` de `ms-usuarios` y qué
+/// identidad usar en `update_scan_status`) como por
+/// `GET /api/scans/{scan_id}/events` (para verificar que el `scan_id`
+/// solicitado pertenece a la sesión activa).
+///
+/// **Limitación conocida, aceptada, mismo patrón que
+/// `auth::LoginStateStore`**: vive únicamente en la memoria de este
+/// proceso — no sobrevive un reinicio ni se comparte entre instancias de
+/// Gateway. No se persigue aquí una solución persistente (p. ej. recuperar
+/// este mapeo consultando a `ms-usuarios`) porque está fuera del alcance de
+/// esta feature y añadiría complejidad no pedida; si Gateway llega a
+/// desplegarse con más de una instancia, o a necesitar sobrevivir un
+/// restart mientras hay escaneos en curso, esto necesitará un store
+/// compartido, a discutir como feature aparte si llega a hacer falta.
+pub struct ScanOwnershipRegistry {
+    entries: RwLock<HashMap<String, ScanOwnership>>,
+}
+
+impl ScanOwnershipRegistry {
+    /// Registro vacío.
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Registra que `scan_id` (propio de este Gateway) pertenece a `owner`,
+    /// y que `ms-usuarios` lo identifica internamente como
+    /// `ms_usuarios_scan_id`.
+    pub fn register(&self, scan_id: &str, ms_usuarios_scan_id: String, owner: Session) {
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.insert(
+            scan_id.to_string(),
+            ScanOwnership {
+                ms_usuarios_scan_id,
+                owner,
+            },
+        );
+    }
+
+    /// Devuelve la [`ScanOwnership`] registrada para `scan_id`, si existe.
+    pub fn lookup(&self, scan_id: &str) -> Option<ScanOwnership> {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.get(scan_id).cloned()
+    }
+}
+
+impl Default for ScanOwnershipRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Estado compartido por los handlers de autenticación de este router.
 #[derive(Clone)]
@@ -48,6 +139,13 @@ pub struct AppState {
     /// otras features puedan inyectar un doble de prueba en vez de una
     /// conexión AMQPS real (ver `crate::broker::ScanRequestPublisher`).
     pub broker_publisher: Arc<dyn ScanRequestPublisher>,
+    /// Registro en memoria de a qué sesión/`scan_id` de `ms-usuarios`
+    /// pertenece cada `scanId` propio de este Gateway (feature
+    /// `scan_outcome_relay`, ver [`ScanOwnershipRegistry`]).
+    pub scan_ownership: Arc<ScanOwnershipRegistry>,
+    /// Registro de streams SSE activos por `scanId` (feature
+    /// `scan_outcome_relay`, ver [`crate::realtime::RealtimeRegistry`]).
+    pub realtime: Arc<RealtimeRegistry>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -93,6 +191,7 @@ fn protected_router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/profile", get(profile))
         .route("/api/scans", post(submit_scan))
+        .route("/api/scans/:scan_id/events", get(scan_events))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -219,6 +318,16 @@ async fn submit_scan(
         .create_scan_history(&session, &submission.target)
         .await?;
 
+    // Feature `scan_outcome_relay`: registra a quién pertenece este
+    // `scanId` (sesión + `scan_id` asignado por `ms-usuarios`) justo después
+    // de registrar el histórico con éxito, para que el consumidor de
+    // `gateway.scan-outcomes` y el stream SSE puedan resolverlo más
+    // adelante (ver `AppState::scan_ownership`). No altera el resto de esta
+    // función, ya aprobada en la feature `scan_submission`.
+    state
+        .scan_ownership
+        .register(&scan_id, history_entry.scan_id.clone(), session.clone());
+
     let scan_request = ScanRequest {
         correlation_id: scan_id.clone(),
         ip: submission.target,
@@ -248,6 +357,53 @@ async fn submit_scan(
     }
 
     Ok(Json(ScanSubmissionResponse { scan_id }))
+}
+
+/// Errores de `GET /api/scans/{scan_id}/events`.
+#[derive(Debug, thiserror::Error)]
+enum ScanEventsError {
+    /// `scan_id` no tiene ninguna [`ScanOwnership`] registrada, o pertenece
+    /// a una sesión distinta de la activa. Mismo status en ambos casos
+    /// (`404`), para no revelar a un usuario que un `scan_id` ajeno existe
+    /// (mismo criterio que exige la feature `scan_history_and_cancellation`
+    /// para cancelar un scan ajeno).
+    #[error("no existe un escaneo con ese identificador para la sesión activa")]
+    NotFound,
+}
+
+impl IntoResponse for ScanEventsError {
+    fn into_response(self) -> Response {
+        tracing::debug!(error = %self, "solicitud de stream SSE rechazada");
+        (StatusCode::NOT_FOUND, self.to_string()).into_response()
+    }
+}
+
+/// Abre un stream SSE (`text/event-stream`) que emite cada
+/// [`crate::domain::ScanOutcomeEvent`] nuevo de `scan_id` a medida que el
+/// consumidor de `gateway.scan-outcomes` los recibe (RF-07/RF-08), hasta
+/// alcanzar un estado terminal (`completed`/`failed`), momento en el que el
+/// stream se cierra ordenadamente (ver [`crate::realtime::RealtimeRegistry::subscribe_stream`]).
+///
+/// Solo la sesión que generó `scan_id` (en `submit_scan`, el handler de
+/// `POST /api/scans`) puede suscribirse: `scan_id` ausente en
+/// [`AppState::scan_ownership`], o
+/// perteneciente a otra sesión, responde `404` (nunca revela que un
+/// `scan_id` ajeno existe, ver [`ScanEventsError::NotFound`]).
+async fn scan_events(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(scan_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ScanEventsError> {
+    let ownership = state
+        .scan_ownership
+        .lookup(&scan_id)
+        .ok_or(ScanEventsError::NotFound)?;
+
+    if ownership.owner.sub != session.sub {
+        return Err(ScanEventsError::NotFound);
+    }
+
+    Ok(Sse::new(state.realtime.subscribe_stream(scan_id)))
 }
 
 /// Descripción de una ruta expuesta por [`app_router`], usada tanto para
@@ -307,6 +463,11 @@ pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: "/api/scans",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/scans/:scan_id/events",
         protected: true,
     },
 ];

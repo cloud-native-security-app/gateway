@@ -107,6 +107,136 @@ fn is_valid_cidr(ip_part: &str, prefix_part: &str) -> bool {
     prefix <= max_prefix
 }
 
+/// Evento de avance de un escaneo publicado por `ms-nmap` en
+/// `gateway.scan-outcomes` (routing keys `scan.outcome.started`/`completed`/
+/// `failed`), consumido por este Gateway (feature `scan_outcome_relay`) y
+/// relayado a los clientes SSE suscritos al `scanId` correspondiente
+/// (RF-07/RF-08).
+///
+/// Shape copiado literalmente de `broker/contracts/scan-outcome.schema.json`
+/// (`oneOf` discriminado por `status`, `additionalProperties: false` en cada
+/// variante — de ahí `#[serde(deny_unknown_fields)]`): un mensaje que no
+/// respeta este contrato falla al deserializar, lo cual el consumidor de
+/// `crate::broker` trata como mensaje malformado (se descarta, nunca tumba
+/// el proceso).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScanOutcomeEvent {
+    /// El escaneo comenzó a ejecutarse (`ms-nmap` lo refleja como
+    /// `EnProgreso` en `ms-usuarios`). Contrato acordado, aunque `ms-nmap`
+    /// todavía no lo publica en producción (ver
+    /// `broker/contracts/README.md`) — este consumidor lo trata igual que
+    /// las otras dos variantes.
+    Started {
+        /// Identificador de correlación: el `scanId` propio de este
+        /// Gateway, el mismo que generó `POST /api/scans` (feature
+        /// `scan_submission`) y usó como `correlation_id` del `ScanRequest`
+        /// publicado.
+        correlation_id: String,
+    },
+    /// El escaneo terminó exitosamente, con un resultado utilizable.
+    Completed {
+        /// Ver [`Self::Started`].
+        correlation_id: String,
+        /// Resultado completo del escaneo (puertos, hallazgos de
+        /// vulnerabilidades).
+        result: ScanResult,
+    },
+    /// El escaneo terminó con un error y no produjo un resultado
+    /// utilizable.
+    Failed {
+        /// Ver [`Self::Started`].
+        correlation_id: String,
+        /// Motivo del fallo, tal como lo reporta `ms-nmap`.
+        reason: String,
+    },
+}
+
+impl ScanOutcomeEvent {
+    /// Identificador de correlación de este evento: el `scanId` propio de
+    /// este Gateway (ver [`Self::Started::correlation_id`]), común a las
+    /// tres variantes.
+    pub fn correlation_id(&self) -> &str {
+        match self {
+            ScanOutcomeEvent::Started { correlation_id }
+            | ScanOutcomeEvent::Completed { correlation_id, .. }
+            | ScanOutcomeEvent::Failed { correlation_id, .. } => correlation_id,
+        }
+    }
+
+    /// `true` si este evento representa un estado terminal (`completed`/
+    /// `failed`): un stream SSE debe cerrarse ordenadamente justo después de
+    /// emitirlo (ver `crate::realtime`).
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ScanOutcomeEvent::Completed { .. } | ScanOutcomeEvent::Failed { .. }
+        )
+    }
+}
+
+/// Resultado completo de un escaneo (`ScanOutcomeEvent::Completed::result`).
+/// Shape copiado literalmente de `broker/contracts/scan-outcome.schema.json`
+/// (`$defs/scanResult`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanResult {
+    /// IP escaneada.
+    pub host: String,
+    /// Puertos encontrados y su estado.
+    pub ports: Vec<PortFinding>,
+    /// Hallazgos de vulnerabilidades asociados al escaneo.
+    pub vulnerabilities: Vec<VulnFinding>,
+    /// Marca de tiempo (RFC 3339) en la que se completó el escaneo, tal
+    /// cual la reporta `ms-nmap`. No se interpreta como fecha/hora en este
+    /// Gateway (se reenvía tal cual a `front` vía SSE).
+    pub scanned_at: String,
+}
+
+/// Hallazgo de un puerto individual dentro de un [`ScanResult`]. Shape
+/// copiado de `broker/contracts/scan-outcome.schema.json`
+/// (`$defs/portFinding`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortFinding {
+    /// Número de puerto (0-65535).
+    pub port: u16,
+    /// Protocolo de transporte (`tcp`/`udp`, tal como lo reporta
+    /// `ms-nmap`).
+    pub protocol: String,
+    /// Estado del puerto (`open`/`closed`/`filtered`/..., tal como lo
+    /// reporta `ms-nmap`).
+    pub state: String,
+    /// Servicio detectado en el puerto, si `ms-nmap` pudo identificarlo.
+    pub service: Option<String>,
+    /// Versión del servicio detectado, si `ms-nmap` pudo identificarla.
+    pub version: Option<String>,
+    /// Identificadores CPE asociados al servicio detectado.
+    pub cpes: Vec<String>,
+}
+
+/// Hallazgo de una vulnerabilidad individual dentro de un [`ScanResult`].
+/// Shape copiado de `broker/contracts/scan-outcome.schema.json`
+/// (`$defs/vulnFinding`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VulnFinding {
+    /// Identificador de la vulnerabilidad (p. ej. CVE), si se conoce.
+    pub id: Option<String>,
+    /// Severidad reportada (`unknown`/`info`/`low`/`medium`/`high`/
+    /// `critical`).
+    pub severity: String,
+    /// Descripción de la vulnerabilidad.
+    pub description: String,
+    /// Script NSE de `nmap` que detectó el hallazgo (cadena vacía si no
+    /// aplica).
+    pub nse_script: String,
+    /// Origen del hallazgo (`nmap_nse`/`exploit_db`/`nvd`).
+    pub source: String,
+    /// Referencias externas asociadas al hallazgo.
+    pub references: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +304,101 @@ mod tests {
     #[test]
     fn rejects_cidr_with_non_numeric_prefix() {
         assert!(ScanSubmission::parse("10.0.0.0/abc").is_err());
+    }
+
+    #[test]
+    fn scan_outcome_event_decodes_started_variant() {
+        let json = serde_json::json!({
+            "status": "started",
+            "correlation_id": "scan-1",
+        });
+
+        let event: ScanOutcomeEvent =
+            serde_json::from_value(json).expect("started debe decodificar");
+
+        assert_eq!(event.correlation_id(), "scan-1");
+        assert!(!event.is_terminal());
+        assert!(matches!(event, ScanOutcomeEvent::Started { .. }));
+    }
+
+    #[test]
+    fn scan_outcome_event_decodes_completed_variant_with_full_result() {
+        let json = serde_json::json!({
+            "status": "completed",
+            "correlation_id": "scan-2",
+            "result": {
+                "host": "192.0.2.10",
+                "ports": [{
+                    "port": 22,
+                    "protocol": "tcp",
+                    "state": "open",
+                    "service": "ssh",
+                    "version": null,
+                    "cpes": [],
+                }],
+                "vulnerabilities": [{
+                    "id": "CVE-2024-0001",
+                    "severity": "high",
+                    "description": "algo",
+                    "nse_script": "",
+                    "source": "nvd",
+                    "references": [],
+                }],
+                "scanned_at": "2024-01-01T00:00:00Z",
+            },
+        });
+
+        let event: ScanOutcomeEvent =
+            serde_json::from_value(json).expect("completed debe decodificar");
+
+        assert_eq!(event.correlation_id(), "scan-2");
+        assert!(event.is_terminal());
+        assert!(matches!(event, ScanOutcomeEvent::Completed { .. }));
+    }
+
+    #[test]
+    fn scan_outcome_event_decodes_failed_variant() {
+        let json = serde_json::json!({
+            "status": "failed",
+            "correlation_id": "scan-3",
+            "reason": "host inalcanzable",
+        });
+
+        let event: ScanOutcomeEvent =
+            serde_json::from_value(json).expect("failed debe decodificar");
+
+        assert_eq!(event.correlation_id(), "scan-3");
+        assert!(event.is_terminal());
+    }
+
+    #[test]
+    fn scan_outcome_event_rejects_unknown_status() {
+        let json = serde_json::json!({
+            "status": "progressing",
+            "correlation_id": "scan-4",
+        });
+
+        assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
+    }
+
+    #[test]
+    fn scan_outcome_event_rejects_extra_fields() {
+        let json = serde_json::json!({
+            "status": "started",
+            "correlation_id": "scan-5",
+            "unexpected": "field",
+        });
+
+        assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
+    }
+
+    #[test]
+    fn scan_outcome_event_rejects_missing_required_field() {
+        let json = serde_json::json!({
+            "status": "failed",
+            "correlation_id": "scan-6",
+        });
+
+        assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
     }
 }
