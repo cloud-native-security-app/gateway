@@ -136,7 +136,7 @@
         "Dos usuarios distintos con sesiones válidas tienen contadores independientes: uno alcanzando su límite no afecta al otro",
         "Tests de integración: un usuario que excede el umbral recibe 429 en la solicitud que lo supera; un segundo usuario en paralelo sigue recibiendo 200/202 normalmente"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 10,

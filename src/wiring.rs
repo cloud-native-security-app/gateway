@@ -3,8 +3,9 @@
 //! de fondo completos, listos para que [`crate::run`] los sirva.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::api::{AppState, ScanOwnershipRegistry};
+use crate::api::{AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use crate::auth::{LoginStateStore, OidcClient};
 use crate::broker::{BrokerConsumer, BrokerError, BrokerPublisher, ScanOutcomeHandler};
 use crate::config::Config;
@@ -89,6 +90,10 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
 
     let scan_ownership = Arc::new(ScanOwnershipRegistry::new());
     let realtime = Arc::new(RealtimeRegistry::new());
+    let scan_submission_rate_limiter = Arc::new(ScanSubmissionRateLimiter::new(
+        config.scan_submission_rate_limit_max_requests,
+        Duration::from_secs(config.scan_submission_rate_limit_window_secs),
+    ));
 
     let scan_outcome_handler: Arc<dyn ScanOutcomeHandler> = Arc::new(ScanOutcomeRelay {
         usuarios_client: Arc::clone(&usuarios_client),
@@ -107,6 +112,7 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         broker_publisher,
         scan_ownership,
         realtime,
+        scan_submission_rate_limiter,
     };
 
     Ok(Wiring {

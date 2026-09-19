@@ -23,7 +23,7 @@ use axum::extract::{Path as AxumPath, State};
 use axum::routing::{get, patch};
 use axum::{Json, Router};
 use futures_util::StreamExt;
-use gateway::api::{app_router, AppState, ScanOwnershipRegistry};
+use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
     BrokerConsumer, BrokerError, ScanCancellation, ScanOutcomeHandler, ScanRequest,
@@ -185,6 +185,10 @@ async fn spawn_gateway(usuarios_client: UsuariosClient) -> GatewayUnderTest {
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: scan_ownership.clone(),
         realtime: realtime.clone(),
+        scan_submission_rate_limiter: Arc::new(ScanSubmissionRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+        )),
     };
 
     let app = app_router(state);

@@ -9,13 +9,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use gateway::api::{app_router, AppState, ScanOwnershipRegistry};
+use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
@@ -156,6 +156,10 @@ async fn spawn_gateway(usuarios_base_url: String) -> GatewayUnderTest {
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
         realtime: Arc::new(RealtimeRegistry::new()),
+        scan_submission_rate_limiter: Arc::new(ScanSubmissionRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+        )),
     };
 
     let app = app_router(state);

@@ -3,18 +3,20 @@
 //! Expone las rutas de login/callback/logout OIDC (feature `oidc_login`),
 //! una ruta de salud, `GET /api/me` (feature `session_middleware_and_me`) y
 //! `GET /api/profile` (feature `usuarios_profile_proxy`), protegidas por el
-//! middleware de sesión de [`crate::auth::require_session`]. El resto de
-//! rutas públicas (escaneos, SSE, documentación) se añaden en features
-//! posteriores.
+//! middleware de sesión de [`crate::auth::require_session`]. `POST
+//! /api/scans` lleva además un rate limiter por usuario (feature
+//! `rate_limiting`, ver [`ScanSubmissionRateLimiter`]). El resto de rutas
+//! públicas (SSE, documentación) se añaden en features posteriores.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware;
+use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -145,6 +147,128 @@ impl Default for ScanOwnershipRegistry {
     }
 }
 
+/// Contador de ventana fija de un único usuario, usado por
+/// [`ScanSubmissionRateLimiter`].
+struct RateLimitWindow {
+    /// Momento en que empezó la ventana actualmente en curso.
+    started_at: Instant,
+    /// Solicitudes ya contadas dentro de la ventana actual.
+    count: u32,
+}
+
+/// Limitador de tasa en memoria de `POST /api/scans` (RF-12, feature
+/// `rate_limiting`): ventana fija de `window` por usuario, con la identidad
+/// de la sesión (`sub`) como clave — nunca la IP del cliente, que puede
+/// compartirse tras un NAT/proxy (ver `docs/security-scope.md`
+/// §"Rate limiting y superficie pública").
+///
+/// **Decisión de diseño**: se evaluó `tower_governor` (mencionado como
+/// ejemplo en el criterio de aceptación), pero exige implementar su trait
+/// `KeyExtractor` propio para sustituir la clave por IP por defecto, y
+/// gobernar su interacción con el orden de capas de `axum` (debe ejecutarse
+/// después de [`crate::auth::require_session`], que es quien deja la sesión
+/// disponible como `Extension<Session>`) sin una necesidad concreta que un
+/// limitador propio no cubra ya. Se optó por este limitador en memoria,
+/// mismo patrón ya usado dos veces en este repo ([`crate::auth::LoginStateStore`],
+/// [`ScanOwnershipRegistry`]): misma limitación conocida y aceptada (en
+/// memoria, no compartido entre instancias de Gateway, no sobrevive un
+/// reinicio) — a discutir un store compartido si Gateway llega a
+/// desplegarse con más de una instancia.
+pub struct ScanSubmissionRateLimiter {
+    max_requests: u32,
+    window: Duration,
+    entries: Mutex<HashMap<String, RateLimitWindow>>,
+}
+
+impl ScanSubmissionRateLimiter {
+    /// Crea un limitador que permite como máximo `max_requests` solicitudes
+    /// por usuario dentro de cada `window`.
+    pub fn new(max_requests: u32, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registra un intento de `sub` contra el límite de tasa.
+    ///
+    /// Si la ventana en curso de `sub` ya expiró (transcurrió `window` desde
+    /// que empezó), la reinicia en 0 antes de contar este intento. Devuelve
+    /// `true` (y cuenta el intento) si todavía queda cupo en la ventana
+    /// actual; `false` (sin contarlo, para no desplazar la ventana de un
+    /// usuario que sigue enviando solicitudes de más) si `sub` ya alcanzó
+    /// `max_requests` en la ventana actual.
+    pub fn check_and_record(&self, sub: &str) -> bool {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let window = entries.entry(sub.to_string()).or_insert(RateLimitWindow {
+            started_at: now,
+            count: 0,
+        });
+
+        if now.duration_since(window.started_at) >= self.window {
+            window.started_at = now;
+            window.count = 0;
+        }
+
+        if window.count >= self.max_requests {
+            return false;
+        }
+
+        window.count += 1;
+        true
+    }
+}
+
+/// Errores de [`rate_limit_scan_submission`].
+#[derive(Debug, thiserror::Error)]
+enum RateLimitError {
+    /// El usuario de la sesión activa superó el umbral de solicitudes de
+    /// escaneo configurado para la ventana de tiempo actual (RF-12).
+    #[error(
+        "se superó el límite de solicitudes de escaneo permitidas para este usuario; \
+         intenta de nuevo más tarde"
+    )]
+    Exceeded,
+}
+
+impl IntoResponse for RateLimitError {
+    fn into_response(self) -> Response {
+        tracing::debug!(error = %self, "solicitud de escaneo rechazada por rate limiting");
+        (StatusCode::TOO_MANY_REQUESTS, self.to_string()).into_response()
+    }
+}
+
+/// Middleware `axum` que aplica el límite de tasa por usuario (RF-12) sobre
+/// `POST /api/scans`, usando el `sub` de la sesión activa
+/// (`Extension<Session>`) como clave.
+///
+/// Debe ejecutarse **después** de [`crate::auth::require_session`] (que es
+/// quien valida la sesión e inserta esa extensión): se aplica como una capa
+/// de [`crate::api::protected_router`] anidada solo en el método `POST` de
+/// `/api/scans`, dentro de la capa de sesión que ya envuelve todo el router
+/// protegido (ver [`protected_router`]), así que cuando este middleware se
+/// ejecuta, la sesión ya está validada. Excede el límite responde `429` con
+/// un mensaje explícito, antes de ejecutar `submit_scan` — nunca llega a
+/// tocar `ms-usuarios` ni el Broker para la solicitud que lo supera.
+async fn rate_limit_scan_submission(
+    State(limiter): State<Arc<ScanSubmissionRateLimiter>>,
+    Extension(session): Extension<Session>,
+    request: Request,
+    next: Next,
+) -> Result<Response, RateLimitError> {
+    if limiter.check_and_record(&session.sub) {
+        Ok(next.run(request).await)
+    } else {
+        Err(RateLimitError::Exceeded)
+    }
+}
+
 /// Estado compartido por los handlers de autenticación de este router.
 #[derive(Clone)]
 pub struct AppState {
@@ -175,6 +299,9 @@ pub struct AppState {
     /// Registro de streams SSE activos por `scanId` (feature
     /// `scan_outcome_relay`, ver [`crate::realtime::RealtimeRegistry`]).
     pub realtime: Arc<RealtimeRegistry>,
+    /// Limitador de tasa por usuario aplicado a `POST /api/scans` (RF-12,
+    /// feature `rate_limiting`, ver [`ScanSubmissionRateLimiter`]).
+    pub scan_submission_rate_limiter: Arc<ScanSubmissionRateLimiter>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -209,6 +336,13 @@ async fn health() -> StatusCode {
 /// (por ahora, solo `GET /api/me`), envueltas en el middleware de sesión
 /// [`crate::auth::require_session`] (RNF-02): una request sin sesión propia
 /// válida recibe `401` sin ejecutar ningún handler de este router.
+///
+/// El método `POST` de `/api/scans` lleva además, como capa propia de ese
+/// método (no del resto de rutas protegidas), el rate limiter de
+/// [`rate_limit_scan_submission`] (RF-12): al estar anidado dentro de la
+/// capa de sesión de todo este router, se ejecuta después de que
+/// [`crate::auth::require_session`] ya validó la sesión e insertó
+/// `Extension<Session>`.
 fn protected_router(state: AppState) -> Router {
     let validator = SessionValidator::new(
         state.session_signing_key.clone(),
@@ -216,10 +350,18 @@ fn protected_router(state: AppState) -> Router {
         state.session_issuer.clone(),
     );
 
+    let submit_scan_method_router = post(submit_scan).layer(middleware::from_fn_with_state(
+        state.scan_submission_rate_limiter.clone(),
+        rate_limit_scan_submission,
+    ));
+
     Router::new()
         .route("/api/me", get(me))
         .route("/api/profile", get(profile))
-        .route("/api/scans", post(submit_scan).get(list_scan_history))
+        .route(
+            "/api/scans",
+            submit_scan_method_router.get(list_scan_history),
+        )
         .route("/api/scans/:scan_id/events", get(scan_events))
         .route("/api/scans/:scan_id/cancel", post(cancel_scan))
         .layer(middleware::from_fn_with_state(
@@ -878,5 +1020,61 @@ impl IntoResponse for ScanSubmitError {
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_allows_requests_up_to_the_threshold() {
+        let limiter = ScanSubmissionRateLimiter::new(3, Duration::from_secs(60));
+
+        assert!(limiter.check_and_record("user-a"));
+        assert!(limiter.check_and_record("user-a"));
+        assert!(limiter.check_and_record("user-a"));
+    }
+
+    #[test]
+    fn rate_limiter_rejects_requests_beyond_the_threshold() {
+        let limiter = ScanSubmissionRateLimiter::new(2, Duration::from_secs(60));
+
+        assert!(limiter.check_and_record("user-a"));
+        assert!(limiter.check_and_record("user-a"));
+        assert!(
+            !limiter.check_and_record("user-a"),
+            "la tercera solicitud dentro de la ventana debe rechazarse"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_keeps_independent_counters_per_user() {
+        let limiter = ScanSubmissionRateLimiter::new(1, Duration::from_secs(60));
+
+        assert!(limiter.check_and_record("user-a"));
+        assert!(
+            !limiter.check_and_record("user-a"),
+            "user-a ya agotó su cupo"
+        );
+        assert!(
+            limiter.check_and_record("user-b"),
+            "el límite de user-a no debe afectar a user-b"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_resets_after_the_window_elapses() {
+        let limiter = ScanSubmissionRateLimiter::new(1, Duration::from_millis(20));
+
+        assert!(limiter.check_and_record("user-a"));
+        assert!(!limiter.check_and_record("user-a"));
+
+        std::thread::sleep(Duration::from_millis(40));
+
+        assert!(
+            limiter.check_and_record("user-a"),
+            "tras expirar la ventana, el contador debe reiniciarse"
+        );
     }
 }

@@ -585,3 +585,70 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   completo en `progress/review_scan_history_and_cancellation.md`.
 - **Estado final:** feature 8 (`scan_history_and_cancellation`) pasó a
   `"done"` en `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 9: rate_limiting — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  complejidad media, middleware nuevo sobre `POST /api/scans` ya existente,
+  sin Broker/OIDC/SSE).
+- **Investigación previa:** el leader verificó que `tower_governor 0.8.0`
+  resuelve sin conflicto contra `axum = "0.7"` ya fijado (`cargo add
+  --dry-run` limpio). El criterio de aceptación menciona esa crate solo como
+  ejemplo ("p. ej."), no como obligación, así que se dejó al implementer
+  decidir entre ella (con un `KeyExtractor` propio) o un limitador propio en
+  memoria, documentando la elección.
+- **Qué se hizo:** límite de tasa por usuario (RF-12) sobre `POST
+  /api/scans`. Tras investigar la API de `KeyExtractor` de `tower_governor`,
+  el implementer optó por un limitador propio en memoria
+  (`ScanSubmissionRateLimiter` en `src/api.rs`: `Mutex<HashMap<sub,
+  RateLimitWindow>>`, ventana fija reiniciada al expirar), mismo patrón ya
+  usado dos veces en el repo (`auth::LoginStateStore`,
+  `ScanOwnershipRegistry`) — evita añadir una dependencia nueva y el mismo
+  problema de orden de capas que `tower_governor` habría exigido resolver
+  igual. `src/config.rs` gana `SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS`
+  (u32) y `SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS` (u64), sin hardcode.
+  `src/wiring.rs` construye el limitador real desde `Config`. `src/api.rs`
+  gana `RateLimitError` (`thiserror`, -> `429` con mensaje explícito) y el
+  middleware `rate_limit_scan_submission`, que lee `Extension<Session>`
+  (nunca la IP) y se aplica **solo** al método `POST` de `/api/scans`
+  (`post(submit_scan).layer(...)` construido antes de encadenar
+  `.get(list_scan_history)`, verificado contra el código fuente real de
+  `axum` 0.7.9: `MethodRouter::layer` solo envuelve los métodos ya
+  configurados en ese momento), anidado dentro de la capa de sesión que ya
+  cubre todo `protected_router`, de modo que se ejecuta después de
+  `auth::require_session` y antes de cualquier llamada a `ms-usuarios`/el
+  Broker. Nuevo archivo `tests/rate_limiting.rs` (3 tests de integración
+  sin Docker: usuario que excede el umbral recibe `429` en la solicitud que
+  lo supera; un segundo usuario en paralelo con contador independiente
+  sigue recibiendo `200`; una solicitud rechazada con umbral 0 nunca llega
+  a tocar un `ms-usuarios` inalcanzable ni un publicador del Broker que
+  hace `panic!` si se invoca) más 4 unit tests en `src/api.rs` (umbral
+  respetado, rechazo al superarlo, contadores independientes,
+  reinicio tras expirar la ventana). Los 6 archivos de test existentes que
+  construyen `AppState` a mano se actualizaron mecánicamente para el nuevo
+  campo obligatorio `scan_submission_rate_limiter` (umbral alto, 1000/60s,
+  que no interfiere con sus propios escenarios).
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (54 unitarios + todos los
+  tests de integración sin Docker en verde, ninguna feature 1-8 se rompió),
+  `cargo test -- --ignored` (Docker disponible: los 3 tests existentes con
+  RabbitMQ real siguen en verde), `cargo doc --no-deps` y `./init.sh` —
+  todo en verde, 0 warnings. Detalle completo en
+  `progress/impl_rate_limiting.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación, validar los 5 criterios
+  de aceptación uno por uno contra el código/tests (líneas concretas
+  citadas), y evaluar explícitamente la decisión de usar un limitador
+  propio en vez de `tower_governor` (razonable, verificable, consistente
+  con `docs/conventions.md` "homogeneidad extrema", y no una violación de
+  `docs/architecture.md` porque el criterio de aceptación deja la crate
+  como ejemplo, no como obligación). Confirmó que no hay filtración de
+  `sub`/credenciales en logs, que `RateLimitError` y el resto del código
+  nuevo siguen el patrón `thiserror` del repo, y que la tabla `ROUTES`/su
+  test de enumeración no cambiaron (ninguna ruta cambió su estado
+  protegido/público por accidente). Sin cambios requeridos. Detalle
+  completo en `progress/review_rate_limiting.md`.
+- **Estado final:** feature 9 (`rate_limiting`) pasó a `"done"` en
+  `feature_list.json`.

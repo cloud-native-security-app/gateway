@@ -44,6 +44,15 @@ const ENV_MS_USUARIOS_BASE_URL: &str = "MS_USUARIOS_BASE_URL";
 /// Nombre de la variable de entorno con la credencial de servicio
 /// compartida con `ms-usuarios`.
 const ENV_MS_USUARIOS_SHARED_SECRET: &str = "MS_USUARIOS_SHARED_SECRET";
+/// Nombre de la variable de entorno con el número máximo de solicitudes de
+/// `POST /api/scans` que un mismo usuario (identidad de la sesión, no IP,
+/// ver `docs/security-scope.md`) puede hacer dentro de una ventana de
+/// [`ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS`] (RF-12).
+const ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS: &str = "SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS";
+/// Nombre de la variable de entorno con la duración (en segundos) de la
+/// ventana de tiempo sobre la que se cuenta
+/// [`ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS`] (RF-12).
+const ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS: &str = "SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS";
 
 /// Configuración completa del servicio, cargada desde variables de entorno.
 ///
@@ -84,6 +93,14 @@ pub struct Config {
     /// Credencial de servicio compartida con `ms-usuarios`. Nunca se
     /// loggea.
     pub ms_usuarios_shared_secret: SecretString,
+    /// Número máximo de solicitudes de `POST /api/scans` que un mismo
+    /// usuario puede hacer dentro de
+    /// [`Config::scan_submission_rate_limit_window_secs`] (RF-12, feature
+    /// `rate_limiting`). Sin valor hardcodeado en el código.
+    pub scan_submission_rate_limit_max_requests: u32,
+    /// Duración, en segundos, de la ventana de tiempo sobre la que se cuenta
+    /// [`Config::scan_submission_rate_limit_max_requests`].
+    pub scan_submission_rate_limit_window_secs: u64,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -162,6 +179,20 @@ impl Config {
         let broker_vhost = required_string(ENV_BROKER_VHOST)?;
         let ms_usuarios_base_url = required_string(ENV_MS_USUARIOS_BASE_URL)?;
         let ms_usuarios_shared_secret = required_secret(ENV_MS_USUARIOS_SHARED_SECRET)?;
+        let scan_submission_rate_limit_max_requests =
+            required_string(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS)?
+                .parse::<u32>()
+                .map_err(|source| ConfigError::InvalidNumber {
+                    name: ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
+                    source,
+                })?;
+        let scan_submission_rate_limit_window_secs =
+            required_string(ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS)?
+                .parse::<u64>()
+                .map_err(|source| ConfigError::InvalidNumber {
+                    name: ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
+                    source,
+                })?;
 
         Ok(Self {
             http_host,
@@ -176,6 +207,8 @@ impl Config {
             broker_vhost,
             ms_usuarios_base_url,
             ms_usuarios_shared_secret,
+            scan_submission_rate_limit_max_requests,
+            scan_submission_rate_limit_window_secs,
         })
     }
 }
@@ -202,6 +235,8 @@ mod tests {
         ENV_BROKER_VHOST,
         ENV_MS_USUARIOS_BASE_URL,
         ENV_MS_USUARIOS_SHARED_SECRET,
+        ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
+        ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
     ];
 
     /// Valor de laboratorio para `BROKER_AMQPS_URL`, no una credencial real
@@ -227,6 +262,8 @@ mod tests {
         env::set_var(ENV_BROKER_VHOST, "security-app");
         env::set_var(ENV_MS_USUARIOS_BASE_URL, "http://ms-usuarios.internal");
         env::set_var(ENV_MS_USUARIOS_SHARED_SECRET, "lab-only-not-a-real-secret");
+        env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS, "5");
+        env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS, "60");
     }
 
     #[test]
@@ -255,6 +292,8 @@ mod tests {
             config.google_oidc_issuer_url, DEFAULT_GOOGLE_OIDC_ISSUER_URL,
             "sin GOOGLE_OIDC_ISSUER_URL debe usarse el issuer real de Google por defecto"
         );
+        assert_eq!(config.scan_submission_rate_limit_max_requests, 5);
+        assert_eq!(config.scan_submission_rate_limit_window_secs, 60);
 
         clear_all_vars();
     }
@@ -326,6 +365,46 @@ mod tests {
             result,
             Err(ConfigError::InvalidNumber {
                 name: ENV_SESSION_TTL_SECS,
+                ..
+            })
+        ));
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn non_numeric_scan_submission_rate_limit_max_requests_produces_typed_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS, "not-a-number");
+
+        let result = Config::from_env();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidNumber {
+                name: ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
+                ..
+            })
+        ));
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn non_numeric_scan_submission_rate_limit_window_secs_produces_typed_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS, "not-a-number");
+
+        let result = Config::from_env();
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidNumber {
+                name: ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
                 ..
             })
         ));

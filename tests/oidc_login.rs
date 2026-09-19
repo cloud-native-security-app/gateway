@@ -10,14 +10,14 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use gateway::api::{auth_router, AppState, ScanOwnershipRegistry};
+use gateway::api::{auth_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::realtime::RealtimeRegistry;
@@ -259,6 +259,10 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
         realtime: Arc::new(RealtimeRegistry::new()),
+        scan_submission_rate_limiter: Arc::new(ScanSubmissionRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+        )),
     };
 
     let app = auth_router(state);
