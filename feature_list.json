@@ -20,7 +20,7 @@
         "Cargo.toml incluye testcontainers como dev-dependency",
         "cargo build compila sin warnings"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 2,
