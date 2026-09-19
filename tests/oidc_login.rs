@@ -19,6 +19,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use gateway::api::{auth_router, AppState};
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
+use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
@@ -37,6 +38,18 @@ const TEST_CLIENT_ID: &str = "test-client-id";
 const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
+
+/// Doble de prueba de [`ScanRequestPublisher`]: esta feature (`oidc_login`)
+/// no ejerce `POST /api/scans`, así que un `AppState` de prueba solo
+/// necesita satisfacer el tipo del campo, nunca invocarlo de verdad.
+struct NeverPublishesToBroker;
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for NeverPublishesToBroker {
+    async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
+        panic!("esta prueba no debe llegar a publicar en el Broker");
+    }
+}
 
 /// Par de claves RSA de laboratorio para firmar ID tokens de prueba, más su
 /// representación JWK pública. No es una credencial real (ver
@@ -235,6 +248,7 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
+        broker_publisher: Arc::new(NeverPublishesToBroker),
     };
 
     let app = auth_router(state);

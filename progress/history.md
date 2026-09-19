@@ -288,3 +288,103 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   formales seguían cumpliéndose). `./init.sh` en verde, 41 tests.
   Detalle en `progress/impl_fix_usuarios_client_headers.md` y
   `progress/review_fix_usuarios_client_headers.md`.
+
+---
+
+## 2026-09-19 — Feature 6: scan_submission — DONE
+
+- **Agente:** leader (orquestando 2 explorers en paralelo + implementer +
+  reviewer).
+- **Investigación previa:** el leader confirmó directamente (sin subagente,
+  leyendo los repos hermanos de solo lectura) el shape exacto de
+  `ScanRequest` (`broker/contracts/scan-request.schema.json`:
+  `correlation_id`/`ip`/`network_user`/`ssh_credentials_ref`/`has_sudo`/
+  `requested_by`, todos requeridos, `additionalProperties: false`), la
+  topología real (`broker/rabbitmq/definitions.json`: usuario `gateway` con
+  `write` solo en `scan.requests`/`scan.cancellations`), y el contrato real
+  de `user-service` (`POST /users/me/scans`/`PATCH /scans/{scan_id}` ya
+  existen; el endpoint para resolver `network_user`/`ssh_credentials_ref`/
+  `has_sudo` sigue sin existir). Se despacharon 2 explorers en paralelo
+  para la complejidad de Broker/AMQPS:
+  `progress/explore_lapin_publish.md` (hallazgo crítico: `gateway` fija
+  `lapin 2.5.5`, no 4.x como `broker/` — API de conexión distinta,
+  verificada contra el código fuente real; trade-off de `confirm_select`
+  vs RNF-04) y `progress/explore_lapin_testcontainers.md`
+  (`rabbitmq:4.3.5-management` vía `testcontainers::GenericImage` 0.20.1,
+  copia literal de la topología/TLS de `broker/`, cola de verificación
+  declarada con `lab-admin` porque `gateway` no tiene permiso `configure`).
+- **Qué se hizo:** `POST /api/scans` (ruta protegida). `src/domain.rs` gana
+  `ScanSubmission`/`ScanSubmissionError` (validación pura de IP/CIDR,
+  RF-02/RF-03). `src/broker.rs` (antes stub vacío) implementa `ScanRequest`
+  (shape copiado literal del schema, `Debug` manual que redacta
+  `ssh_credentials_ref`), `BrokerError` (`thiserror`), el trait
+  `ScanRequestPublisher` (`async_trait`, para poder inyectar un doble de
+  prueba en `AppState` sin abrir una conexión AMQPS real en tests de otras
+  features) y `BrokerPublisher` (conexión+canal `lapin` 2.5.5 persistentes,
+  `confirm_select` activado una sola vez, sin declarar topología). Se
+  decidió esperar el ack/nack real del Broker en el hot path (no solo el
+  envío del frame): RNF-04 permite 500ms y un ack en subred privada añade
+  típicamente un dígito de milisegundos, y es la única forma de distinguir
+  "se publicó" de "se envió el frame pero se rechazó" — necesario para el
+  criterio de marcar `Fallido`. `src/usuarios_client.rs` gana `ScanStatus`
+  (confirmado contra `user-service/src/domain.rs`, `SCREAMING_SNAKE_CASE`),
+  `ScanHistoryEntry` (contrato real), `ScanTargetCredentials` (contrato
+  **especulativo**, documentado explícitamente como tal), y los métodos
+  `create_scan_history`/`update_scan_status`/`resolve_scan_target`. Un
+  `404` de `ms-usuarios` en `resolve_scan_target` (la API no existe
+  todavía) se traduce a `501`; un `422` (existe pero sin credenciales) a
+  `422` — nunca un valor inventado. `src/api.rs` gana
+  `AppState::broker_publisher` (`Arc<dyn ScanRequestPublisher>`) y el
+  handler `submit_scan`: valida antes de cualquier llamada externa, genera
+  su propio `scanId` (`uuid` v4) antes de la primera llamada externa,
+  intenta resolver credenciales, registra histórico y publica; si el
+  publish falla tras registrar histórico, marca `Fallido` (best-effort,
+  loggeado si esa compensación también falla) y reporta el error, nunca
+  deja un `Pendiente` huérfano. **Decisión de diseño documentada
+  explícitamente** (evaluada y aceptada por el reviewer): como
+  `POST /users/me/scans` de `user-service` no acepta un `scan_id` externo
+  (lo genera internamente), el `scanId` propio de Gateway y el `scan_id`
+  real de `ms-usuarios` son dos identificadores distintos — el primero es
+  el `correlation_id` del `ScanRequest` y el que se devuelve al cliente, el
+  segundo se usa solo para la compensación a `Fallido`. Queda anotado para
+  que la feature futura `scan_outcome_relay` no asuma que son el mismo
+  valor. Nuevo archivo `tests/scan_submission.rs` (4 tests: 3 sin Docker —
+  inválido→400, API de credenciales ausente→501, sin credenciales
+  configuradas→422 — y 1 `#[ignore = "requiere Docker"]` con el camino
+  feliz contra RabbitMQ real). Nuevos fixtures `rabbitmq/definitions.json`,
+  `rabbitmq/rabbitmq.conf`, `rabbitmq/tls/*.pem`, copia literal de
+  `broker/rabbitmq/` (sin `ca_key.pem`, no usado por ningún test). Nuevas
+  dependencias: `tokio-executor-trait`/`tokio-reactor-trait` (runtime de
+  `lapin` sobre `tokio`), `async-trait`, `uuid`; en dev: `rustls`
+  (instalación defensiva del proveedor criptográfico),
+  `futures-util` (`.next()` sobre el consumidor de `lapin` en tests).
+  `tests/oidc_login.rs`/`tests/session_middleware_and_me.rs`/
+  `tests/usuarios_profile_proxy.rs` actualizados mecánicamente para el
+  nuevo campo `AppState::broker_publisher` (doble de prueba que hace
+  `panic!` si se invoca, ya que esas features no ejercen `POST /api/scans`).
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (38 unitarios + 25 de
+  integración sin Docker en verde, ninguna feature 1-5 se rompió),
+  `cargo test -- --ignored` (Docker disponible: el camino feliz pasa
+  contra `rabbitmq:4.3.5-management` real, sin contenedores huérfanos tras
+  la corrida), `cargo doc --no-deps` y `./init.sh` — todo en verde, 0
+  warnings. Detalle completo en `progress/impl_scan_submission.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación, validar los 7
+  criterios de aceptación uno por uno contra el código/tests (líneas
+  concretas citadas), confirmar por `grep` que `ssh_credentials_ref` y la
+  credencial AMQPS nunca se loggean, que `src/broker.rs` no redeclara
+  topología de producción (`grep` sin resultados para
+  `exchange_declare`/`queue_declare`/`queue_bind` fuera de
+  `tests/scan_submission.rs`), y que la topología de test coincide byte a
+  byte (`diff`) con `broker/rabbitmq/`. Evaluó explícitamente la decisión
+  de los dos identificadores contra el contrato real de `user-service`
+  (confirmado leyendo `user-service/src/api.rs` directamente) y la
+  consideró razonable y bien documentada, sin necesidad de bloquear para
+  preguntar al usuario. Único hueco no bloqueante señalado: no hay test de
+  integración dedicado para la rama "publish falla tras histórico ya
+  registrado → Fallido" (no exigido explícitamente por el criterio de
+  aceptación #7, que solo enumera 3 escenarios). Sin cambios requeridos.
+  Detalle completo en `progress/review_scan_submission.md`.
+- **Estado final:** feature 6 (`scan_submission`) pasó a `"done"` en
+  `feature_list.json`.

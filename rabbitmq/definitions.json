@@ -1,0 +1,281 @@
+{
+  "users": [
+    {
+      "name": "lab-admin",
+      "password_hash": "Log23LySg0oO/hE1+uVKD0kEPLFb5UuMu9v6Z0wASrDNOXYE",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": ["administrator"],
+      "limits": {}
+    },
+    {
+      "name": "gateway",
+      "password_hash": "89Hfu9RHGkton/a/XdF+8Atie2gnvJJ05U1Pm8xGJc2S931U",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": [],
+      "limits": {}
+    },
+    {
+      "name": "ms-nmap",
+      "password_hash": "artohmzKYCD/k2SiVDkUw8ARJCVd0yvOS2/KQy4OO+f9jDBm",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": [],
+      "limits": {}
+    },
+    {
+      "name": "ms-analisis",
+      "password_hash": "243E5OkRxE/7NJ4VglvEHHpeTQX692xvPtiCuIVzS+EDxQBE",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": [],
+      "limits": {}
+    }
+  ],
+  "vhosts": [
+    {
+      "name": "security-app",
+      "description": "Broker de la plataforma de ciberseguridad blue/red team: Gateway -> ms-nmap -> ms-analisis/Gateway.",
+      "tags": []
+    }
+  ],
+  "permissions": [
+    {
+      "user": "lab-admin",
+      "vhost": "security-app",
+      "configure": ".*",
+      "write": ".*",
+      "read": ".*"
+    },
+    {
+      "user": "gateway",
+      "vhost": "security-app",
+      "configure": "^$",
+      "write": "^scan\\.(requests|cancellations)$",
+      "read": "^gateway\\.scan-outcomes$"
+    },
+    {
+      "user": "ms-nmap",
+      "vhost": "security-app",
+      "configure": "^$",
+      "write": "^scan\\.outcomes$",
+      "read": "^ms-nmap\\.(scan-requests|scan-cancellations)$"
+    },
+    {
+      "user": "ms-analisis",
+      "vhost": "security-app",
+      "configure": "^$",
+      "write": "^$",
+      "read": "^ms-analisis\\.scan-outcomes$"
+    }
+  ],
+  "topic_permissions": [],
+  "parameters": [],
+  "global_parameters": [],
+  "policies": [],
+  "queues": [
+    {
+      "name": "ms-nmap.scan-requests",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 3,
+        "x-dead-letter-exchange": "scan.requests.dlx",
+        "x-dead-letter-routing-key": "ms-nmap.scan-requests.dead"
+      }
+    },
+    {
+      "name": "ms-nmap.scan-requests.dlq",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "ms-analisis.scan-outcomes",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 3,
+        "x-dead-letter-exchange": "scan.outcomes.dlx",
+        "x-dead-letter-routing-key": "ms-analisis.scan-outcomes.dead"
+      }
+    },
+    {
+      "name": "ms-analisis.scan-outcomes.dlq",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "gateway.scan-outcomes",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 3,
+        "x-dead-letter-exchange": "scan.outcomes.dlx",
+        "x-dead-letter-routing-key": "gateway.scan-outcomes.dead"
+      }
+    },
+    {
+      "name": "gateway.scan-outcomes.dlq",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    },
+    {
+      "name": "ms-nmap.scan-cancellations",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-queue-type": "quorum",
+        "x-delivery-limit": 3,
+        "x-dead-letter-exchange": "scan.cancellations.dlx",
+        "x-dead-letter-routing-key": "ms-nmap.scan-cancellations.dead"
+      }
+    },
+    {
+      "name": "ms-nmap.scan-cancellations.dlq",
+      "vhost": "security-app",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {}
+    }
+  ],
+  "exchanges": [
+    {
+      "name": "scan.requests",
+      "vhost": "security-app",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "scan.requests.dlx",
+      "vhost": "security-app",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "scan.outcomes",
+      "vhost": "security-app",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "scan.outcomes.dlx",
+      "vhost": "security-app",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "scan.cancellations",
+      "vhost": "security-app",
+      "type": "topic",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    },
+    {
+      "name": "scan.cancellations.dlx",
+      "vhost": "security-app",
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "arguments": {}
+    }
+  ],
+  "bindings": [
+    {
+      "source": "scan.requests",
+      "vhost": "security-app",
+      "destination": "ms-nmap.scan-requests",
+      "destination_type": "queue",
+      "routing_key": "scan.request",
+      "arguments": {}
+    },
+    {
+      "source": "scan.requests.dlx",
+      "vhost": "security-app",
+      "destination": "ms-nmap.scan-requests.dlq",
+      "destination_type": "queue",
+      "routing_key": "ms-nmap.scan-requests.dead",
+      "arguments": {}
+    },
+    {
+      "source": "scan.outcomes",
+      "vhost": "security-app",
+      "destination": "ms-analisis.scan-outcomes",
+      "destination_type": "queue",
+      "routing_key": "scan.outcome.completed",
+      "arguments": {}
+    },
+    {
+      "source": "scan.outcomes",
+      "vhost": "security-app",
+      "destination": "ms-analisis.scan-outcomes",
+      "destination_type": "queue",
+      "routing_key": "scan.outcome.failed",
+      "arguments": {}
+    },
+    {
+      "source": "scan.outcomes",
+      "vhost": "security-app",
+      "destination": "gateway.scan-outcomes",
+      "destination_type": "queue",
+      "routing_key": "scan.outcome.#",
+      "arguments": {}
+    },
+    {
+      "source": "scan.outcomes.dlx",
+      "vhost": "security-app",
+      "destination": "ms-analisis.scan-outcomes.dlq",
+      "destination_type": "queue",
+      "routing_key": "ms-analisis.scan-outcomes.dead",
+      "arguments": {}
+    },
+    {
+      "source": "scan.outcomes.dlx",
+      "vhost": "security-app",
+      "destination": "gateway.scan-outcomes.dlq",
+      "destination_type": "queue",
+      "routing_key": "gateway.scan-outcomes.dead",
+      "arguments": {}
+    },
+    {
+      "source": "scan.cancellations",
+      "vhost": "security-app",
+      "destination": "ms-nmap.scan-cancellations",
+      "destination_type": "queue",
+      "routing_key": "scan.cancellation",
+      "arguments": {}
+    },
+    {
+      "source": "scan.cancellations.dlx",
+      "vhost": "security-app",
+      "destination": "ms-nmap.scan-cancellations.dlq",
+      "destination_type": "queue",
+      "routing_key": "ms-nmap.scan-cancellations.dead",
+      "arguments": {}
+    }
+  ]
+}

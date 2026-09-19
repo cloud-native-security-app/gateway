@@ -21,8 +21,9 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
-use crate::domain::Session;
-use crate::usuarios_client::{UserProfile, UsuariosClient, UsuariosClientError};
+use crate::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
+use crate::domain::{ScanSubmission, ScanSubmissionError, Session};
+use crate::usuarios_client::{ScanStatus, UserProfile, UsuariosClient, UsuariosClientError};
 
 /// Estado compartido por los handlers de autenticación de este router.
 #[derive(Clone)]
@@ -42,6 +43,11 @@ pub struct AppState {
     /// Cliente HTTP hacia `ms-usuarios` (único módulo que le habla
     /// directamente, ver `docs/architecture.md` capa `usuarios_client`).
     pub usuarios_client: Arc<UsuariosClient>,
+    /// Publicador de mensajes hacia el Broker (feature `scan_submission`).
+    /// Guardado como `Arc<dyn ScanRequestPublisher>` para que los tests de
+    /// otras features puedan inyectar un doble de prueba en vez de una
+    /// conexión AMQPS real (ver `crate::broker::ScanRequestPublisher`).
+    pub broker_publisher: Arc<dyn ScanRequestPublisher>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -86,6 +92,7 @@ fn protected_router(state: AppState) -> Router {
     Router::new()
         .route("/api/me", get(me))
         .route("/api/profile", get(profile))
+        .route("/api/scans", post(submit_scan))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -135,6 +142,112 @@ async fn profile(
 ) -> Result<Json<UserProfile>, UsuariosClientError> {
     let profile = state.usuarios_client.get_profile(&session).await?;
     Ok(Json(profile))
+}
+
+/// Cuerpo de `POST /api/scans`: el objetivo (IP o rango CIDR) del escaneo
+/// solicitado, sin validar todavía (ver [`ScanSubmission::parse`]).
+#[derive(Debug, Deserialize)]
+struct ScanSubmissionRequest {
+    target: String,
+}
+
+/// Respuesta de `POST /api/scans` con éxito: el identificador de
+/// seguimiento generado por este Gateway (RF-04), devuelto tan pronto se
+/// confirma el registro de histórico y la publicación en el Broker, sin
+/// esperar ningún desenlace del escaneo.
+#[derive(Debug, Serialize)]
+struct ScanSubmissionResponse {
+    #[serde(rename = "scanId")]
+    scan_id: String,
+}
+
+/// Errores de `POST /api/scans`, agregando los de cada capa involucrada
+/// (validación pura de [`crate::domain`], `ms-usuarios`, el Broker) en un
+/// único tipo con su propio mapeo a un status HTTP explícito.
+#[derive(Debug, thiserror::Error)]
+enum ScanSubmitError {
+    /// El `target` recibido no es una IP ni un rango CIDR válido (RF-02/
+    /// RF-03). No se llegó a tocar `ms-usuarios` ni el Broker.
+    #[error(transparent)]
+    InvalidTarget(#[from] ScanSubmissionError),
+    /// Fallo al hablar con `ms-usuarios` (resolución de credenciales de red
+    /// o registro/actualización de histórico).
+    #[error(transparent)]
+    Usuarios(#[from] UsuariosClientError),
+    /// Fallo al publicar el `ScanRequest` en el Broker, después de haber
+    /// registrado ya la entrada de histórico.
+    #[error(transparent)]
+    Broker(#[from] BrokerError),
+}
+
+/// Valida el objetivo del escaneo (RF-02/RF-03), resuelve
+/// `network_user`/`ssh_credentials_ref`/`has_sudo` contra `ms-usuarios`
+/// (feature `scan_submission`: esa API es especulativa mientras
+/// `user-service` no la implemente, ver `docs/architecture.md`
+/// §"Dependencia pendiente"), registra la entrada de histórico y publica el
+/// `ScanRequest` correspondiente en el Broker.
+///
+/// Orden de operaciones, deliberado:
+/// 1. Valida `target` — un formato inválido responde `400` sin ninguna
+///    llamada externa.
+/// 2. Genera el `scanId`/`correlation_id` propio de este Gateway, antes de
+///    cualquier llamada externa (RF-04).
+/// 3. Intenta resolver las credenciales de red — si la API no existe o no
+///    hay credenciales configuradas, responde `501`/`422` sin registrar
+///    histórico ni publicar nada.
+/// 4. Registra el histórico (`Pendiente`) y publica el `ScanRequest`. Si la
+///    publicación falla **después** de registrar el histórico, esa entrada
+///    se actualiza a `Fallido` (best-effort: un fallo al marcarla se
+///    loggea, nunca tumba la respuesta de error ya en curso) antes de
+///    responder el error al cliente — nunca queda un `Pendiente` huérfano.
+async fn submit_scan(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Json(body): Json<ScanSubmissionRequest>,
+) -> Result<Json<ScanSubmissionResponse>, ScanSubmitError> {
+    let submission = ScanSubmission::parse(&body.target)?;
+
+    let scan_id = uuid::Uuid::new_v4().to_string();
+
+    let credentials = state
+        .usuarios_client
+        .resolve_scan_target(&session, &submission.target)
+        .await?;
+
+    let history_entry = state
+        .usuarios_client
+        .create_scan_history(&session, &submission.target)
+        .await?;
+
+    let scan_request = ScanRequest {
+        correlation_id: scan_id.clone(),
+        ip: submission.target,
+        network_user: credentials.network_user,
+        ssh_credentials_ref: credentials.ssh_credentials_ref,
+        has_sudo: credentials.has_sudo,
+        requested_by: session.sub.clone(),
+    };
+
+    if let Err(broker_err) = state
+        .broker_publisher
+        .publish_scan_request(&scan_request)
+        .await
+    {
+        if let Err(mark_failed_err) = state
+            .usuarios_client
+            .update_scan_status(&session, &history_entry.scan_id, ScanStatus::Fallido)
+            .await
+        {
+            tracing::error!(
+                error = %mark_failed_err,
+                scan_id = %history_entry.scan_id,
+                "no se pudo marcar como Fallido el histórico tras un fallo de publicación en el Broker"
+            );
+        }
+        return Err(broker_err.into());
+    }
+
+    Ok(Json(ScanSubmissionResponse { scan_id }))
 }
 
 /// Descripción de una ruta expuesta por [`app_router`], usada tanto para
@@ -189,6 +302,11 @@ pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
         path: "/api/profile",
+        protected: true,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/scans",
         protected: true,
     },
 ];
@@ -338,10 +456,38 @@ impl IntoResponse for UsuariosClientError {
             // Fallo al construir la propia solicitud: un bug de este
             // Gateway, no de ms-usuarios.
             UsuariosClientError::RequestBuild => StatusCode::INTERNAL_SERVER_ERROR,
+            // La API de ms-usuarios para resolver las credenciales de red de
+            // un escaneo todavía no existe (ver `docs/architecture.md`
+            // §"Dependencia pendiente") — error explícito, nunca un valor
+            // inventado.
+            UsuariosClientError::ScanTargetResolutionNotImplemented => StatusCode::NOT_IMPLEMENTED,
+            // La API existe pero no hay credenciales de red configuradas
+            // para este usuario/objetivo.
+            UsuariosClientError::ScanTargetNotConfigured => StatusCode::UNPROCESSABLE_ENTITY,
         };
 
         tracing::warn!(error = %self, %status, "fallo al comunicarse con el servicio de usuarios");
 
         (status, self.to_string()).into_response()
+    }
+}
+
+impl IntoResponse for ScanSubmitError {
+    fn into_response(self) -> Response {
+        match self {
+            ScanSubmitError::InvalidTarget(err) => {
+                tracing::debug!(error = %err, "solicitud de escaneo con IP/CIDR inválida");
+                (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+            }
+            ScanSubmitError::Usuarios(err) => err.into_response(),
+            ScanSubmitError::Broker(err) => {
+                tracing::error!(error = %err, "fallo al publicar la solicitud de escaneo en el Broker");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "no se pudo encolar la solicitud de escaneo".to_string(),
+                )
+                    .into_response()
+            }
+        }
     }
 }

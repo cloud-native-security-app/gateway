@@ -93,7 +93,7 @@
         "Un fallo al publicar en el Broker tras haber registrado el histórico se refleja actualizando ese registro a Fallido (nunca deja una entrada Pendiente huérfana) y se reporta como error al cliente",
         "Tests de integración (#[ignore = \"requiere Docker\"]): IP/CIDR inválido -> 400 sin llamadas externas; dependencia de ms-usuarios no disponible -> error explícito documentado; camino feliz (con un stub de ms-usuarios que sí resuelve los 3 campos) publica un ScanRequest verificable en una cola de test bindeada a scan.requests y devuelve el scanId"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,

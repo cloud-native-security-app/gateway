@@ -18,6 +18,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ROUTES};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
+use gateway::broker::{BrokerError, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::JwkSet;
@@ -30,6 +31,19 @@ const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
+
+/// Doble de prueba de [`ScanRequestPublisher`]: esta feature
+/// (`session_middleware_and_me`) no ejerce el envío de escaneos con una
+/// sesión válida, así que un `AppState` de prueba solo necesita satisfacer
+/// el tipo del campo, nunca invocarlo de verdad.
+struct NeverPublishesToBroker;
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for NeverPublishesToBroker {
+    async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
+        panic!("esta prueba no debe llegar a publicar en el Broker");
+    }
+}
 
 async fn serve_discovery(State(issuer_url): State<String>) -> Json<serde_json::Value> {
     Json(json!({
@@ -107,6 +121,7 @@ async fn spawn_gateway() -> GatewayUnderTest {
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
         usuarios_client: Arc::new(usuarios_client),
+        broker_publisher: Arc::new(NeverPublishesToBroker),
     };
 
     let app = app_router(state);

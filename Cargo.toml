@@ -9,6 +9,13 @@ axum = "0.7"
 axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
 cookie = { version = "0.18.2", default-features = false }
 lapin = { version = "2", features = ["rustls"], default-features = false }
+# Adapta el executor/reactor de `lapin` al runtime `tokio` que ya usa el
+# resto de este servicio (axum), en vez de dejar que `lapin` use su propio
+# pool de hilos por defecto (`async-global-executor`) — ver
+# `progress/explore_lapin_publish.md` §3. Versiones alineadas con las que
+# fija `lapin` 2.5.5 en sus propios dev-dependencies/ejemplos.
+tokio-executor-trait = "2"
+tokio-reactor-trait = "1"
 openidconnect = "4.0.1"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 tracing = "0.1"
@@ -18,6 +25,12 @@ serde_json = "1"
 secrecy = "0.10.3"
 thiserror = "2.0.20"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `AppState` guarda el publicador del Broker como `Arc<dyn ScanRequestPublisher>`
+# (feature `scan_submission`) para que los tests de otras features no
+# necesiten una conexión AMQPS real solo para construir el router; `lapin`
+# 2.5.5 usa `async fn` en un trait sin soporte nativo para objetos `dyn`.
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 testcontainers = "0.20"
@@ -25,3 +38,11 @@ rsa = "0.9.10"
 rand = "0.8"
 base64 = "0.22"
 url = "2"
+# Instalación defensiva del backend criptográfico de `rustls` antes de la
+# primera conexión AMQPS en tests (ver `progress/explore_lapin_testcontainers.md`
+# §4, gotcha de doble-proveedor `rustls`).
+rustls = "0.23"
+# `.next()` sobre el `Consumer` (`Stream`) de `lapin` en el test de
+# integración de `scan_submission`, que consume la cola de verificación con
+# el usuario `lab-admin`.
+futures-util = "0.3"
