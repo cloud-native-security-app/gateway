@@ -46,3 +46,42 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   requeridos. Detalle completo en `progress/review_scaffolding.md`.
 - **Estado final:** feature 1 (`scaffolding`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-18 — Feature 2: config — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Qué se hizo:** carga y validación de la configuración del servicio
+  desde variables de entorno. Se reescribió `src/config.rs`: struct pública
+  `Config` con un campo por variable
+  (`HTTP_HOST`/`HTTP_PORT`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+  `GOOGLE_REDIRECT_URI`, `SESSION_SIGNING_KEY`, `SESSION_TTL_SECS`,
+  `BROKER_AMQPS_URL`, `BROKER_VHOST`, `MS_USUARIOS_BASE_URL`,
+  `MS_USUARIOS_SHARED_SECRET`), `Config::from_env() -> Result<Config,
+  ConfigError>` sin panics, y `ConfigError` (`thiserror`) con variantes
+  `Missing { name }` e `InvalidNumber { name, source }`. Los 4 campos que
+  transportan una credencial (`google_client_secret`, `session_signing_key`,
+  `broker_amqps_url`, `ms_usuarios_shared_secret`) usan
+  `secrecy::SecretString`, que redacta en `Debug` y no implementa `Display`.
+  Se añadieron `secrecy = "0.10.3"` y `thiserror = "2.0.20"` a `Cargo.toml`
+  (dependencias normales, vía `cargo add`). Ningún valor hardcodeado fuera
+  de los nombres de las variables de entorno y los fixtures de laboratorio
+  en tests.
+- **Verificación:** `cargo build`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo fmt --check`, `cargo test` (5 tests en
+  `config::tests`, todos verdes) y `./init.sh` — todo en verde, 0 warnings.
+  Detalle completo en `progress/impl_config.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación y revisar los 4
+  criterios de aceptación uno por uno contra el código línea por línea.
+  Sin cambios bloqueantes. Nota no bloqueante documentada: discrepancia de
+  nombre entre `docs/security-scope.md` (`GATEWAY_SHARED_SECRET`) y
+  `feature_list.json`/código (`MS_USUARIOS_SHARED_SECRET`) para la misma
+  credencial de servicio hacia `ms-usuarios`; se siguió el nombre exacto
+  del criterio de aceptación de la feature. Queda como nota para una
+  sesión futura (relevante sobre todo para la feature `usuarios_profile_proxy`,
+  id=5), no bloquea el cierre de esta feature. Detalle completo en
+  `progress/review_config.md`.
+- **Estado final:** feature 2 (`config`) pasó a `"done"` en
+  `feature_list.json`.

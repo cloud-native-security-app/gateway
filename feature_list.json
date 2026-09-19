@@ -33,7 +33,7 @@
         "Ningún valor de configuración queda hardcodeado en el código",
         "Test cubre: config válida se carga correctamente; falta cada variable requerida produce un error tipado; Debug no filtra ningún secreto"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 3,
