@@ -19,6 +19,14 @@ const ENV_GOOGLE_CLIENT_SECRET: &str = "GOOGLE_CLIENT_SECRET";
 /// Nombre de la variable de entorno con la URI de redirección registrada
 /// ante Google para el callback OIDC.
 const ENV_GOOGLE_REDIRECT_URI: &str = "GOOGLE_REDIRECT_URI";
+/// Nombre de la variable de entorno con la URL de discovery/issuer OIDC
+/// contra la que este Gateway hace el handshake (Google en producción, un
+/// IdP de prueba en tests de integración). Opcional: si no se define, se usa
+/// [`DEFAULT_GOOGLE_OIDC_ISSUER_URL`].
+const ENV_GOOGLE_OIDC_ISSUER_URL: &str = "GOOGLE_OIDC_ISSUER_URL";
+/// Valor por defecto de `GOOGLE_OIDC_ISSUER_URL` cuando no se define: el
+/// issuer real de Google en producción.
+const DEFAULT_GOOGLE_OIDC_ISSUER_URL: &str = "https://accounts.google.com";
 /// Nombre de la variable de entorno con la clave de firma de la sesión
 /// propia de este Gateway.
 const ENV_SESSION_SIGNING_KEY: &str = "SESSION_SIGNING_KEY";
@@ -56,6 +64,11 @@ pub struct Config {
     pub google_client_secret: SecretString,
     /// URI de redirección registrada ante Google para el callback OIDC.
     pub google_redirect_uri: String,
+    /// URL de discovery/issuer OIDC contra la que este Gateway hace el
+    /// handshake (Google en producción, un IdP de prueba en tests). Nunca
+    /// hardcodeada en el código: permite apuntar a un servidor distinto sin
+    /// recompilar.
+    pub google_oidc_issuer_url: String,
     /// Clave de firma de la sesión propia de este Gateway (`jsonwebtoken`).
     /// Nunca se loggea.
     pub session_signing_key: SecretString,
@@ -110,6 +123,12 @@ fn required_secret(name: &'static str) -> Result<SecretString, ConfigError> {
     required_string(name).map(SecretString::from)
 }
 
+/// Lee una variable de entorno opcional como `String`, devolviendo
+/// `default` si no está definida o no es UTF-8 válido.
+fn optional_string_with_default(name: &'static str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
 impl Config {
     /// Carga la configuración completa del servicio desde variables de
     /// entorno.
@@ -128,6 +147,10 @@ impl Config {
         let google_client_id = required_string(ENV_GOOGLE_CLIENT_ID)?;
         let google_client_secret = required_secret(ENV_GOOGLE_CLIENT_SECRET)?;
         let google_redirect_uri = required_string(ENV_GOOGLE_REDIRECT_URI)?;
+        let google_oidc_issuer_url = optional_string_with_default(
+            ENV_GOOGLE_OIDC_ISSUER_URL,
+            DEFAULT_GOOGLE_OIDC_ISSUER_URL,
+        );
         let session_signing_key = required_secret(ENV_SESSION_SIGNING_KEY)?;
         let session_ttl_secs = required_string(ENV_SESSION_TTL_SECS)?
             .parse::<u64>()
@@ -146,6 +169,7 @@ impl Config {
             google_client_id,
             google_client_secret,
             google_redirect_uri,
+            google_oidc_issuer_url,
             session_signing_key,
             session_ttl_secs,
             broker_amqps_url,
@@ -188,6 +212,7 @@ mod tests {
         for name in ALL_REQUIRED_VARS {
             env::remove_var(name);
         }
+        env::remove_var(ENV_GOOGLE_OIDC_ISSUER_URL);
     }
 
     fn set_all_valid_vars() {
@@ -226,6 +251,24 @@ mod tests {
         );
         assert_eq!(config.broker_vhost, "security-app");
         assert_eq!(config.ms_usuarios_base_url, "http://ms-usuarios.internal");
+        assert_eq!(
+            config.google_oidc_issuer_url, DEFAULT_GOOGLE_OIDC_ISSUER_URL,
+            "sin GOOGLE_OIDC_ISSUER_URL debe usarse el issuer real de Google por defecto"
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn google_oidc_issuer_url_can_be_overridden_for_tests() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_GOOGLE_OIDC_ISSUER_URL, "http://127.0.0.1:12345");
+
+        let config = Config::from_env().expect("config válida debe cargar");
+
+        assert_eq!(config.google_oidc_issuer_url, "http://127.0.0.1:12345");
 
         clear_all_vars();
     }

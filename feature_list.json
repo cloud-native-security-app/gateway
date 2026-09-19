@@ -49,7 +49,7 @@
         "POST /auth/logout invalida la sesión del lado del navegador (borra la cookie)",
         "Tests de integración (#[ignore = \"requiere Docker\"] si usan un contenedor, o un servidor HTTP de test en memoria si no): callback con ID token válido (firmado con una clave JWKS de prueba) crea sesión; ID token con audiencia incorrecta, expirado, o firma inválida es rechazado; state ausente/incorrecto es rechazado; logout borra la cookie"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,

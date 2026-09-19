@@ -85,3 +85,72 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_config.md`.
 - **Estado final:** feature 2 (`config`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 3: oidc_login — DONE
+
+- **Agente:** leader (orquestando 3 explorers en paralelo + implementer +
+  reviewer).
+- **Investigación previa:** 3 explorers en paralelo (`progress/explore_openidconnect.md`,
+  `progress/explore_session_cookie.md`, `progress/explore_test_idp.md`)
+  confirmaron la API exacta de `openidconnect` 4.0.1
+  (`CoreProviderMetadata::discover_async` contra un issuer arbitrario,
+  válido para apuntar a Google en producción o a un IdP de prueba en
+  tests), `jsonwebtoken` 11.1.0 para la sesión propia, `axum-extra` 0.9.6
+  (única versión compatible con `axum = "0.7"` ya fijado) para la cookie,
+  y el patrón de IdP de prueba en memoria (axum + `jsonwebtoken::jwk` +
+  `rsa`, sin `wiremock`). Se detectó y resolvió con el usuario una
+  ambigüedad entre `feature_list.json` y `docs/verification.md` sobre si
+  los tests de `auth` con IdP en memoria llevan `#[ignore = "requiere
+  Docker"]`: decisión confirmada de que **no** lo llevan (corren en
+  `cargo test` normal), documentada en `progress/current.md` antes de
+  despachar al implementer.
+- **Qué se hizo:** flujo completo de login OIDC delegado en Google.
+  `src/config.rs` gana `GOOGLE_OIDC_ISSUER_URL` (opcional, default
+  `https://accounts.google.com`, override en tests) — gap detectado por
+  el explorer, plumbing necesario para esta feature. `src/domain.rs` gana
+  `Session { sub, email, name, exp }`. `src/auth.rs` implementa
+  `AuthError` (`thiserror`), `OidcClient` (discovery + `begin_login` con
+  PKCE/`state`/`nonce` + `exchange_and_verify` que valida firma
+  JWKS/`aud`/`iss`/`exp`/`nonce` y descarta el ID token tras extraer la
+  identidad), `LoginStateStore` (store en memoria del `state`→(`nonce`,
+  PKCE), TTL de 10 min, uso único — limitación de un solo proceso
+  documentada explícitamente), `issue_session_token`/`session_cookie`/
+  `removal_cookie`. `src/api.rs` monta `GET /auth/login`,
+  `GET /auth/callback`, `POST /auth/logout` sobre un `AppState` propio, y
+  traduce `AuthError` a 400/401/500 según el caso (`impl IntoResponse`).
+  Nuevas dependencias: `openidconnect`, `jsonwebtoken` (con feature
+  `rust_crypto`, requerida en runtime — sin ella `encode`/`decode` entran
+  en pánico), `axum-extra` (solo feature `cookie`), `cookie` (dependencia
+  directa, ya resuelta transitivamente por `axum-extra`); en dev:
+  `rsa`/`rand`/`base64` (IdP de prueba), `reqwest`/`url` (cliente HTTP de
+  test). No se tocó el middleware de sesión (diferido a la feature 4,
+  `session_middleware_and_me`) ni ninguna otra ruta/módulo fuera de
+  alcance.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (12 unit + 8 integración en
+  `tests/oidc_login.rs`, todos verdes, ninguno `#[ignore]`), `cargo test
+  -- --ignored` (0 tests, no aplica todavía), `cargo doc --no-deps` y
+  `./init.sh` — todo en verde, 0 warnings. Los 8 tests de integración
+  levantan un IdP OIDC de prueba en memoria (discovery + JWKS + `/token`
+  propios, `axum::serve` sobre puerto efímero) y ejercen el router real de
+  `gateway::api`: login redirige con los parámetros correctos; callback
+  válido crea sesión (cookie `HttpOnly`+`Secure`+`SameSite=Strict`
+  verificada, JWT decodificado y comparado campo a campo); callback
+  rechaza audiencia incorrecta/expirado/firma inválida (3 tests, 401, sin
+  `Set-Cookie`); `state` ausente/no coincidente rechazado (2 tests, 400);
+  logout borra la cookie (204, `Max-Age=0`/`Expires` pasado). Detalle
+  completo en `progress/impl_oidc_login.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente `cargo build`/`fmt`/`clippy`/`test`/`test -- --ignored`/
+  `doc`/`./init.sh`, y verificar los 7 criterios de aceptación uno por uno
+  contra el código y los tests (líneas concretas citadas). Confirmó que el
+  ID token de Google nunca se loggea/persiste/reenvía (`grep -rn
+  "tracing::" src/` solo devuelve el `Display` genérico de `AuthError`),
+  que no se adelantó ningún trabajo de la feature 4 (sin función de
+  validación de sesión reutilizable fuera de tests), y que `src/config.rs`
+  no reabrió nada de la feature 2 ya `done`. Sin cambios requeridos.
+  Detalle completo en `progress/review_oidc_login.md`.
+- **Estado final:** feature 3 (`oidc_login`) pasó a `"done"` en
+  `feature_list.json`.
