@@ -1,21 +1,27 @@
 //! Handshake OIDC contra el proveedor de identidad (Google en producción, un
-//! IdP de prueba en tests de integración), y emisión de la sesión propia de
-//! este Gateway (`jsonwebtoken`).
+//! IdP de prueba en tests de integración), emisión de la sesión propia de
+//! este Gateway (`jsonwebtoken`), y el middleware `axum` que exige esa
+//! sesión válida en cada ruta protegida (RNF-02, feature
+//! `session_middleware_and_me`).
 //!
 //! El ID token de Google se valida una sola vez, aquí, durante el callback
 //! de login, y se descarta inmediatamente tras extraer la identidad: nunca
-//! se persiste, se loggea, ni se reenvía (ver `docs/security-scope.md`). El
-//! middleware `axum` que exige sesión propia válida en rutas protegidas es
-//! responsabilidad de una feature posterior (`session_middleware_and_me`):
-//! este módulo solo emite/describe la sesión, no la vuelve a validar.
+//! se persiste, se loggea, ni se reenvía (ver `docs/security-scope.md`). En
+//! cada request posterior a una ruta protegida, lo único que se vuelve a
+//! validar es la sesión propia de este Gateway (firma/`exp`/`aud`/`iss`), no
+//! el ID token de Google — eso es responsabilidad de [`SessionValidator`] y
+//! [`require_session`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use cookie::time::Duration as CookieDuration;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
     AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
@@ -105,6 +111,11 @@ pub enum AuthError {
     /// No se pudo firmar la sesión propia de este Gateway.
     #[error("no se pudo emitir la sesión propia")]
     SessionIssue,
+    /// La sesión propia de este Gateway (cookie) está ausente, tiene una
+    /// firma inválida, o expiró. Mensaje deliberadamente genérico: el motivo
+    /// exacto solo se loggea en el servidor (ver `docs/security-scope.md`).
+    #[error("sesión inválida o ausente")]
+    SessionInvalid,
 }
 
 impl From<ClaimsVerificationError> for AuthError {
@@ -422,6 +433,91 @@ pub fn removal_cookie() -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE_NAME, "")).path("/").build()
 }
 
+/// Valida la sesión propia de este Gateway (firma, `exp`, `aud`, `iss`) en
+/// cada request a una ruta protegida (RNF-02).
+///
+/// Construido una sola vez con la misma clave/audiencia/emisor con los que
+/// [`issue_session_token`] emitió la sesión en el login: no vuelve a validar
+/// el ID token de Google, solo el JWT propio de este Gateway.
+#[derive(Clone)]
+pub struct SessionValidator {
+    signing_key: SecretString,
+    audience: String,
+    issuer: String,
+}
+
+impl SessionValidator {
+    /// Construye un validador con la clave de firma, audiencia y emisor
+    /// propios de este Gateway.
+    pub fn new(signing_key: SecretString, audience: String, issuer: String) -> Self {
+        Self {
+            signing_key,
+            audience,
+            issuer,
+        }
+    }
+
+    /// Decodifica y valida `token` (firma, `exp`, `aud`, `iss`), devolviendo
+    /// la identidad que encapsula.
+    ///
+    /// Falla con [`AuthError::SessionInvalid`] si la firma no verifica, el
+    /// token expiró, o `aud`/`iss` no coinciden con este Gateway. El motivo
+    /// exacto se loggea aquí (nunca el contenido del token) y no se expone
+    /// al cliente.
+    pub fn validate(&self, token: &str) -> Result<Session, AuthError> {
+        let decoding_key = DecodingKey::from_secret(self.signing_key.expose_secret().as_bytes());
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&[self.audience.as_str()]);
+        validation.set_issuer(&[self.issuer.as_str()]);
+
+        let decoded = jsonwebtoken::decode::<SessionClaims>(token, &decoding_key, &validation)
+            .map_err(|source| {
+                tracing::debug!(error = %source, "sesión propia inválida o expirada");
+                AuthError::SessionInvalid
+            })?;
+
+        Ok(Session {
+            sub: decoded.claims.sub,
+            email: decoded.claims.email,
+            name: decoded.claims.name,
+            exp: decoded.claims.exp,
+        })
+    }
+}
+
+/// Middleware `axum` que exige una sesión propia válida antes de dejar pasar
+/// a una ruta protegida (RNF-02).
+///
+/// Extrae la cookie [`SESSION_COOKIE_NAME`] y la valida con
+/// [`SessionValidator::validate`]. Si está ausente, tiene firma inválida, o
+/// expiró, responde `401` (vía [`AuthError::SessionInvalid`]) sin ejecutar
+/// el handler protegido. Si es válida, la sesión queda disponible al
+/// handler como `axum::Extension<Session>`.
+///
+/// Se aplica como capa (`axum::middleware::from_fn_with_state`) sobre el
+/// subconjunto de rutas protegidas del router de `api`, en vez de como un
+/// extractor por handler: así una ruta nueva queda pública o protegida por
+/// construcción explícita del router (`docs/architecture.md`), no porque
+/// cada handler recuerde añadir el extractor.
+pub async fn require_session(
+    State(validator): State<SessionValidator>,
+    jar: axum_extra::extract::cookie::CookieJar,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let Some(token) = jar
+        .get(SESSION_COOKIE_NAME)
+        .map(|cookie| cookie.value().to_string())
+    else {
+        tracing::debug!("solicitud a ruta protegida sin cookie de sesión");
+        return Err(AuthError::SessionInvalid);
+    };
+
+    let session = validator.validate(&token)?;
+    request.extensions_mut().insert(session);
+    Ok(next.run(request).await)
+}
+
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
@@ -518,5 +614,91 @@ mod tests {
             store.take(csrf_token.secret()).is_none(),
             "un state ya consumido no debe poder reutilizarse"
         );
+    }
+
+    fn lab_validator() -> SessionValidator {
+        SessionValidator::new(
+            SecretString::from("lab-only-not-a-real-secret".to_string()),
+            "gateway".to_string(),
+            "gateway-issuer".to_string(),
+        )
+    }
+
+    #[test]
+    fn session_validator_accepts_a_token_it_issued() {
+        let validator = lab_validator();
+        let session = lab_session();
+
+        let token = issue_session_token(
+            &session,
+            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            "gateway",
+            "gateway-issuer",
+        )
+        .expect("debe poder firmar una sesión válida");
+
+        let validated = validator
+            .validate(&token)
+            .expect("un token recién emitido con la misma clave/aud/iss debe validar");
+
+        assert_eq!(validated, session);
+    }
+
+    #[test]
+    fn session_validator_rejects_token_signed_with_a_different_key() {
+        let validator = lab_validator();
+        let session = lab_session();
+
+        let token = issue_session_token(
+            &session,
+            &SecretString::from("a-completely-different-lab-key".to_string()),
+            "gateway",
+            "gateway-issuer",
+        )
+        .expect("debe poder firmar con otra clave de laboratorio");
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(AuthError::SessionInvalid)
+        ));
+    }
+
+    #[test]
+    fn session_validator_rejects_expired_token() {
+        let validator = lab_validator();
+        let mut session = lab_session();
+        session.exp = 1; // muy en el pasado
+
+        let token = issue_session_token(
+            &session,
+            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            "gateway",
+            "gateway-issuer",
+        )
+        .expect("debe poder firmar una sesión ya vencida");
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(AuthError::SessionInvalid)
+        ));
+    }
+
+    #[test]
+    fn session_validator_rejects_token_with_wrong_audience() {
+        let validator = lab_validator();
+        let session = lab_session();
+
+        let token = issue_session_token(
+            &session,
+            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            "some-other-audience",
+            "gateway-issuer",
+        )
+        .expect("debe poder firmar con otra audiencia");
+
+        assert!(matches!(
+            validator.validate(&token),
+            Err(AuthError::SessionInvalid)
+        ));
     }
 }

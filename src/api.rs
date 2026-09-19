@@ -1,22 +1,25 @@
 //! Handlers y router `axum` de toda ruta pública de este Gateway.
 //!
-//! Por ahora solo expone las rutas de login/callback/logout OIDC (feature
-//! `oidc_login`); el resto de rutas públicas (perfil, escaneos, SSE,
-//! documentación) se añaden en features posteriores.
+//! Expone las rutas de login/callback/logout OIDC (feature `oidc_login`),
+//! una ruta de salud, y `GET /api/me` (feature `session_middleware_and_me`),
+//! la primera ruta protegida por el middleware de sesión de
+//! [`crate::auth::require_session`]. El resto de rutas públicas (perfil,
+//! escaneos, SSE, documentación) se añaden en features posteriores.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use secrecy::SecretString;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::auth::{self, AuthError, LoginStateStore, OidcClient};
+use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::domain::Session;
 
 /// Estado compartido por los handlers de autenticación de este router.
@@ -38,12 +41,141 @@ pub struct AppState {
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
 /// `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout`.
+///
+/// `POST /auth/logout` queda deliberadamente fuera del middleware de sesión
+/// (ver [`require_session`](crate::auth::require_session)): un logout debe
+/// poder invocarse incluso con una sesión ya ausente/inválida/expirada, sin
+/// que el middleware lo rechace con `401` antes de poder borrar la cookie
+/// del navegador. Decisión documentada en `progress/impl_session_middleware_and_me.md`.
 pub fn auth_router(state: AppState) -> Router {
     Router::new()
         .route("/auth/login", get(login))
         .route("/auth/callback", get(callback))
         .route("/auth/logout", post(logout))
         .with_state(state)
+}
+
+/// Construye el router `axum` con la ruta de salud pública de este Gateway
+/// (`GET /health`), sin lógica de negocio ni dependencia de `AppState`.
+pub fn health_router() -> Router {
+    Router::new().route("/health", get(health))
+}
+
+/// Responde `200 OK` sin cuerpo: usado por orquestadores/balanceadores para
+/// comprobar que el proceso está vivo, sin exigir sesión.
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Construye el router `axum` con las rutas protegidas de este Gateway
+/// (por ahora, solo `GET /api/me`), envueltas en el middleware de sesión
+/// [`crate::auth::require_session`] (RNF-02): una request sin sesión propia
+/// válida recibe `401` sin ejecutar ningún handler de este router.
+fn protected_router(state: AppState) -> Router {
+    let validator = SessionValidator::new(
+        state.session_signing_key.clone(),
+        state.session_audience.clone(),
+        state.session_issuer.clone(),
+    );
+
+    Router::new()
+        .route("/api/me", get(me))
+        .layer(middleware::from_fn_with_state(
+            validator,
+            auth::require_session,
+        ))
+}
+
+/// Identidad de la sesión activa devuelta por `GET /api/me`.
+///
+/// No incluye `exp` ni ningún dato de codificación del JWT de sesión (`aud`/
+/// `iss`): esos son un detalle de `auth`, no de la identidad expuesta a
+/// `front`.
+#[derive(Debug, Serialize)]
+struct MeResponse {
+    sub: String,
+    email: String,
+    name: String,
+}
+
+impl From<Session> for MeResponse {
+    fn from(session: Session) -> Self {
+        Self {
+            sub: session.sub,
+            email: session.email,
+            name: session.name,
+        }
+    }
+}
+
+/// Devuelve la identidad (`sub`/`email`/`name`) de la sesión activa, ya
+/// validada por el middleware de sesión. No consulta `ms-usuarios`: el
+/// perfil completo del usuario es responsabilidad de una feature posterior
+/// (`usuarios_profile_proxy`).
+async fn me(Extension(session): Extension<Session>) -> Json<MeResponse> {
+    Json(session.into())
+}
+
+/// Descripción de una ruta expuesta por [`app_router`], usada tanto para
+/// construirlo como para que los tests de la feature
+/// `session_middleware_and_me` puedan enumerar el router completo y
+/// verificar cuáles rutas llevan el middleware de sesión, en vez de
+/// mantener esa lista duplicada a mano en cada test (criterio de
+/// aceptación: "ninguna ruta nueva queda protegida o desprotegida por
+/// accidente"). Si se añade una ruta a `app_router` sin añadir aquí su
+/// entrada correspondiente, el test de enumeración deja de reflejar el
+/// router real.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteSpec {
+    /// Método HTTP de la ruta.
+    pub method: &'static str,
+    /// Path de la ruta.
+    pub path: &'static str,
+    /// `true` si la ruta exige sesión válida (lleva
+    /// [`crate::auth::require_session`]).
+    pub protected: bool,
+}
+
+/// Tabla canónica de toda ruta expuesta por [`app_router`], fuente única de
+/// verdad tanto para su construcción como para el test de enumeración de
+/// rutas de la feature `session_middleware_and_me`.
+pub const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        method: "GET",
+        path: "/auth/login",
+        protected: false,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/auth/callback",
+        protected: false,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/auth/logout",
+        protected: false,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/health",
+        protected: false,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/me",
+        protected: true,
+    },
+];
+
+/// Construye el router `axum` completo de este Gateway: las rutas públicas
+/// de autenticación ([`auth_router`]), la ruta de salud ([`health_router`]),
+/// y las rutas protegidas por el middleware de sesión
+/// (`crate::auth::require_session`). Ver [`ROUTES`] para la tabla canónica
+/// de qué ruta queda pública o protegida.
+pub fn app_router(state: AppState) -> Router {
+    auth_router(state.clone())
+        .merge(health_router())
+        .merge(protected_router(state))
 }
 
 /// Redirige (`302 Found`) al endpoint de autorización del proveedor de
@@ -155,11 +287,12 @@ impl IntoResponse for AuthError {
             | AuthError::IdTokenInvalidSignature
             | AuthError::IdTokenInvalidAudienceOrIssuer
             | AuthError::IdTokenInvalidNonce
-            | AuthError::IdTokenRejected => StatusCode::UNAUTHORIZED,
+            | AuthError::IdTokenRejected
+            | AuthError::SessionInvalid => StatusCode::UNAUTHORIZED,
             AuthError::Discovery | AuthError::SessionIssue => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        tracing::warn!(error = %self, %status, "fallo en el flujo de login OIDC");
+        tracing::warn!(error = %self, %status, "fallo de autenticación");
 
         (status, self.to_string()).into_response()
     }

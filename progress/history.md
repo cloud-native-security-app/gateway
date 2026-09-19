@@ -154,3 +154,56 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   Detalle completo en `progress/review_oidc_login.md`.
 - **Estado final:** feature 3 (`oidc_login`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 4: session_middleware_and_me — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  complejidad media, reutiliza `jsonwebtoken` ya integrado en la feature 3).
+- **Qué se hizo:** middleware `axum` que exige sesión propia válida en toda
+  ruta protegida (RNF-02), y `GET /api/me`. `src/auth.rs` gana
+  `AuthError::SessionInvalid` (401 genérico, sin filtrar el motivo exacto
+  al cliente), `SessionValidator` (`new`/`validate`: decodifica y valida el
+  JWT de sesión — firma HS256, `exp`, `aud`, `iss` — reutilizando el mismo
+  `SessionClaims` que ya usaba `issue_session_token`) y `require_session`
+  (middleware compatible con `axum::middleware::from_fn_with_state`: sin
+  cookie o inválida → `401` sin ejecutar el handler; válida → inserta
+  `Session` en `request.extensions_mut()`). `src/api.rs` gana
+  `health_router`/`GET /health` (pública, sin lógica de negocio),
+  `protected_router` (privado, monta `GET /api/me` con `.layer(...)` de
+  `require_session`), el handler `me` + `MeResponse` (solo
+  `sub`/`email`/`name`, sin tocar `ms-usuarios`), la tabla canónica
+  `pub const ROUTES` (método/path/`protected: bool`, fuente única de verdad
+  para el test de enumeración — axum 0.7 no expone introspección real del
+  router) y `pub fn app_router` que mergea `auth_router` (login/callback/
+  logout, público) + `health_router` (público) + `protected_router`
+  (con middleware). Se decidió mantener `/auth/logout` **pública** (fuera
+  del middleware): el logout es una acción puramente del navegador (borra
+  la cookie), exigir sesión válida para cerrarla crearía sesiones
+  "atascadas" para cookies ya vencidas/corruptas, y protegerla habría roto
+  el test ya aprobado `logout_clears_the_session_cookie` de la feature 3.
+  Nuevo archivo `tests/session_middleware_and_me.rs` (mismo patrón que
+  `tests/oidc_login.rs`: router real servido con `axum::serve` sobre
+  puerto efímero, sin Docker).
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (16 unitarios + 8
+  `tests/oidc_login.rs` sin regresión + 5 `tests/session_middleware_and_me.rs`
+  nuevos = 29 tests verdes), `cargo doc --no-deps` y `./init.sh` — todo en
+  verde, 0 warnings. Detalle completo en
+  `progress/impl_session_middleware_and_me.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación y validar los 5
+  criterios de aceptación uno por uno contra el código y los tests (líneas
+  concretas citadas). Confirmó la decisión de dejar `/auth/logout` pública
+  (duda documentada por el implementer), con justificación adicional en
+  `docs/security-scope.md`. Observación no bloqueante: el test de
+  enumeración de rutas verifica comportamiento HTTP contra una tabla
+  mantenida a mano (`ROUTES`), no introspección estructural real del
+  router — mitigado porque la protección real se aplica vía `.layer()` a
+  nivel de sub-router, no depende de `ROUTES`; recomendación para
+  features futuras de acoplar ambas cosas, no bloqueante. Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_session_middleware_and_me.md`.
+- **Estado final:** feature 4 (`session_middleware_and_me`) pasó a
+  `"done"` en `feature_list.json`.

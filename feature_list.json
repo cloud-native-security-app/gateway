@@ -63,7 +63,7 @@
         "Ninguna ruta nueva queda protegida u desprotegida por accidente: existe un test que enumera las rutas del router y verifica cuáles llevan el middleware",
         "Tests de integración: sesión válida accede a /api/me y recibe la identidad correcta; sesión ausente, con firma inválida, o expirada recibe 401 en una ruta protegida de ejemplo"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 5,
