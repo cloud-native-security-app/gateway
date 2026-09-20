@@ -149,7 +149,7 @@
         "Una ruta nueva sin su anotación OpenAPI hace fallar un test (no queda documentación desactualizada en silencio)",
         "Test verifica que la especificación generada es JSON válido y lista todas las rutas públicas esperadas"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 11,

@@ -652,3 +652,75 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   completo en `progress/review_rate_limiting.md`.
 - **Estado final:** feature 9 (`rate_limiting`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 10: openapi_docs — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers: el
+  leader verificó directamente, vía `cargo add --dry-run`, que `utoipa
+  5.5.0` (features `axum_extras`, `macros`) resuelve sin conflicto contra
+  `axum = "0.7"` ya fijado, y enumeró de antemano las 10 rutas públicas
+  existentes a documentar).
+- **Qué se hizo:** especificación OpenAPI de toda ruta pública de este
+  Gateway (RNF-08), generada desde el propio código. `Cargo.toml` gana
+  `utoipa = { version = "5.5.0", features = ["axum_extras"] }` (sin
+  `utoipa-swagger-ui`: el criterio de aceptación solo exige servir el JSON,
+  no una UI interactiva — decisión documentada para evitar una dependencia
+  no pedida). `src/api.rs` gana `#[utoipa::path(...)]` sobre los 10
+  handlers ya existentes (`login`, `callback`, `logout`, `health`, `me`,
+  `profile`, `submit_scan`, `list_scan_history`, `scan_events`,
+  `cancel_scan`), reutilizando sus doc-comments `///` ya existentes como
+  `summary`/`description` (utoipa los toma automáticamente de rustdoc, sin
+  duplicar texto), `#[derive(utoipa::ToSchema)]` en `MeResponse`,
+  `ScanSubmissionRequest`, `ScanSubmissionResponse`, `ScanHistoryEntryResponse`
+  (y `usuarios_client::ScanStatus`, que aparece como uno de sus campos),
+  `#[derive(utoipa::IntoParams)]` en `CallbackParams`, una nueva ruta
+  pública `GET /api/openapi.json` (`openapi_router`/`openapi_json`,
+  mergeada en `app_router` fuera del middleware de sesión — mismo patrón
+  que `health_router` — con su entrada `protected: false` en `ROUTES`), el
+  esquema de seguridad `session_cookie` (`impl utoipa::Modify`, referencia
+  la cookie `gateway::auth::SESSION_COOKIE_NAME` sin exponer su valor/firma)
+  y el agregador `ApiDoc` (`#[derive(utoipa::OpenApi)]` con los 11
+  `paths(...)`, `components(schemas(...))` y 5 `tags`). El stream SSE de
+  `GET /api/scans/{scan_id}/events` se documenta con la limitación explícita
+  de que `utoipa` no modela un body estructurado por evento (se aproxima
+  como `text/event-stream` de tipo `string`). Nuevo archivo
+  `tests/openapi_docs.rs`: mecanismo anti-drift que traduce la sintaxis de
+  parámetro de `axum` (`:scan_id`) a la de OpenAPI (`{scan_id}`) y compara
+  el conjunto exacto de paths/métodos de `gateway::api::ROUTES` (la misma
+  tabla canónica de la feature 4) contra `ApiDoc::openapi()` serializada a
+  JSON y vuelta a parsear (lo mismo que vería un cliente real de
+  `GET /api/openapi.json`) — una ruta añadida a `ROUTES` sin anotar/registrar
+  en `ApiDoc` hace fallar el `assert_eq!` de conjuntos, verificado
+  manualmente por el implementer insertando una ruta falsa y confirmando el
+  fallo antes de revertir. Corrección post-revisión (no bloqueante):
+  añadida la respuesta `504` (ya presente en los endpoints hermanos
+  `GET /api/profile`/`GET /api/scans`) a los `#[utoipa::path]` de
+  `POST /api/scans` y `POST /api/scans/{scan_id}/cancel`, ambos capaces de
+  producir `UsuariosClientError::Unreachable` por el mismo camino.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (54 unitarios + todos los
+  tests de integración sin Docker en verde, incluidos los 2 nuevos de
+  `tests/openapi_docs.rs`; ninguna feature 1-9 se rompió), `cargo test --
+  --ignored` (Docker disponible: los 3 tests existentes con RabbitMQ real
+  siguen en verde), `cargo doc --no-deps` (sin warnings, tras corregir un
+  `rustdoc::private_intra_doc_links` en el doc-comment de módulo) y
+  `./init.sh` — todo en verde, 0 warnings. Detalle completo en
+  `progress/impl_openapi_docs.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el test
+  Docker), validar los 4 criterios de aceptación uno por uno contra el
+  código/tests (líneas concretas citadas, incluyendo que cada código de
+  status documentado coincide con el `StatusCode` real devuelto por cada
+  handler), replicar el experimento del mecanismo anti-drift, y confirmar
+  que la especificación generada no filtra ningún secreto (solo el nombre
+  de la cookie de sesión en el `securityScheme`, nunca su valor/firma).
+  Único hallazgo no bloqueante: faltaba el código `504` en `POST
+  /api/scans`/`POST /api/scans/{scan_id}/cancel` (presente en sus
+  endpoints hermanos) — corregido por el implementer antes de cerrar la
+  sesión, con `cargo build`/`clippy`/`fmt --check`/`test` reconfirmados en
+  verde tras el ajuste. Detalle completo en
+  `progress/review_openapi_docs.md`.
+- **Estado final:** feature 10 (`openapi_docs`) pasó a `"done"` en
+  `feature_list.json`.

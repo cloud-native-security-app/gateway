@@ -5,8 +5,12 @@
 //! `GET /api/profile` (feature `usuarios_profile_proxy`), protegidas por el
 //! middleware de sesión de [`crate::auth::require_session`]. `POST
 //! /api/scans` lleva además un rate limiter por usuario (feature
-//! `rate_limiting`, ver [`ScanSubmissionRateLimiter`]). El resto de rutas
-//! públicas (SSE, documentación) se añaden en features posteriores.
+//! `rate_limiting`, ver [`ScanSubmissionRateLimiter`]). Cada handler lleva
+//! además su anotación `#[utoipa::path(...)]` (feature `openapi_docs`,
+//! RNF-08): [`ApiDoc`] las agrega en la especificación que sirve `GET
+//! /api/openapi.json` (ver [`openapi_router`]), generada desde el propio
+//! código — nunca mantenida a mano en paralelo (ver [`ROUTES`] para la tabla
+//! contra la que un test verifica que ninguna ruta quede sin documentar).
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -25,6 +29,8 @@ use axum_extra::extract::cookie::CookieJar;
 use futures_util::Stream;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
@@ -328,6 +334,14 @@ pub fn health_router() -> Router {
 
 /// Responde `200 OK` sin cuerpo: usado por orquestadores/balanceadores para
 /// comprobar que el proceso está vivo, sin exigir sesión.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "El proceso está vivo.")
+    )
+)]
 async fn health() -> StatusCode {
     StatusCode::OK
 }
@@ -376,7 +390,7 @@ fn protected_router(state: AppState) -> Router {
 /// No incluye `exp` ni ningún dato de codificación del JWT de sesión (`aud`/
 /// `iss`): esos son un detalle de `auth`, no de la identidad expuesta a
 /// `front`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct MeResponse {
     sub: String,
     email: String,
@@ -397,6 +411,16 @@ impl From<Session> for MeResponse {
 /// validada por el middleware de sesión. No consulta `ms-usuarios`: el
 /// perfil completo del usuario es responsabilidad de una feature posterior
 /// (`usuarios_profile_proxy`).
+#[utoipa::path(
+    get,
+    path = "/api/me",
+    tag = "session",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Identidad de la sesión activa.", body = MeResponse),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada.")
+    )
+)]
 async fn me(Extension(session): Extension<Session>) -> Json<MeResponse> {
     Json(session.into())
 }
@@ -407,6 +431,18 @@ async fn me(Extension(session): Extension<Session>) -> Json<MeResponse> {
 /// que le habla directamente (RF-09). Un fallo de red o un 5xx de
 /// `ms-usuarios` se traduce en `502`/`504` sin exponer su URL interna en el
 /// cuerpo de la respuesta (ver `docs/security-scope.md`).
+#[utoipa::path(
+    get,
+    path = "/api/profile",
+    tag = "session",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Perfil del usuario de la sesión activa, tal como lo reporta ms-usuarios (JSON opaco, ver crate::usuarios_client).", body = UserProfile),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
 async fn profile(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -430,7 +466,7 @@ async fn profile(
 /// pierde la capacidad de reabrir el stream SSE o cancelar esa entrada
 /// concreta hasta que vuelva a haber un `scanId` conocido para ella, pero
 /// sigue viendo su histórico.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ScanHistoryEntryResponse {
     /// `scanId` propio de este Gateway (ver la nota de diseño de este tipo),
     /// ausente si no hay mapeo conocido en [`ScanOwnershipRegistry`].
@@ -469,6 +505,18 @@ impl ScanHistoryEntryResponse {
 /// partir de la identidad ya verificada que reenvía este handler, nunca un
 /// identificador de otra fuente (ver `docs/security-scope.md`). Mismo mapeo
 /// de errores que [`profile`].
+#[utoipa::path(
+    get,
+    path = "/api/scans",
+    tag = "scans",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Histórico de escaneos del usuario de la sesión activa.", body = [ScanHistoryEntryResponse]),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
 async fn list_scan_history(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -483,7 +531,7 @@ async fn list_scan_history(
 
 /// Cuerpo de `POST /api/scans`: el objetivo (IP o rango CIDR) del escaneo
 /// solicitado, sin validar todavía (ver [`ScanSubmission::parse`]).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct ScanSubmissionRequest {
     target: String,
 }
@@ -492,7 +540,7 @@ struct ScanSubmissionRequest {
 /// seguimiento generado por este Gateway (RF-04), devuelto tan pronto se
 /// confirma el registro de histórico y la publicación en el Broker, sin
 /// esperar ningún desenlace del escaneo.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ScanSubmissionResponse {
     #[serde(rename = "scanId")]
     scan_id: String,
@@ -537,6 +585,23 @@ enum ScanSubmitError {
 ///    se actualiza a `Fallido` (best-effort: un fallo al marcarla se
 ///    loggea, nunca tumba la respuesta de error ya en curso) antes de
 ///    responder el error al cliente — nunca queda un `Pendiente` huérfano.
+#[utoipa::path(
+    post,
+    path = "/api/scans",
+    tag = "scans",
+    security(("session_cookie" = [])),
+    request_body = ScanSubmissionRequest,
+    responses(
+        (status = 200, description = "scanId de seguimiento generado, ya encolado en el Broker.", body = ScanSubmissionResponse),
+        (status = 400, description = "El objetivo (`target`) no es una IP ni un rango CIDR válido."),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 422, description = "ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo."),
+        (status = 429, description = "Se superó el límite de solicitudes de escaneo permitidas para este usuario (RF-12)."),
+        (status = 501, description = "La API de ms-usuarios para resolver las credenciales de red todavía no existe (ver docs/architecture.md §Dependencia pendiente)."),
+        (status = 502, description = "Fallo al registrar el histórico en ms-usuarios o al publicar en el Broker."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
 async fn submit_scan(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -627,6 +692,26 @@ impl IntoResponse for ScanEventsError {
 /// [`AppState::scan_ownership`], o
 /// perteneciente a otra sesión, responde `404` (nunca revela que un
 /// `scan_id` ajeno existe, ver [`ScanEventsError::NotFound`]).
+///
+/// **Limitación de esta documentación (feature `openapi_docs`)**: `utoipa`
+/// no modela un stream SSE con la misma riqueza que un cuerpo JSON
+/// estructurado; el `body` documentado abajo es una aproximación (texto
+/// plano `text/event-stream`), no un schema de cada
+/// [`crate::domain::ScanOutcomeEvent`] posible.
+#[utoipa::path(
+    get,
+    path = "/api/scans/{scan_id}/events",
+    tag = "scans",
+    security(("session_cookie" = [])),
+    params(
+        ("scan_id" = String, Path, description = "scanId propio de este Gateway generado por `POST /api/scans`.")
+    ),
+    responses(
+        (status = 200, description = "Stream `text/event-stream` con cada ScanOutcomeEvent nuevo de scan_id, hasta un estado terminal (completed/failed).", content_type = "text/event-stream", body = String),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 404, description = "El scan_id no existe o pertenece a otra sesión.")
+    )
+)]
 async fn scan_events(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -726,6 +811,23 @@ impl IntoResponse for ScanCancelError {
 ///   `ScanCancellation` (`correlation_id` = `scan_id` del path,
 ///   `requested_by` = `sub` de la sesión activa, nunca un identificador
 ///   reenviado sin verificar) y responde `202 Accepted`.
+#[utoipa::path(
+    post,
+    path = "/api/scans/{scan_id}/cancel",
+    tag = "scans",
+    security(("session_cookie" = [])),
+    params(
+        ("scan_id" = String, Path, description = "scanId propio de este Gateway a cancelar.")
+    ),
+    responses(
+        (status = 202, description = "ScanCancellation publicado en el Broker."),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 404, description = "El scan_id no existe o pertenece a otra sesión."),
+        (status = 409, description = "El escaneo ya finalizó y no puede cancelarse."),
+        (status = 502, description = "Fallo al consultar ms-usuarios o al publicar la cancelación en el Broker."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
 async fn cancel_scan(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
@@ -840,22 +942,117 @@ pub const ROUTES: &[RouteSpec] = &[
         path: "/api/scans/:scan_id/cancel",
         protected: true,
     },
+    RouteSpec {
+        method: "GET",
+        path: "/api/openapi.json",
+        protected: false,
+    },
 ];
 
 /// Construye el router `axum` completo de este Gateway: las rutas públicas
 /// de autenticación ([`auth_router`]), la ruta de salud ([`health_router`]),
-/// y las rutas protegidas por el middleware de sesión
-/// (`crate::auth::require_session`). Ver [`ROUTES`] para la tabla canónica
-/// de qué ruta queda pública o protegida.
+/// la especificación OpenAPI pública ([`openapi_router`]), y las rutas
+/// protegidas por el middleware de sesión (`crate::auth::require_session`).
+/// Ver [`ROUTES`] para la tabla canónica de qué ruta queda pública o
+/// protegida.
 pub fn app_router(state: AppState) -> Router {
     auth_router(state.clone())
         .merge(health_router())
+        .merge(openapi_router())
         .merge(protected_router(state))
 }
+
+/// Construye el router `axum` con la especificación OpenAPI pública de este
+/// Gateway (`GET /api/openapi.json`, RNF-08, feature `openapi_docs`): es
+/// documentación de la API, no un dato de sesión, así que queda
+/// deliberadamente fuera del middleware de sesión, igual que [`health_router`].
+pub fn openapi_router() -> Router {
+    Router::new().route("/api/openapi.json", get(openapi_json))
+}
+
+/// Sirve la especificación OpenAPI completa de este Gateway (RNF-08),
+/// generada desde las anotaciones `#[utoipa::path(...)]` de cada handler
+/// agregadas en [`ApiDoc`] — nunca mantenida a mano en paralelo al código.
+#[utoipa::path(
+    get,
+    path = "/api/openapi.json",
+    tag = "docs",
+    responses(
+        (status = 200, description = "Especificación OpenAPI completa de este Gateway, en JSON.", body = serde_json::Value)
+    )
+)]
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
+}
+
+/// Agrega en la [`utoipa::openapi::OpenApi`] generada la definición del
+/// esquema de seguridad `session_cookie` (la cookie
+/// [`crate::auth::SESSION_COOKIE_NAME`] que exige
+/// [`crate::auth::require_session`]), referenciado por cada ruta protegida
+/// vía `security(("session_cookie" = []))`.
+struct SessionCookieSecurity;
+
+impl Modify for SessionCookieSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "session_cookie",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(auth::SESSION_COOKIE_NAME))),
+            );
+        }
+    }
+}
+
+/// Especificación OpenAPI de este Gateway (RNF-08): agrega la anotación
+/// `#[utoipa::path(...)]` de cada handler público listado en [`ROUTES`] —
+/// una ruta añadida a `ROUTES`/`app_router` sin registrarse aquí queda fuera
+/// de la especificación generada, lo que hace fallar el test anti-drift de
+/// la feature `openapi_docs` (`tests/openapi_docs.rs`) en vez de dejar
+/// documentación desactualizada en silencio.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(
+        login,
+        callback,
+        logout,
+        health,
+        openapi_json,
+        me,
+        profile,
+        submit_scan,
+        list_scan_history,
+        scan_events,
+        cancel_scan,
+    ),
+    components(schemas(
+        MeResponse,
+        ScanSubmissionRequest,
+        ScanSubmissionResponse,
+        ScanHistoryEntryResponse,
+        crate::usuarios_client::ScanStatus,
+    )),
+    tags(
+        (name = "auth", description = "Login/callback/logout delegados en Google OIDC."),
+        (name = "health", description = "Comprobación de vida del proceso."),
+        (name = "docs", description = "Documentación OpenAPI de este Gateway (RNF-08)."),
+        (name = "session", description = "Identidad y perfil de la sesión activa."),
+        (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos.")
+    ),
+    modifiers(&SessionCookieSecurity)
+)]
+pub struct ApiDoc;
 
 /// Redirige (`302 Found`) al endpoint de autorización del proveedor de
 /// identidad, tras registrar el `state`/`nonce`/PKCE de este intento de
 /// login en [`AppState::login_states`].
+#[utoipa::path(
+    get,
+    path = "/auth/login",
+    tag = "auth",
+    responses(
+        (status = 302, description = "Redirección al endpoint de autorización del proveedor de identidad (Google).")
+    )
+)]
 async fn login(State(state): State<AppState>) -> Response {
     let login_start = state.oidc_client.begin_login();
     state.login_states.insert(
@@ -868,7 +1065,7 @@ async fn login(State(state): State<AppState>) -> Response {
 }
 
 /// Parámetros de consulta esperados en `GET /auth/callback`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 struct CallbackParams {
     /// Código de autorización devuelto por el proveedor de identidad.
     #[serde(default)]
@@ -886,6 +1083,18 @@ struct CallbackParams {
 /// Rechaza el callback (sin crear sesión) si falta o no coincide el `state`
 /// (mitigación CSRF), si falta el código, o si el ID token es inválido,
 /// expiró, o tiene una audiencia/emisor/nonce inesperados.
+#[utoipa::path(
+    get,
+    path = "/auth/callback",
+    tag = "auth",
+    params(CallbackParams),
+    responses(
+        (status = 200, description = "Sesión propia emitida como cookie HttpOnly + Secure + SameSite=Strict tras validar el ID token."),
+        (status = 400, description = "Falta el parámetro `state`/`code`, o el `state` no coincide con ningún login vigente."),
+        (status = 401, description = "El ID token es inválido, expiró, o tiene una audiencia/emisor/nonce inesperados."),
+        (status = 500, description = "No se pudo completar el descubrimiento OIDC o emitir la sesión propia.")
+    )
+)]
 async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
@@ -923,6 +1132,14 @@ async fn callback(
 }
 
 /// Borra la cookie de sesión del lado del navegador.
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    tag = "auth",
+    responses(
+        (status = 204, description = "Cookie de sesión borrada del lado del navegador.")
+    )
+)]
 async fn logout(jar: CookieJar) -> (CookieJar, StatusCode) {
     (jar.remove(auth::removal_cookie()), StatusCode::NO_CONTENT)
 }

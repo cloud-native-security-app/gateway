@@ -38,6 +38,14 @@ uuid = { version = "1", features = ["v4"] }
 # producción, no solo de test (antes solo estaba en `[dev-dependencies]`,
 # ver `progress/explore_sse.md`).
 futures-util = "0.3"
+# Genera la especificación OpenAPI de `src/api.rs` desde las anotaciones
+# `#[utoipa::path(...)]`/`#[derive(ToSchema)]` ya puestas sobre cada
+# handler/tipo (RNF-08, feature `openapi_docs`) — nunca mantenida a mano en
+# paralelo al código. `axum_extras` habilita las conversiones de extractores
+# de `axum` (`Path`/`Query`/`State`) que usan esos handlers; no se añade
+# `utoipa-swagger-ui` porque el criterio de aceptación solo exige servir el
+# JSON generado en `GET /api/openapi.json`, no una UI interactiva.
+utoipa = { version = "5.5.0", features = ["axum_extras"] }
 
 [dev-dependencies]
 testcontainers = "0.20"

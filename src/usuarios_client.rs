@@ -86,7 +86,11 @@ pub type UserProfile = serde_json::Value;
 /// `user-service/src/domain.rs::ScanStatus`
 /// (`#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`), no una suposición de
 /// este repo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `ToSchema` (feature `openapi_docs`, RNF-08): este tipo aparece como campo
+/// de `GET /api/scans` en la especificación OpenAPI generada (ver
+/// `crate::api::ScanHistoryEntryResponse`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanStatus {
     /// El escaneo fue solicitado pero aún no ha comenzado a ejecutarse.
