@@ -3,18 +3,19 @@
 > Este archivo se vacía al cerrar cada sesión y se mueve a `history.md`.
 > Mientras trabajas, **mantenlo actualizado en tiempo real**, no al final.
 
-- **Feature en curso:** _ninguna — elegir la siguiente `pending` de `feature_list.json`_
-- **Inicio:** _pendiente_
-- **Agente:** _pendiente_
+- **Feature en curso:** _ninguna_
+- **Inicio:** _—_
+- **Agente:** _—_
 
 ## Plan
 
-_Bullets breves del plan de la próxima sesión._
+_Vacío — sin sesión activa._
 
 ## Bitácora
 
-_Se registra en tiempo real mientras se trabaja._
+_Vacío — sin sesión activa._
 
 ## Próximo paso
 
-_Si la sesión se interrumpe, lo primero que debe hacer la siguiente sesión._
+_Vacío — sin sesión activa. `feature_list.json` no tiene features `pending`
+a la fecha del último cierre de sesión (ver `progress/history.md`)._

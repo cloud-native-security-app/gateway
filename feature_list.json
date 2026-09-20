@@ -166,7 +166,7 @@
         "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
         "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no, y la nota ya existente sobre terminación TLS pública fuera de este binario)"
       ],
-      "status": "pending"
+      "status": "done"
     }
   ]
 }

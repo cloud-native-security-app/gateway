@@ -724,3 +724,75 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_openapi_docs.md`.
 - **Estado final:** feature 10 (`openapi_docs`) pasó a `"done"` en
   `feature_list.json`.
+
+---
+
+## 2026-09-19 — Feature 11: containerization — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  patrón directamente reutilizable ya validado en `user-service/Dockerfile`,
+  repo hermano de solo lectura).
+- **Investigación previa:** el leader revisó `user-service/Dockerfile`,
+  `.dockerignore`, `docs/architecture.md`§Despliegue y
+  `README.md`§"Despliegue (Docker)" como plantilla a adaptar (no copiar
+  literal), y confirmó de antemano en `progress/current.md` las variables
+  de entorno reales de `src/config.rs` y que el binario del paquete
+  `gateway` (sin `[[bin]]` en `Cargo.toml`) ya se llama `gateway` por
+  defecto.
+- **Qué se hizo:** imagen Docker de producción de `gateway` (RF-09,
+  ninguna lógica de negocio nueva en `src/`/`tests/`). Nuevo `Dockerfile`
+  multi-stage en la raíz: stage `builder`
+  (`rust:1.98-bookworm@sha256:82150a52...`, mismo digest que
+  `user-service`, cachea la compilación de dependencias con un `src`
+  placeholder antes de copiar el código real y compilar
+  `cargo build --release`) y stage runtime
+  (`gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79...`, mismo
+  digest que `user-service`) con únicamente el binario `gateway` copiado
+  y `USER nonroot`; sin stage de migraciones/sqlx (diferencia deliberada
+  frente a `user-service`, que sí las embebe). El comentario del
+  `Dockerfile` y la nota nueva de `docs/architecture.md` explicitan que
+  los certificados CA de la base distroless cubren el TLS saliente hacia
+  **3** destinos: Google (OIDC), `ms-usuarios` y el Broker (AMQPS), no
+  solo uno. Nuevo `.dockerignore` que excluye `target/`, `.git/`,
+  `.gitignore`, `.claude/`, `progress/`, `docs/`, `tests/`, `rabbitmq/`
+  (fixtures de topología de `testcontainers`, confirmado por `grep` que
+  solo las usa `cargo test`, nunca el binario de producción), `*.md`,
+  `Dockerfile`, `.dockerignore`. `docs/architecture.md`§Despliegue
+  **extendida** (no reemplazada): la nota ya existente sobre terminación
+  TLS pública fuera del binario sigue intacta, con un párrafo nuevo sobre
+  la imagen. `README.md`§"Despliegue (Docker)" relleno completo del
+  placeholder: instrucciones de build, tabla de las 14 constantes `ENV_*`
+  reales leídas de `src/config.rs` (13 requeridas + `GOOGLE_OIDC_ISSUER_URL`
+  como única con valor por defecto), y un `docker run` de ejemplo con
+  valores sintéticos de laboratorio (nunca credenciales reales).
+- **Verificación:** `docker build -t gateway:local .` sin error (~101s,
+  imagen final 51.7MB disco/13.4MB contenido); `docker inspect` confirma
+  `USER` = `nonroot`; `docker run --rm --entrypoint sh ... -c "echo hi"`
+  confirma ausencia de shell/toolchain en la imagen final; `docker run`
+  con las 13 env vars requeridas (valores sintéticos) arranca el proceso,
+  carga la configuración correctamente y falla limpiamente al no
+  encontrar Google/Broker/ms-usuarios reales en este entorno —log `ERROR`
+  estructurado, exit code 1, **sin panic ni credenciales en el log**.
+  Limpieza: contenedores lanzados con `--rm`, imagen `gateway:local`
+  eliminada explícitamente al terminar. `./init.sh` en verde (esta feature
+  no toca `src/`/`tests/`). Detalle completo en
+  `progress/impl_containerization.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras verificación
+  independiente: repitió `docker build --no-cache -t gateway:review-check .`
+  desde cero (sin depender de la caché del implementer, ~1m46s, éxito),
+  confirmó ausencia de shell y usuario `nonroot` por su cuenta, repitió
+  `docker run` con env vars sintéticas y confirmó el mismo comportamiento
+  sin panic ni fuga de credenciales (además probó el caso sin ninguna env
+  var: tampoco panickea), confirmó por `git diff docs/architecture.md` que
+  la nota TLS pública original sigue intacta y solo se añadió texto nuevo,
+  confirmó por `grep`/lectura directa de `src/config.rs` el conteo exacto
+  de 14 `ENV_*` (13 requeridas + 1 con default) contra la tabla de
+  `README.md`, y confirmó que `.dockerignore` no rompe el build real.
+  Ejecutó `./init.sh` dos veces de forma independiente (regresión de las
+  features 1-10, incluidos los 3 tests Docker vía testcontainers contra
+  RabbitMQ real) sin encontrar regresiones. Recorrió los 5 checkpoints de
+  `CHECKPOINTS.md` uno por uno, todos `[x]`. Sin cambios requeridos.
+  Detalle completo en `progress/review_containerization.md`.
+- **Estado final:** feature 11 (`containerization`) pasó a `"done"` en
+  `feature_list.json`. Era la última feature pendiente del backlog de
+  `feature_list.json`.
