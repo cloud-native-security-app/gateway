@@ -159,9 +159,9 @@ documentada en `feature_list.json`.
 
 ## Despliegue
 
-> Detalle práctico (variables de entorno exactas) vive en `README.md` una
-> vez exista el `Dockerfile` (feature `containerization`) — esta sección
-> explica el *por qué*.
+> Detalle práctico (variables de entorno exactas, ejemplo de `docker run`)
+> vive en `README.md` §"Despliegue (Docker)" — esta sección explica el
+> *por qué*, no lo duplica.
 
 Gateway sirve HTTP plano dentro de la subred; la terminación TLS pública
 (RNF-01) se asume hecha por un balanceador/ingress delante de este
@@ -169,6 +169,22 @@ servicio, no por el propio binario — mismo principio de "no asumir
 infraestructura no pedida" que documentan los demás repos de esta
 plataforma. Si el despliegue real requiere que Gateway termine TLS él
 mismo, es una decisión a discutir explícitamente antes de implementarla.
+
+El servicio se empaqueta con un `Dockerfile` multi-stage (stage builder con
+la toolchain Rust, stage runtime mínimo distroless, usuario no-root), mismo
+patrón que `user-service`/`nmap-service`. La imagen final incluye
+únicamente el binario `gateway` y los certificados CA del sistema (ya
+provistos por la base `gcr.io/distroless/cc-debian12:nonroot`) — necesarios
+porque este binario es, a su vez, **cliente** TLS saliente hacia tres
+destinos distintos: Google (handshake OIDC, RF-01), `ms-usuarios` (HTTP
+síncrono, subred privada) y el Broker (AMQPS, puerto 5671). Esto es
+independiente de la terminación TLS pública descrita arriba, que sigue
+siendo responsabilidad de un balanceador/ingress delante de Gateway, no del
+propio binario. La imagen final **no incluye** la toolchain de Rust, el
+código fuente, ni shell/coreutils — es deliberadamente inspeccionable y de
+superficie de ataque mínima. No se asume todavía un proveedor cloud
+concreto para el propio servicio — se documenta en términos genéricos hasta
+que el usuario decida una plataforma de despliegue.
 
 ## Qué NO hacer
 

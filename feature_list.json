@@ -20,7 +20,7 @@
         "Cargo.toml incluye testcontainers como dev-dependency",
         "cargo build compila sin warnings"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 2,
@@ -33,7 +33,7 @@
         "Ningún valor de configuración queda hardcodeado en el código",
         "Test cubre: config válida se carga correctamente; falta cada variable requerida produce un error tipado; Debug no filtra ningún secreto"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 3,
@@ -49,7 +49,7 @@
         "POST /auth/logout invalida la sesión del lado del navegador (borra la cookie)",
         "Tests de integración (#[ignore = \"requiere Docker\"] si usan un contenedor, o un servidor HTTP de test en memoria si no): callback con ID token válido (firmado con una clave JWKS de prueba) crea sesión; ID token con audiencia incorrecta, expirado, o firma inválida es rechazado; state ausente/incorrecto es rechazado; logout borra la cookie"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 4,
@@ -63,7 +63,7 @@
         "Ninguna ruta nueva queda protegida u desprotegida por accidente: existe un test que enumera las rutas del router y verifica cuáles llevan el middleware",
         "Tests de integración: sesión válida accede a /api/me y recibe la identidad correcta; sesión ausente, con firma inválida, o expirada recibe 401 en una ruta protegida de ejemplo"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 5,
@@ -77,7 +77,7 @@
         "GET /api/profile (ruta protegida) usa este cliente y devuelve el perfil del usuario de la sesión activa",
         "Tests de integración: contra un servidor HTTP de test que implementa el contrato documentado de ms-usuarios — camino feliz, credencial de servicio incorrecta simulada como 401 de ms-usuarios, ms-usuarios caído simula 502/504 sin panic"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 6,
@@ -93,7 +93,7 @@
         "Un fallo al publicar en el Broker tras haber registrado el histórico se refleja actualizando ese registro a Fallido (nunca deja una entrada Pendiente huérfana) y se reporta como error al cliente",
         "Tests de integración (#[ignore = \"requiere Docker\"]): IP/CIDR inválido -> 400 sin llamadas externas; dependencia de ms-usuarios no disponible -> error explícito documentado; camino feliz (con un stub de ms-usuarios que sí resuelve los 3 campos) publica un ScanRequest verificable en una cola de test bindeada a scan.requests y devuelve el scanId"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 7,
@@ -108,7 +108,7 @@
         "Un mensaje malformado en la cola se descarta con un log (sin credenciales) y no tumba el consumidor",
         "Tests de integración (#[ignore = \"requiere Docker\"]): publicar manualmente started/completed/failed en la cola de test y verificar que el stream SSE los recibe en orden; un scan_id de otro usuario es rechazado; mensaje malformado no tumba el consumidor"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 8,
@@ -122,7 +122,7 @@
         "Cancelar un scan_id que ya está en estado terminal (completed/failed) responde un error explícito sin publicar nada al Broker",
         "Tests de integración (#[ignore = \"requiere Docker\"]): histórico devuelve las entradas del usuario correcto; cancelación de un scan propio en curso publica el mensaje verificable en una cola de test bindeada a scan.cancellations; cancelación de scan ajeno -> 404; cancelación de scan ya terminado -> error sin publicar"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 9,
@@ -136,7 +136,7 @@
         "Dos usuarios distintos con sesiones válidas tienen contadores independientes: uno alcanzando su límite no afecta al otro",
         "Tests de integración: un usuario que excede el umbral recibe 429 en la solicitud que lo supera; un segundo usuario en paralelo sigue recibiendo 200/202 normalmente"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 10,
@@ -149,7 +149,7 @@
         "Una ruta nueva sin su anotación OpenAPI hace fallar un test (no queda documentación desactualizada en silencio)",
         "Test verifica que la especificación generada es JSON válido y lista todas las rutas públicas esperadas"
       ],
-      "status": "pending"
+      "status": "done"
     },
     {
       "id": 11,
@@ -166,7 +166,7 @@
         "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
         "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no, y la nota ya existente sobre terminación TLS pública fuera de este binario)"
       ],
-      "status": "pending"
+      "status": "done"
     }
   ]
 }
