@@ -68,6 +68,7 @@ un error tipado explícito, nunca con un panic:
 | `SESSION_TTL_SECS` | Sí | Tiempo de vida, en segundos, de la sesión propia de Gateway |
 | `BROKER_AMQPS_URL` | Sí | URL AMQPS del Broker, incluida la credencial del usuario RabbitMQ `gateway`. Nunca se loggea |
 | `BROKER_VHOST` | Sí | Vhost de RabbitMQ a usar en el Broker |
+| `FRONT_BASE_URL` | Sí | URL fija de `front` a la que `GET /auth/callback` redirige (`302`) tras completar el login; nunca se deriva de la request (evita open redirect) |
 | `MS_USUARIOS_BASE_URL` | Sí | URL base de `ms-usuarios`, nunca expuesta a `front` |
 | `MS_USUARIOS_SHARED_SECRET` | Sí | Credencial de servicio compartida con `ms-usuarios`. Nunca se loggea |
 | `SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS` | Sí | Número máximo de `POST /api/scans` por usuario dentro de la ventana de tiempo (RF-12) |
@@ -84,6 +85,7 @@ docker run --rm \
   -e SESSION_TTL_SECS=3600 \
   -e BROKER_AMQPS_URL=amqps://gateway:change-me@broker.internal:5671 \
   -e BROKER_VHOST=security-app \
+  -e FRONT_BASE_URL=https://front.example/post-login \
   -e MS_USUARIOS_BASE_URL=http://ms-usuarios.internal \
   -e MS_USUARIOS_SHARED_SECRET=change-me \
   -e SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS=5 \

@@ -39,6 +39,11 @@ const ENV_BROKER_AMQPS_URL: &str = "BROKER_AMQPS_URL";
 /// Nombre de la variable de entorno con el vhost de RabbitMQ a usar en el
 /// Broker.
 const ENV_BROKER_VHOST: &str = "BROKER_VHOST";
+/// Nombre de la variable de entorno con la URL fija de `front` a la que
+/// `GET /auth/callback` redirige (`302`) tras completar el login (feature
+/// `post_login_redirect`). Nunca se deriva de la query string de la request
+/// original: fijarla en configuración evita un open redirect.
+const ENV_FRONT_BASE_URL: &str = "FRONT_BASE_URL";
 /// Nombre de la variable de entorno con la URL base de `ms-usuarios`.
 const ENV_MS_USUARIOS_BASE_URL: &str = "MS_USUARIOS_BASE_URL";
 /// Nombre de la variable de entorno con la credencial de servicio
@@ -88,6 +93,20 @@ pub struct Config {
     pub broker_amqps_url: SecretString,
     /// Vhost de RabbitMQ a usar en el Broker.
     pub broker_vhost: String,
+    /// URL fija de `front` a la que `GET /auth/callback` redirige (`302`)
+    /// tras completar el login. Nunca se deriva de la request original (ver
+    /// `docs/security-scope.md`: evita un open redirect).
+    pub front_base_url: String,
+    /// Origen (`scheme://host[:puerto]`, sin `path`) derivado de
+    /// [`Config::front_base_url`] — no es una variable de entorno nueva,
+    /// sino el mismo valor de `FRONT_BASE_URL` normalizado a la forma que
+    /// compara el header `Origin` de una request CORS (RFC 6454): ese
+    /// header nunca lleva `path`, así que no basta con reflejar el string
+    /// crudo de `front_base_url` (que sí puede llevarlo, p. ej.
+    /// `https://front.example/post-login`). Único origen permitido por la
+    /// `CorsLayer` de este Gateway (feature `cors_for_front`) — nunca un
+    /// wildcard (ver `docs/security-scope.md`).
+    pub front_origin: String,
     /// URL base de `ms-usuarios`, nunca expuesta a `front`.
     pub ms_usuarios_base_url: String,
     /// Credencial de servicio compartida con `ms-usuarios`. Nunca se
@@ -122,6 +141,17 @@ pub enum ConfigError {
         #[source]
         source: ParseIntError,
     },
+    /// Una variable de entorno que debe ser una URL absoluta no se pudo
+    /// parsear como tal (p. ej. `FRONT_BASE_URL` para derivar
+    /// [`Config::front_origin`]).
+    #[error("la variable de entorno {name} no es una URL absoluta válida")]
+    InvalidUrl {
+        /// Nombre de la variable de entorno inválida.
+        name: &'static str,
+        /// Error original de parseo.
+        #[source]
+        source: url::ParseError,
+    },
 }
 
 /// Lee una variable de entorno requerida como `String`.
@@ -144,6 +174,16 @@ fn required_secret(name: &'static str) -> Result<SecretString, ConfigError> {
 /// `default` si no está definida o no es UTF-8 válido.
 fn optional_string_with_default(name: &'static str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Deriva el origen (`scheme://host[:puerto]`, sin `path`) de `value`,
+/// interpretado como una URL absoluta — usado para validar `FRONT_BASE_URL`
+/// como [`Config::front_origin`] (feature `cors_for_front`). Devuelve
+/// [`ConfigError::InvalidUrl`] si `value` no es una URL absoluta válida.
+fn front_origin_from_base_url(name: &'static str, value: &str) -> Result<String, ConfigError> {
+    let parsed =
+        url::Url::parse(value).map_err(|source| ConfigError::InvalidUrl { name, source })?;
+    Ok(parsed.origin().ascii_serialization())
 }
 
 impl Config {
@@ -177,6 +217,8 @@ impl Config {
             })?;
         let broker_amqps_url = required_secret(ENV_BROKER_AMQPS_URL)?;
         let broker_vhost = required_string(ENV_BROKER_VHOST)?;
+        let front_base_url = required_string(ENV_FRONT_BASE_URL)?;
+        let front_origin = front_origin_from_base_url(ENV_FRONT_BASE_URL, &front_base_url)?;
         let ms_usuarios_base_url = required_string(ENV_MS_USUARIOS_BASE_URL)?;
         let ms_usuarios_shared_secret = required_secret(ENV_MS_USUARIOS_SHARED_SECRET)?;
         let scan_submission_rate_limit_max_requests =
@@ -205,6 +247,8 @@ impl Config {
             session_ttl_secs,
             broker_amqps_url,
             broker_vhost,
+            front_base_url,
+            front_origin,
             ms_usuarios_base_url,
             ms_usuarios_shared_secret,
             scan_submission_rate_limit_max_requests,
@@ -233,6 +277,7 @@ mod tests {
         ENV_SESSION_TTL_SECS,
         ENV_BROKER_AMQPS_URL,
         ENV_BROKER_VHOST,
+        ENV_FRONT_BASE_URL,
         ENV_MS_USUARIOS_BASE_URL,
         ENV_MS_USUARIOS_SHARED_SECRET,
         ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
@@ -260,6 +305,7 @@ mod tests {
         env::set_var(ENV_SESSION_TTL_SECS, "3600");
         env::set_var(ENV_BROKER_AMQPS_URL, LAB_BROKER_AMQPS_URL);
         env::set_var(ENV_BROKER_VHOST, "security-app");
+        env::set_var(ENV_FRONT_BASE_URL, "https://front.lab/post-login");
         env::set_var(ENV_MS_USUARIOS_BASE_URL, "http://ms-usuarios.internal");
         env::set_var(ENV_MS_USUARIOS_SHARED_SECRET, "lab-only-not-a-real-secret");
         env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS, "5");
@@ -287,6 +333,11 @@ mod tests {
             LAB_BROKER_AMQPS_URL
         );
         assert_eq!(config.broker_vhost, "security-app");
+        assert_eq!(config.front_base_url, "https://front.lab/post-login");
+        assert_eq!(
+            config.front_origin, "https://front.lab",
+            "front_origin debe ser el origen (sin path) de FRONT_BASE_URL"
+        );
         assert_eq!(config.ms_usuarios_base_url, "http://ms-usuarios.internal");
         assert_eq!(
             config.google_oidc_issuer_url, DEFAULT_GOOGLE_OIDC_ISSUER_URL,
@@ -408,6 +459,29 @@ mod tests {
                 ..
             })
         ));
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn front_base_url_that_is_not_an_absolute_url_produces_typed_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_FRONT_BASE_URL, "not-an-absolute-url");
+
+        let result = Config::from_env();
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidUrl {
+                    name: ENV_FRONT_BASE_URL,
+                    ..
+                })
+            ),
+            "esperaba ConfigError::InvalidUrl para {ENV_FRONT_BASE_URL}, obtuve {result:?}"
+        );
 
         clear_all_vars();
     }

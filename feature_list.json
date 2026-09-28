@@ -4,7 +4,12 @@
   "rules": {
     "one_feature_at_a_time": true,
     "require_tests_to_close": true,
-    "valid_status": ["pending", "in_progress", "done", "blocked"]
+    "valid_status": [
+      "pending",
+      "in_progress",
+      "done",
+      "blocked"
+    ]
   },
   "features": [
     {
@@ -165,6 +170,69 @@
         "Las imágenes base están fijadas por tag concreto (no latest), idealmente por digest",
         "docker build completa sin error y docker run con las env vars requeridas arranca el proceso sin panic (verificación manual documentada)",
         "docs/architecture.md se actualiza con una nota breve de despliegue (imagen, qué incluye y qué no, y la nota ya existente sobre terminación TLS pública fuera de este binario)"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 12,
+      "name": "post_login_redirect",
+      "title": "Redirect a front tras completar el login OIDC",
+      "description": "GET /auth/callback hoy responde 200 vacío tras validar el login y emitir la sesión (ver feature 3, oidc_login) — el navegador queda en una página en blanco en vez de volver a la SPA de front, que inicia el flujo con una navegación de página completa (window.location.href, ver front/src/auth/LoginButton.tsx). Se agrega un redirect 302 hacia una URL de front fija, tomada de configuración, nunca derivada de ningún parámetro de la request (para no introducir un open redirect).",
+      "acceptance": [
+        "Nueva variable de entorno (recomendado: FRONT_BASE_URL) en src/config.rs, cargada/validada con el mismo patrón que el resto (error explícito y tipado si falta, sin panics, sin valor hardcodeado)",
+        "GET /auth/callback, tras validar el callback y emitir la cookie de sesión, responde 302 con el header Location fijado exactamente al valor configurado — nunca concatenando ni reflejando ningún parámetro de la query string de la request original (mitigación de open redirect)",
+        "La documentación OpenAPI (utoipa) de GET /auth/callback se actualiza para reflejar el nuevo código de respuesta 302 en el camino feliz",
+        "Los casos de error ya existentes (falta code/state, state no coincide con ningún login vigente, ID token inválido/expirado/audiencia o nonce incorrectos) no cambian de comportamiento: siguen respondiendo 400/401 sin redirect, igual que antes",
+        "Tests de integración de tests/oidc_login.rs actualizados: el caso de callback exitoso ahora espera 302 con Location == la URL de front configurada (no 200); se agrega un caso que confirma que el Location no varía aunque la request de prueba incluya parámetros de query adicionales/maliciosos",
+        "cargo test (incluyendo los marcados #[ignore] vía --ignored) pasa en verde, y ./init.sh termina sin errores"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 13,
+      "name": "cors_for_front",
+      "title": "CORS para que front pueda llamar al gateway desde otro origen",
+      "description": "front y gateway corren en orígenes distintos del navegador (mismo host, puertos distintos: 80 vs 8080 en local y en el despliegue de AWS) — front/src/api/httpClient.ts hace fetch(..., {credentials: \"include\"}) hacia el gateway (RF-01, GET /api/me al montar cualquier ruta protegida vía SessionProvider). Sin cabeceras CORS en el gateway, el navegador bloquea la respuesta (aunque el gateway la procese bien) y front la trata como network error -> ANONYMOUS_SESSION (ver front/src/api/httpClient.ts performRequest, catch -> {networkError:true}) -> ProtectedRoute redirige a /auth/login otra vez -> bucle infinito de login detectado en despliegue real (el usuario completa el login contra Google correctamente, la cookie de sesion se emite bien, pero front nunca la reconoce).",
+      "acceptance": [
+        "Se agrega tower-http (feature \"cors\") como dependencia y una CorsLayer al router de gateway",
+        "El origen permitido es exactamente el valor de configuración FRONT_BASE_URL (el mismo que ya existe desde la feature 12, post_login_redirect) — nunca un wildcard ni una lista hardcodeada, para no abrir el gateway a cualquier origen",
+        "allow_credentials(true) (las llamadas de front van con cookies) — recordar que CORS con credentials nunca permite wildcard de origen, tiene que ser el origen exacto reflejado",
+        "Métodos permitidos: al menos GET y POST (los que usa front hoy: getMe, submitScan, getScanHistory, cancelScan, etc.) y el header Content-Type (front lo manda en llamadas con jsonBody)",
+        "La respuesta a un preflight OPTIONS de una ruta protegida (p. ej. /api/me) responde con las cabeceras CORS correctas sin pasar por el middleware de sesión (un preflight nunca lleva la cookie ni debe exigirla)",
+        "Una request real (GET/POST) sigue exigiendo sesión válida igual que antes en las rutas protegidas — CORS solo habilita que el navegador deje leer la respuesta, no cambia la autorización",
+        "Tests de integración: una request con header Origin=<FRONT_BASE_URL configurado en el test> a una ruta protegida recibe Access-Control-Allow-Origin con ese mismo valor y Access-Control-Allow-Credentials: true; un preflight OPTIONS a esa misma ruta responde 200/204 sin requerir sesión; una request con un Origin distinto al configurado no recibe Access-Control-Allow-Origin (o el navegador la bloquearía)",
+        "cargo test e ./init.sh pasan en verde"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 14,
+      "name": "network_credentials_proxy",
+      "title": "Proxy hacia la API de credenciales de red de ms-usuarios",
+      "description": "user-service (feature network_credentials_api, ya done) expone POST/GET /users/me/network-credentials y DELETE /users/me/network-credentials/{id} para que un usuario configure network_user/ssh_credentials_ref/has_sudo por target_pattern (IP o CIDR). front nunca habla directo con user-service (RNF-03) y hoy gateway no expone ningún proxy para estos 3 endpoints -solo existe el de perfil, /api/profile, feature usuarios_profile_proxy-. Sin esto, un usuario no tiene forma de registrar credenciales, y POST /api/scans siempre responde 422 (sin credenciales configuradas para ningun objetivo). El struct NetworkCredential de user-service (src/domain.rs) es {id, user_id, target_pattern, network_user, has_sudo, created_at, updated_at} -nunca incluye ssh_credentials_ref, ni en create ni en list-.",
+      "acceptance": [
+        "3 métodos nuevos en UsuariosClient (src/usuarios_client.rs), mismo patrón exacto que get_profile/upsert_profile (reenvían FORWARDED_USER_HEADER_NAME + GATEWAY_SECRET_HEADER_NAME, usan send_and_decode, mismos UsuariosClientError): list_network_credentials(identity) -> GET /users/me/network-credentials; create_network_credential(identity, body) -> POST /users/me/network-credentials; delete_network_credential(identity, id) -> DELETE /users/me/network-credentials/{id}",
+        "Tipo propio en este repo que espeja NetworkCredential de user-service: {id, user_id, target_pattern, network_user, has_sudo, created_at, updated_at} (Deserialize para la respuesta) y un tipo de request para el body de create: {target_pattern, network_user, ssh_credentials_ref, has_sudo} (Serialize) — el campo ssh_credentials_ref SOLO existe en el tipo de request, nunca en el tipo de respuesta",
+        "3 rutas nuevas en protected_router (src/api.rs), mismo nivel de protección que /api/profile: GET /api/network-credentials, POST /api/network-credentials, DELETE /api/network-credentials/:id — agregadas a ROUTE_SPECS con protected: true",
+        "GET y POST devuelven el NetworkCredential(es) tal cual los da user-service (nunca ssh_credentials_ref en la respuesta, ni siquiera si por error user-service lo incluyera algún día — el tipo Rust de respuesta de este repo simplemente no tiene ese campo, así que no podría serializarse aunque llegara)",
+        "DELETE reenvía el status de user-service tal cual (404 si la entrada no existe o no es del usuario activo, mismo criterio ya usado en user-service)",
+        "Mismo manejo de errores que profile/usuarios_profile_proxy: fallo de red o 5xx de user-service -> 502/504 con mensaje genérico, nunca la URL interna expuesta en el cuerpo",
+        "Doc OpenAPI (utoipa::path) para las 3 rutas nuevas, mismo formato que las existentes",
+        "docs/security-scope.md actualizado: menciona esta nueva superficie y reafirma que ssh_credentials_ref nunca transita por una respuesta de este Gateway hacia front en list/create (solo se usa internamente, ya cifrado en tránsito, en el body de create hacia user-service)",
+        "Tests de integración nuevos (mismo patrón que tests/usuarios_profile_proxy.rs): servidor HTTP de test que implementa el contrato de user-service ya documentado (list/create/delete) — camino feliz de los 3 endpoints, credencial de servicio rechazada simulada como 401, user-service caído simula 502/504 sin panic, delete de una entrada ajena/inexistente devuelve 404",
+        "cargo test e ./init.sh pasan en verde"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 15,
+      "name": "fix_logout_cookie_removal",
+      "title": "Fix: la cookie de logout no borra la sesión en navegadores reales",
+      "description": "Bug confirmado en producción (AWS): tras POST /auth/logout, la respuesta trae Set-Cookie: gateway_session=; Path=/; Max-Age=0; Expires=<pasado> (verificado en devtools), pero el navegador NUNCA borra la cookie original -- sigue existiendo con el JWT completo tras la recarga, y el usuario nunca queda deslogueado (front vuelve a mostrar la sesion autenticada). Causa raiz: session_cookie() (src/auth.rs) construye la cookie original con .http_only(true).secure(true).same_site(SameSite::Strict), pero removal_cookie() solo fija .path(\"/\") -- sin Secure. Los navegadores modernos (Chrome/Firefox, politica 'Leave Secure Cookies Alone') rechazan que un Set-Cookie SIN el atributo Secure sobreescriba/borre una cookie existente que SI tiene Secure, para el mismo nombre+path -- por eso el borrado se ignora en silencio (sin error visible) y la cookie original persiste intacta.",
+      "acceptance": [
+        "removal_cookie() en src/auth.rs se corrige para llevar los mismos atributos que session_cookie() salvo el valor/expiracion: .http_only(true), .secure(true), .same_site(SameSite::Strict), .path(\"/\") (CookieJar::remove ya se encarga de fijar Max-Age=0/Expires en el pasado, eso no hay que tocarlo)",
+        "El test existente removal_cookie_matches_session_cookie_name_and_path se extiende para verificar tambien que .secure() y .http_only() y .same_site() de la cookie de borrado coinciden con los de session_cookie() -no solo el nombre y el path-, para que una regresion futura de este mismo bug quede cubierta",
+        "cargo test e ./init.sh pasan en verde"
       ],
       "status": "done"
     }

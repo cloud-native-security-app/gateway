@@ -60,6 +60,34 @@
   desarrollo, usar siempre valores de laboratorio, nunca una credencial
   real.
 
+## Credenciales de red (feature `network_credentials_proxy`)
+
+- Gateway expone `GET`/`POST /api/network-credentials` y `DELETE
+  /api/network-credentials/{id}` como proxy directo de `POST`/`GET
+  /users/me/network-credentials` y `DELETE
+  /users/me/network-credentials/{id}` de `ms-usuarios` (feature
+  `network_credentials_api`, ya `done` en `user-service`) — misma
+  protección de sesión y mismo reenvío de identidad + credencial de
+  servicio que el resto de llamadas a `ms-usuarios` (ver arriba).
+- `ssh_credentials_ref` (una credencial SSH real) **solo** viaja en el
+  cuerpo de `POST /api/network-credentials` hacia `ms-usuarios` — nunca en
+  una respuesta de este Gateway hacia `front`, ni en `GET
+  /api/network-credentials` (`list`) ni en la respuesta de ese mismo
+  `POST` (`create`). El tipo de respuesta de este Gateway
+  (`crate::usuarios_client::NetworkCredential`) simplemente no declara ese
+  campo, así que no podría serializarlo aunque `ms-usuarios` lo incluyera
+  algún día por error — misma garantía a nivel de tipo que ya aplica
+  `crate::usuarios_client::ScanTargetCredentials` para
+  `resolve_scan_target`. En tránsito hacia `ms-usuarios` viaja cifrado
+  (TLS de la subred privada), igual que el resto de tráfico
+  Gateway→`ms-usuarios`.
+- `DELETE /api/network-credentials/{id}` reenvía el status real de
+  `ms-usuarios` (`404` si `id` no existe o no pertenece al usuario de la
+  sesión activa, nunca `403` — mismo criterio que ya aplica
+  `user-service`) en vez de traducirlo al `502` genérico del resto de
+  fallos de `ms-usuarios`, para que `front` pueda distinguir "no existe"
+  de "el servicio falló".
+
 ## Origen de `network_user`/`ssh_credentials_ref`/`has_sudo`
 
 - Ver `docs/architecture.md` §"Dependencia pendiente": estos 3 campos deben

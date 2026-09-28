@@ -5,6 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::header::InvalidHeaderValue;
+use axum::http::HeaderValue;
+
 use crate::api::{AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use crate::auth::{LoginStateStore, OidcClient};
 use crate::broker::{BrokerConsumer, BrokerError, BrokerPublisher, ScanOutcomeHandler};
@@ -35,6 +38,12 @@ pub enum WiringError {
     /// No se pudo conectar al Broker (publicador o consumidor).
     #[error("no se pudo conectar al Broker")]
     Broker(#[source] BrokerError),
+    /// [`Config::front_origin`] (derivado de `FRONT_BASE_URL`, ya validado
+    /// como URL absoluta en [`Config::from_env`]) no se pudo convertir a un
+    /// header HTTP para la `CorsLayer` de [`crate::api::app_router`]
+    /// (feature `cors_for_front`).
+    #[error("el origen de front derivado de FRONT_BASE_URL no es un header HTTP válido")]
+    InvalidCorsOrigin(#[source] InvalidHeaderValue),
 }
 
 /// Resultado de construir la composición completa de este Gateway: el
@@ -88,6 +97,9 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
             .await
             .map_err(WiringError::Broker)?;
 
+    let front_origin =
+        HeaderValue::from_str(&config.front_origin).map_err(WiringError::InvalidCorsOrigin)?;
+
     let scan_ownership = Arc::new(ScanOwnershipRegistry::new());
     let realtime = Arc::new(RealtimeRegistry::new());
     let scan_submission_rate_limiter = Arc::new(ScanSubmissionRateLimiter::new(
@@ -108,6 +120,8 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         session_ttl_secs: config.session_ttl_secs,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        front_base_url: config.front_base_url,
+        front_origin,
         usuarios_client,
         broker_publisher,
         scan_ownership,

@@ -52,6 +52,21 @@
 //! credenciales configuradas para este usuario/objetivo) se distinguen
 //! explícitamente en [`UsuariosClientError`], y ninguno de los dos casos
 //! produce jamás un valor inventado en su lugar.
+//!
+//! ## Credenciales de red (feature `network_credentials_proxy`)
+//!
+//! [`UsuariosClient::list_network_credentials`] (`GET
+//! /users/me/network-credentials`), [`UsuariosClient::create_network_credential`]
+//! (`POST /users/me/network-credentials`) y
+//! [`UsuariosClient::delete_network_credential`]
+//! (`DELETE /users/me/network-credentials/{id}`) sí están confirmados contra
+//! el contrato real de `user-service` (`user-service/src/api.rs` y
+//! `user-service/src/domain.rs::NetworkCredential`, feature
+//! `network_credentials_api`, ya `done` en ese repo): a diferencia de
+//! [`UsuariosClient::resolve_scan_target`], esta API ya existe.
+//! [`NetworkCredential`] espeja ese contrato campo a campo y deliberadamente
+//! **nunca** incluye `ssh_credentials_ref` — ver la nota de diseño de ese
+//! tipo y `docs/security-scope.md`.
 
 use reqwest::{Client, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
@@ -155,6 +170,83 @@ impl std::fmt::Debug for ScanTargetCredentials {
     }
 }
 
+/// Credencial de red configurada por el usuario para un objetivo (IP exacta
+/// o CIDR), tal como la devuelve `ms-usuarios` (feature
+/// `network_credentials_proxy`). Shape confirmado contra
+/// `user-service/src/domain.rs::NetworkCredential`: deliberadamente **no**
+/// incluye `ssh_credentials_ref` — ni en `list` ni en `create` —, así que
+/// este tipo no podría serializarla en una respuesta de este Gateway hacia
+/// `front` aunque `ms-usuarios` la incluyera algún día por error (ver
+/// `docs/security-scope.md`).
+///
+/// `created_at`/`updated_at` se conservan como `String` (RFC 3339) tal cual
+/// los serializa `ms-usuarios`, mismo criterio que [`ScanHistoryEntry`]: este
+/// cliente no los interpreta como fecha/hora, así que no hace falta una
+/// dependencia de manejo de tiempo solo para transportarlos.
+///
+/// `Serialize` (además de `Deserialize`): este mismo tipo es tanto lo que
+/// este cliente decodifica de `ms-usuarios` como el cuerpo que
+/// `crate::api::list_network_credentials`/`create_network_credential`
+/// devuelven tal cual a `front` — no hay un tipo de respuesta intermedio
+/// distinto (a diferencia de `ScanHistoryEntry`/`ScanHistoryEntryResponse`,
+/// que sí difieren porque este Gateway le añade su propio `scanId`).
+///
+/// `ToSchema` (feature `openapi_docs`, RNF-08): este tipo es el cuerpo de
+/// `GET`/`POST /api/network-credentials` en la especificación OpenAPI
+/// generada (ver `crate::api`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct NetworkCredential {
+    /// Identificador único de la entrada, asignado por `ms-usuarios`.
+    pub id: String,
+    /// Identidad del usuario dueño de la entrada.
+    pub user_id: String,
+    /// IP exacta o CIDR (v4 o v6) al que aplica esta entrada.
+    pub target_pattern: String,
+    /// Usuario de red a usar para autenticarse en el objetivo.
+    pub network_user: String,
+    /// Si `network_user` tiene privilegios `sudo` en el objetivo.
+    pub has_sudo: bool,
+    /// Marca de tiempo (RFC 3339) en la que se creó la entrada.
+    pub created_at: String,
+    /// Marca de tiempo (RFC 3339) de la última actualización de la entrada.
+    pub updated_at: String,
+}
+
+/// Cuerpo de `POST /users/me/network-credentials`, reenviado tal cual desde
+/// `POST /api/network-credentials` (mismo patrón que
+/// [`UsuariosClient::upsert_profile`] con [`UserProfile`]: un único tipo
+/// sirve tanto para deserializar el cuerpo que envía `front` como para
+/// serializarlo hacia `ms-usuarios`).
+///
+/// A diferencia de [`NetworkCredential`], **sí** incluye
+/// `ssh_credentials_ref` — una credencial SSH real —, porque es el cuerpo que
+/// el usuario debe proveer para registrarla; ese campo nunca aparece en el
+/// tipo de respuesta (ver `docs/security-scope.md`). Implementa `Debug` a
+/// mano para redactarla, mismo criterio que [`ScanTargetCredentials`].
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateNetworkCredentialRequest {
+    /// IP exacta o CIDR (v4 o v6) al que aplica esta entrada.
+    pub target_pattern: String,
+    /// Usuario de red a usar para autenticarse en el objetivo.
+    pub network_user: String,
+    /// Credencial SSH real para autenticarse en el objetivo. Nunca se
+    /// loggea, nunca viaja en una respuesta de este Gateway.
+    pub ssh_credentials_ref: String,
+    /// Si `network_user` tiene privilegios `sudo` en el objetivo.
+    pub has_sudo: bool,
+}
+
+impl std::fmt::Debug for CreateNetworkCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateNetworkCredentialRequest")
+            .field("target_pattern", &self.target_pattern)
+            .field("network_user", &self.network_user)
+            .field("ssh_credentials_ref", &"[REDACTED]")
+            .field("has_sudo", &self.has_sudo)
+            .finish()
+    }
+}
+
 /// Cuerpo de `POST /users/me/scans`.
 #[derive(Debug, Serialize)]
 struct CreateScanHistoryRequest<'a> {
@@ -206,6 +298,15 @@ pub enum UsuariosClientError {
     /// para este usuario/objetivo (`422`).
     #[error("no hay credenciales de red configuradas para este usuario y objetivo")]
     ScanTargetNotConfigured,
+    /// `ms-usuarios` respondió `404` a
+    /// [`UsuariosClient::delete_network_credential`]: la entrada no existe o
+    /// no pertenece al usuario de la sesión activa (mismo criterio de
+    /// `user-service`: nunca `403`, para no revelar a quién pertenece una
+    /// entrada ajena). A diferencia de [`Self::UnexpectedResponse`] (que
+    /// siempre se traduce a `502`), este caso se reenvía tal cual como `404`
+    /// (ver `crate::api`).
+    #[error("no existe una credencial de red con ese identificador para el usuario activo")]
+    NetworkCredentialNotFound,
 }
 
 /// Cuerpo del header [`FORWARDED_USER_HEADER_NAME`]: la identidad ya
@@ -441,6 +542,103 @@ impl UsuariosClient {
         }
     }
 
+    /// Devuelve las credenciales de red de `identity` (`GET
+    /// /users/me/network-credentials`, feature `network_credentials_proxy`):
+    /// la autorización a nivel de fila (un usuario solo ve sus propias
+    /// credenciales) la aplica `ms-usuarios` a partir del header de identidad
+    /// ya verificada, este cliente no la reimplementa (ver
+    /// `docs/security-scope.md`).
+    ///
+    /// Mismos errores que [`Self::get_profile`].
+    pub async fn list_network_credentials(
+        &self,
+        identity: &Session,
+    ) -> Result<Vec<NetworkCredential>, UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .get(self.network_credentials_url())
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            );
+
+        self.send_and_decode(request).await
+    }
+
+    /// Crea o actualiza (upsert por `target_pattern`, del lado de
+    /// `ms-usuarios`) una credencial de red de `identity`
+    /// (`POST /users/me/network-credentials`, feature
+    /// `network_credentials_proxy`), reenviando `body` tal cual (incluido
+    /// `ssh_credentials_ref`, ver la nota de diseño de
+    /// [`CreateNetworkCredentialRequest`]).
+    ///
+    /// Mismos errores que [`Self::get_profile`].
+    pub async fn create_network_credential(
+        &self,
+        identity: &Session,
+        body: &CreateNetworkCredentialRequest,
+    ) -> Result<NetworkCredential, UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .post(self.network_credentials_url())
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            )
+            .json(body);
+
+        self.send_and_decode(request).await
+    }
+
+    /// Borra la credencial de red `id` de `identity`
+    /// (`DELETE /users/me/network-credentials/{id}`, feature
+    /// `network_credentials_proxy`, `204 No Content` en éxito).
+    ///
+    /// A diferencia de [`Self::update_scan_status`] (con la misma forma de
+    /// solicitud, sin cuerpo que decodificar), un `404` de `ms-usuarios` aquí
+    /// **no** se traduce a [`UsuariosClientError::UnexpectedResponse`]
+    /// (que `crate::api` siempre mapea a `502`): se distingue explícitamente
+    /// como [`UsuariosClientError::NetworkCredentialNotFound`] para que
+    /// `crate::api` pueda reenviarlo tal cual como `404` — `id` inexistente o
+    /// de otro usuario (mismo criterio que `user-service`, nunca `403`).
+    /// Cualquier otro status no-2xx sigue siendo
+    /// [`UsuariosClientError::UnexpectedResponse`].
+    pub async fn delete_network_credential(
+        &self,
+        identity: &Session,
+        id: &str,
+    ) -> Result<(), UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .delete(self.network_credential_url(id))
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            );
+
+        let response = request
+            .send()
+            .await
+            .map_err(|_| UsuariosClientError::Unreachable)?;
+
+        let status_code = response.status();
+        if status_code.is_success() {
+            return Ok(());
+        }
+        if status_code == StatusCode::NOT_FOUND {
+            return Err(UsuariosClientError::NetworkCredentialNotFound);
+        }
+        Err(UsuariosClientError::UnexpectedResponse {
+            status: status_code.as_u16(),
+        })
+    }
+
     fn profile_url(&self) -> String {
         format!("{}/users/me", self.base_url.trim_end_matches('/'))
     }
@@ -459,6 +657,20 @@ impl UsuariosClient {
     fn scan_targets_url(&self) -> String {
         format!(
             "{}/users/me/scan-targets",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    fn network_credentials_url(&self) -> String {
+        format!(
+            "{}/users/me/network-credentials",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    fn network_credential_url(&self, id: &str) -> String {
+        format!(
+            "{}/users/me/network-credentials/{id}",
             self.base_url.trim_end_matches('/')
         )
     }
@@ -556,6 +768,7 @@ mod tests {
             UsuariosClientError::RequestBuild,
             UsuariosClientError::ScanTargetResolutionNotImplemented,
             UsuariosClientError::ScanTargetNotConfigured,
+            UsuariosClientError::NetworkCredentialNotFound,
         ] {
             let message = error.to_string();
             assert!(!message.contains("ms-usuarios.internal"));
@@ -638,5 +851,80 @@ mod tests {
 
         assert!(!debug_output.contains("lab-only-not-a-real-secret"));
         assert!(debug_output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn network_credentials_url_joins_base_url_without_double_slash() {
+        let client = UsuariosClient::new(
+            "http://ms-usuarios.internal/".to_string(),
+            SecretString::from("lab-only-not-a-real-secret".to_string()),
+        )
+        .expect("cliente de laboratorio debe construirse");
+
+        assert_eq!(
+            client.network_credentials_url(),
+            "http://ms-usuarios.internal/users/me/network-credentials"
+        );
+    }
+
+    #[test]
+    fn network_credential_url_includes_the_given_id() {
+        let client = lab_client();
+
+        assert_eq!(
+            client.network_credential_url("cred-123"),
+            "http://ms-usuarios.internal/users/me/network-credentials/cred-123"
+        );
+    }
+
+    #[test]
+    fn create_network_credential_request_debug_redacts_ssh_credentials_ref() {
+        let request = CreateNetworkCredentialRequest {
+            target_pattern: "192.0.2.0/24".to_string(),
+            network_user: "netuser".to_string(),
+            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
+            has_sudo: false,
+        };
+
+        let debug_output = format!("{request:?}");
+
+        assert!(!debug_output.contains("lab-only-not-a-real-secret"));
+        assert!(debug_output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn network_credential_never_serializes_an_ssh_credentials_ref_field() {
+        let credential = NetworkCredential {
+            id: "cred-1".to_string(),
+            user_id: "google-sub-123".to_string(),
+            target_pattern: "192.0.2.10".to_string(),
+            network_user: "netuser".to_string(),
+            has_sudo: false,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let value = serde_json::to_value(&credential).expect("debe serializar");
+        assert!(value.get("ssh_credentials_ref").is_none());
+    }
+
+    #[test]
+    fn network_credential_deserializes_the_real_contract_shape_and_ignores_unknown_fields() {
+        let json = serde_json::json!({
+            "id": "cred-1",
+            "user_id": "google-sub-123",
+            "target_pattern": "192.0.2.10",
+            "network_user": "netuser",
+            "has_sudo": true,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "ssh_credentials_ref": "should-be-ignored-if-ever-sent",
+        });
+
+        let credential: NetworkCredential =
+            serde_json::from_value(json).expect("debe deserializar el contrato real");
+
+        assert_eq!(credential.id, "cred-1");
+        assert!(credential.has_sudo);
     }
 }

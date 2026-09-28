@@ -796,3 +796,265 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
 - **Estado final:** feature 11 (`containerization`) pasó a `"done"` en
   `feature_list.json`. Era la última feature pendiente del backlog de
   `feature_list.json`.
+
+## 2026-09-24 — Feature 12: post_login_redirect — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Detectado en uso real (no en el backlog original):** desplegando en AWS,
+  el login OIDC contra Google terminaba con éxito (código intercambiado,
+  cookie de sesión emitida, verificado en devtools) pero `GET
+  /auth/callback` respondía `200` vacío y el navegador quedaba en blanco,
+  porque `front/src/auth/LoginButton.tsx` inicia el login con
+  `window.location.href` (navegación de página completa, no XHR) y nunca
+  vuelve a la SPA sin un redirect explícito de vuelta.
+- **Qué se hizo:** nueva variable de entorno `FRONT_BASE_URL` en
+  `src/config.rs` (`ENV_FRONT_BASE_URL`, requerida, `String` — mismo patrón
+  `required_string`/`ConfigError::Missing` que el resto, sin valor
+  hardcodeado). `AppState::front_base_url` (`src/api.rs`) recibe ese valor
+  vía `src/wiring.rs`. El handler `callback` ahora devuelve `(CookieJar,
+  Response)`: tras emitir la cookie de sesión, responde `302 Found` con
+  `Location` fijado exactamente a `state.front_base_url` (reutilizando el
+  helper `redirect_found` ya existente) — nunca concatenando ni reflejando
+  ningún parámetro de la query string de la request original (mitigación de
+  open redirect). Los caminos de error ya existentes (`400` por
+  `state`/`code` ausente o no coincidente, `401` por ID token
+  inválido/expirado/audiencia o nonce incorrectos, `500` por fallo de
+  discovery/emisión de sesión) no se tocaron. La anotación
+  `#[utoipa::path(...)]` de `GET /auth/callback` se actualizó (`200` →
+  `302` en el camino feliz, con descripción explícita de la mitigación de
+  open redirect). `README.md` documenta la nueva env var en la tabla y el
+  ejemplo de `docker run`. `tests/oidc_login.rs`:
+  `callback_with_valid_id_token_creates_session` ahora espera `302` +
+  `Location == la URL de front configurada`; nuevo test
+  `callback_success_redirect_ignores_extra_query_params` que agrega
+  `redirect_uri`/`next` maliciosos a la query del callback y confirma que el
+  `Location` no varía. Los demás `tests/*.rs` que construyen `AppState` a
+  mano (`rate_limiting`, `scan_submission`, `scan_history_and_cancellation`,
+  `scan_outcome_relay`, `session_middleware_and_me`,
+  `usuarios_profile_proxy`) se actualizaron solo para agregar el nuevo
+  campo `front_base_url` de laboratorio y seguir compilando, sin tocar sus
+  aserciones.
+- **Verificación:** `./init.sh` en verde — `cargo fmt --check`, `cargo
+  clippy --all-targets -- -D warnings` sin advertencias, `cargo test` (9/9
+  en `tests/oidc_login.rs`, resto de la suite sin regresiones), `cargo test
+  -- --ignored` (3 tests contra RabbitMQ real vía `testcontainers`, Docker
+  disponible en este entorno) y `cargo doc --no-deps` sin errores.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras verificación
+  independiente: ejecutó `./init.sh` por su cuenta (mismo resultado en
+  verde), confirmó línea por línea que `redirect_found` solo escribe
+  `state.front_base_url` en `Location` sin interpolar `CallbackParams`
+  (que solo modela `code`/`state`, así que cualquier query param adicional
+  se ignora), confirmó que el mapeo de `AuthError` a status HTTP no fue
+  tocado por esta feature, confirmó ausencia de fuga de credenciales/tokens,
+  y recorrió los 5 checkpoints de `CHECKPOINTS.md` uno por uno, todos `[x]`.
+  Sin cambios requeridos. Detalle completo en
+  `progress/review_post_login_redirect.md`.
+- **Estado final:** feature 12 (`post_login_redirect`) pasó a `"done"` en
+  `feature_list.json`.
+
+## 2026-09-24 — Feature 13: cors_for_front — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Detectado en uso real (no en el backlog original):** en el mismo
+  despliegue en AWS de la feature 12, el login contra Google completaba
+  bien (cookie `gateway_session` emitida, verificado con devtools), pero el
+  usuario quedaba en un bucle infinito de redirect a `/auth/login`. Causa
+  raíz: `front` y `gateway` corren en orígenes distintos del navegador
+  (mismo host, puertos 80/8080), `front/src/auth/SessionProvider.tsx` llama
+  `getMe()` al montar cualquier ruta protegida vía
+  `front/src/api/httpClient.ts` (`fetch(..., { credentials: "include" })`,
+  cross-origin real), y el gateway no tenía ninguna cabecera CORS — el
+  navegador bloqueaba la respuesta de `/api/me` aunque el gateway la
+  procesara bien, `performRequest` lo capturaba como `{networkError: true}`,
+  y `SessionProvider` lo trataba como `ANONYMOUS_SESSION` -> `ProtectedRoute`
+  volvía a `/auth/login`.
+- **Qué se hizo:** `tower-http` (versión `0.6`, feature `cors`, reutiliza la
+  resolución transitiva que ya fijaba `reqwest` en `Cargo.lock`) agregada a
+  `Cargo.toml`. `src/config.rs`: nuevo campo `Config::front_origin: String`
+  y helper `front_origin_from_base_url` (`url::Url::parse(...).origin()
+  .ascii_serialization()`), invocado justo después de leer `FRONT_BASE_URL`
+  en `Config::from_env` — deriva el *origen* (`scheme://host[:puerto]`, sin
+  `path`) de la misma variable que ya existía desde la feature 12, en vez de
+  reflejar el string crudo (que puede llevar `path`, p. ej.
+  `https://front.example/post-login`, y el header `Origin` de un navegador
+  nunca lo lleva). Nueva variante `ConfigError::InvalidUrl` si
+  `FRONT_BASE_URL` no es una URL absoluta válida. `src/wiring.rs` convierte
+  ese origen ya validado a `axum::http::HeaderValue`
+  (`WiringError::InvalidCorsOrigin` si fallara, nunca debería) y lo guarda
+  en el nuevo campo `AppState::front_origin`. `src/api.rs`: nueva función
+  privada `cors_layer` que construye una `CorsLayer` con
+  `allow_credentials(true)`, `allow_methods([GET, POST])`,
+  `allow_headers([CONTENT_TYPE])`, y **`AllowOrigin::predicate`** (no
+  `allow_origin(HeaderValue)`/`AllowOrigin::exact`) comparando a mano contra
+  `front_origin` — se detectó con el primer test en rojo que `exact` fija un
+  único valor de `Access-Control-Allow-Origin` en toda respuesta sin mirar
+  el `Origin` real de la request, así que un origen no permitido también lo
+  recibiría. `app_router` aplica esta `CorsLayer` como capa **externa**,
+  tras fusionar todos los routers (incluido `protected_router`, que ya
+  lleva `require_session` como su propia capa interna): así un preflight
+  `OPTIONS` lo resuelve `tower_http::cors::Cors` por completo antes de
+  llegar al middleware de sesión, sin exigirle cookie. Los 7 archivos de
+  test que construyen `AppState` a mano (`tests/usuarios_profile_proxy.rs`,
+  `rate_limiting.rs`, `session_middleware_and_me.rs`, `scan_submission.rs`,
+  `scan_history_and_cancellation.rs`, `scan_outcome_relay.rs`,
+  `oidc_login.rs`) se actualizaron solo para agregar el nuevo campo
+  `front_origin` y seguir compilando, sin tocar sus aserciones. Nuevo
+  `tests/cors.rs` (mismo patrón que `tests/session_middleware_and_me.rs`,
+  sin Docker, con un `FRONT_BASE_URL` de prueba con `path` a propósito para
+  demostrar que el origen derivado lo excluye): origen permitido recibe
+  `Access-Control-Allow-Origin` + `Access-Control-Allow-Credentials: true`;
+  preflight `OPTIONS` a `/api/me` responde 200/204 sin cookie y con las
+  cabeceras CORS correctas; origen no permitido no recibe
+  `Access-Control-Allow-Origin` (la request se sigue procesando
+  normalmente del lado del servidor); una request real con origen permitido
+  pero sin sesión sigue devolviendo 401 (CORS no reemplaza la
+  autorización). `src/config.rs` gana además
+  `front_base_url_that_is_not_an_absolute_url_produces_typed_error` y un
+  assert de `front_origin` en el test de config válida existente.
+- **Verificación:** `./init.sh` en verde — `cargo fmt --check`, `cargo
+  clippy --all-targets -- -D warnings` sin advertencias, `cargo test`
+  (incluye los 4 nuevos de `tests/cors.rs` y los 2 nuevos de `config.rs`),
+  `cargo test -- --ignored` (3 tests contra RabbitMQ real vía
+  `testcontainers`, Docker disponible en este entorno), y `cargo doc
+  --no-deps` sin errores ni warnings (se corrigió un intra-doc-link a un
+  ítem privado introducido en el doc comment de `app_router`). Limpieza
+  menor tras la revisión: `url = "2"` había quedado declarada tanto en
+  `[dependencies]` (nueva) como en `[dev-dependencies]` (ya existía) —
+  redundante e inocua, se quitó la duplicada en `[dev-dependencies]`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras verificación
+  independiente: ejecutó `./init.sh` por su cuenta (mismo resultado en
+  verde), confirmó que la derivación de `front_origin` desde
+  `FRONT_BASE_URL` es una normalización correcta del mismo valor de
+  configuración (RFC 6454) y no una desviación del `acceptance`, confirmó
+  que `AllowOrigin::predicate` evita reflejar `Access-Control-Allow-Origin`
+  a un origen no permitido (a diferencia de `AllowOrigin::exact`), confirmó
+  que el preflight `OPTIONS` no pasa por `require_session` y que una
+  request real sigue exigiendo sesión sin importar el `Origin`, confirmó
+  ausencia de fuga de secretos, y recorrió los 5 checkpoints de
+  `CHECKPOINTS.md` uno por uno, todos `[x]` (adaptando los ítems de C5 que
+  asumen git, ya que en este entorno el repo no se reportó como
+  repositorio git). Sin cambios requeridos. Detalle completo en
+  `progress/review_cors_for_front.md`.
+- **Estado final:** feature 13 (`cors_for_front`) pasó a `"done"` en
+  `feature_list.json`. Era la última feature listada en
+  `feature_list.json` a la fecha de este cierre.
+
+## 2026-09-24 — Feature 14: network_credentials_proxy — DONE
+
+- **Contexto:** `user-service` ya expone `POST`/`GET
+  /users/me/network-credentials` y `DELETE
+  /users/me/network-credentials/{id}` (feature `network_credentials_api`,
+  ya `done` en ese repo hermano), pero `gateway` no tenía ningún proxy hacia
+  esos 3 endpoints — solo existía el de perfil (`/api/profile`, feature
+  `usuarios_profile_proxy`). Sin esto, un usuario no tenía forma de
+  registrar credenciales de red y `POST /api/scans` siempre respondía `422`.
+  Contrato confirmado por lectura directa de `../user-service/src/api.rs`
+  (líneas ~401-483) y `../user-service/src/domain.rs::NetworkCredential`
+  (líneas ~151-170), ambos de solo lectura (otro repo).
+- **Implementación:** `src/usuarios_client.rs` gana el tipo
+  `NetworkCredential` (`{id, user_id, target_pattern, network_user,
+  has_sudo, created_at, updated_at}`, `created_at`/`updated_at` como
+  `String` RFC 3339 igual que `ScanHistoryEntry`, deliberadamente sin
+  `ssh_credentials_ref`, con `Serialize`+`Deserialize`+`ToSchema` porque este
+  mismo tipo es tanto lo que se decodifica de `ms-usuarios` como lo que
+  `crate::api` devuelve tal cual a `front`) y
+  `CreateNetworkCredentialRequest` (con `ssh_credentials_ref`, `Debug`
+  redactado a mano, mismo criterio que `ScanTargetCredentials`). Tres
+  métodos nuevos en `UsuariosClient`: `list_network_credentials`/
+  `create_network_credential` (mismo patrón exacto que
+  `get_profile`/`upsert_profile`, vía `send_and_decode`) y
+  `delete_network_credential` (mismo patrón que `update_scan_status` — sin
+  `send_and_decode`, sin cuerpo que decodificar —, pero con una excepción
+  deliberada: un `404` de `ms-usuarios` se distingue con una nueva variante
+  `UsuariosClientError::NetworkCredentialNotFound` en vez de caer en
+  `UnexpectedResponse` como el resto del cliente, porque el criterio de
+  aceptación exige reenviar ese `404` tal cual — nunca el `502` genérico que
+  usa `UnexpectedResponse`). `src/api.rs`: 3 rutas nuevas en
+  `protected_router` (`GET`/`POST /api/network-credentials`, `DELETE
+  /api/network-credentials/:id`), agregadas a `ROUTES` con
+  `protected: true`, con su `#[utoipa::path(...)]` y registro en `ApiDoc`
+  (nuevo tag `network-credentials`), y un nuevo arm en
+  `impl IntoResponse for UsuariosClientError` mapeando
+  `NetworkCredentialNotFound -> 404`. `docs/security-scope.md` gana la
+  subsección "Credenciales de red (feature `network_credentials_proxy`)",
+  reafirmando que `ssh_credentials_ref` nunca transita por una respuesta de
+  este Gateway.
+- **Tests:** `tests/network_credentials_proxy.rs` nuevo (mismo patrón que
+  `tests/usuarios_profile_proxy.rs`, router completo vía `axum::serve` sobre
+  un puerto efímero, stub HTTP real de `ms-usuarios`): camino feliz de los 3
+  endpoints (incluida una verificación explícita de que la respuesta nunca
+  incluye `ssh_credentials_ref` aunque el stub la incluya a propósito para
+  probar la garantía a nivel de tipo), sesión ausente rechazada antes de
+  tocar `ms-usuarios`, credencial de servicio rechazada -> `502` genérico
+  (mismo criterio que el resto del repo para `UnexpectedResponse`),
+  `ms-usuarios` caído -> `502`/`504` sin exponer su URL interna, y `DELETE`
+  de una entrada ajena/inexistente -> `404`. Más 6 tests unitarios nuevos en
+  `src/usuarios_client.rs` (URLs sin doble slash, redacción de `Debug` en
+  `CreateNetworkCredentialRequest`, serialización de `NetworkCredential` sin
+  `ssh_credentials_ref`, deserialización que ignora ese campo si llegara).
+- **Verificación:** `cargo build --all-targets`, `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings` y `./init.sh` completo (con
+  Docker disponible, incluyendo los tests `#[ignore]` contra RabbitMQ real)
+  en verde. Se corrigió un warning de rustdoc
+  (`broken_intra_doc_links`: `Self::` no resuelve en un doc-comment de
+  módulo `//!`, se cambió a `UsuariosClient::resolve_scan_target`).
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras verificación
+  independiente: releyó `docs/architecture.md`/`conventions.md`/
+  `security-scope.md`/`CHECKPOINTS.md` y el `acceptance` completo de la
+  feature 14, confirmó el contrato real contra `../user-service` línea por
+  línea, confirmó que `NetworkCredential` nunca tiene `ssh_credentials_ref`,
+  confirmó que el `404` de `delete_network_credential` se reenvía tal cual
+  (excepción deliberada y documentada al patrón `UnexpectedResponse -> 502`
+  del resto del cliente), confirmó que las 3 rutas están en `ROUTES`
+  (`protected: true`) y documentadas en `ApiDoc` (cubierto por el test
+  anti-drift de `tests/openapi_docs.rs`), corrió `./init.sh`/`clippy`/`fmt`
+  por su cuenta con el mismo resultado en verde, y confirmó que no se tocó
+  nada fuera de `gateway/`. Detalle completo en
+  `progress/review_network_credentials_proxy.md`.
+- **Estado final:** feature 14 (`network_credentials_proxy`) pasó a
+  `"done"` en `feature_list.json`. Era la última feature listada en
+  `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-09-24 — Feature 15: fix_logout_cookie_removal — DONE
+
+- **Agente:** implementer (rol asumido directamente en esta sesión, sin
+  subagente `implementer` disponible en el entorno) + subagente `reviewer`.
+- **Bug (confirmado en producción, AWS, con devtools reales):** tras `POST
+  /auth/logout`, la respuesta traía `Set-Cookie: gateway_session=; Path=/;
+  Max-Age=0; Expires=<pasado>`, pero el navegador nunca borraba la cookie
+  original — seguía existiendo con el JWT completo tras la recarga, y el
+  usuario nunca quedaba deslogueado. Causa raíz: `session_cookie()`
+  (`src/auth.rs`) construye la cookie original con `.http_only(true)
+  .secure(true).same_site(SameSite::Strict)`, pero `removal_cookie()` solo
+  fijaba `.path("/")` — sin `Secure`. Los navegadores modernos (política
+  "Leave Secure Cookies Alone") rechazan que un `Set-Cookie` sin `Secure`
+  sobreescriba/borre una cookie existente con `Secure` para el mismo
+  nombre+path, así que el borrado se ignoraba en silencio.
+- **Qué se hizo:** `removal_cookie()` (`src/auth.rs`, ~L432) ahora agrega
+  `.http_only(true).secure(true).same_site(SameSite::Strict)` además del
+  `.path("/")` que ya tenía — mismos atributos que `session_cookie()` salvo
+  valor/expiración. No se tocó `CookieJar::remove()` (handler `logout` en
+  `src/api.rs`), que ya fijaba correctamente `Max-Age=0`/`Expires` en el
+  pasado.
+- **Tests:** se extendió el test existente
+  `removal_cookie_matches_session_cookie_name_and_path` (`src/auth.rs`)
+  para comparar también `.secure()`, `.http_only()` y `.same_site()` de
+  `removal_cookie()` contra los de una `session_cookie()` real construida
+  en el propio test, además de nombre y path, cubriendo la regresión de
+  este mismo bug.
+- **Verificación:** `./init.sh` completo (unitarios, integración con
+  Docker/testcontainers, `cargo doc --no-deps`), `cargo fmt --check` y
+  `cargo clippy --all-targets -- -D warnings` — todos en verde, corridos
+  tanto por el implementer como de forma independiente por el reviewer.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras releer
+  `docs/architecture.md`/`conventions.md`/`security-scope.md`/
+  `CHECKPOINTS.md`, confirmar que el diff se limita a `removal_cookie()` y
+  su test en `src/auth.rs`, que ninguna ruta protegida quedó sin
+  middleware, que no hay fuga de credenciales, y correr `./init.sh` por su
+  cuenta con el mismo resultado en verde. Detalle completo en
+  `progress/review_15.md`.
+- **Estado final:** feature 15 (`fix_logout_cookie_removal`) pasó a
+  `"done"` en `feature_list.json`. Era la última feature listada en
+  `feature_list.json` a la fecha de este cierre.

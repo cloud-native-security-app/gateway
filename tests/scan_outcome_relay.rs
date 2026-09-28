@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path as AxumPath, State};
+use axum::http::HeaderValue;
 use axum::routing::{get, patch};
 use axum::{Json, Router};
 use futures_util::StreamExt;
@@ -181,6 +182,8 @@ async fn spawn_gateway(usuarios_client: UsuariosClient) -> GatewayUnderTest {
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        front_base_url: "https://front.lab".to_string(),
+        front_origin: HeaderValue::from_static("https://front.lab"),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: scan_ownership.clone(),

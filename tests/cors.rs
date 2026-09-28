@@ -1,13 +1,24 @@
-//! Tests de integración de la feature `session_middleware_and_me`.
+//! Tests de integración de la feature `cors_for_front`.
 //!
-//! Ejercen el router real de `gateway::api::app_router` (login/callback/
-//! logout/salud/`/api/me`) servido sobre un puerto efímero con
-//! `axum::serve`, igual que `tests/oidc_login.rs`. El `OidcClient` de
-//! `AppState` se resuelve contra un IdP de prueba mínimo (solo el documento
-//! de discovery, nunca el endpoint real de Google — ver
-//! `docs/verification.md` Nivel 3), porque esta feature no ejercita el
-//! login en sí, solo necesita un `AppState` completo para poder construir
-//! `app_router`.
+//! Ejercen el router real de `gateway::api::app_router` (mismo patrón que
+//! `tests/session_middleware_and_me.rs`) servido sobre un puerto efímero
+//! con `axum::serve`. El `OidcClient` de `AppState` se resuelve contra un
+//! IdP de prueba mínimo (solo el documento de discovery, nunca el endpoint
+//! real de Google), porque esta feature no ejercita el login en sí: solo
+//! necesita un `AppState` completo para poder construir `app_router` y
+//! ejercer la `CorsLayer` que envuelve todo el router (RF-01, ver
+//! `docs/architecture.md`).
+//!
+//! Contexto del bug real que motiva esta feature: `front` corre en un
+//! origen distinto de este Gateway (mismo host, puerto distinto) y llama a
+//! `GET /api/me` con `fetch(..., { credentials: "include" })`. Sin
+//! cabeceras CORS, el navegador bloquea la respuesta aunque este Gateway la
+//! procese bien, y `front` lo trata como sesión anónima -> bucle de
+//! redirect a `/auth/login`. No se puede reproducir ese bloqueo del
+//! navegador desde un test de servidor (`reqwest` no lo aplica), así que
+//! estos tests verifican las cabeceras que el navegador exige para *no*
+//! bloquear la respuesta, y la ausencia de esas cabeceras para un origen no
+//! permitido.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,9 +28,7 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::routing::get;
 use axum::{Json, Router};
-use gateway::api::{
-    app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter, ROUTES,
-};
+use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::Session;
@@ -35,11 +44,23 @@ const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
+/// URL de `front` de laboratorio a la que redirigiría un login exitoso
+/// (feature `post_login_redirect`) — incluye `path`, como en un valor real
+/// de `FRONT_BASE_URL` (ver `README.md`), a propósito: demuestra que el
+/// origen permitido por CORS ([`TEST_FRONT_ORIGIN`]) es distinto de este
+/// valor (un header `Origin` de navegador nunca lleva `path`).
+const TEST_FRONT_BASE_URL: &str = "https://front.lab/post-login";
+/// Origen (sin `path`) de [`TEST_FRONT_BASE_URL`] — el único que la
+/// `CorsLayer` de `app_router` debe reflejar en
+/// `Access-Control-Allow-Origin`.
+const TEST_FRONT_ORIGIN: &str = "https://front.lab";
+/// Origen que **no** es [`TEST_FRONT_ORIGIN`]: nunca debe recibir
+/// `Access-Control-Allow-Origin`.
+const DISALLOWED_ORIGIN: &str = "https://evil.example";
 
-/// Doble de prueba de [`ScanRequestPublisher`]: esta feature
-/// (`session_middleware_and_me`) no ejerce el envío de escaneos con una
-/// sesión válida, así que un `AppState` de prueba solo necesita satisfacer
-/// el tipo del campo, nunca invocarlo de verdad.
+/// Doble de prueba de [`ScanRequestPublisher`]: esta feature (`cors_for_front`)
+/// no ejerce el envío de escaneos, así que un `AppState` de prueba solo
+/// necesita satisfacer el tipo del campo, nunca invocarlo de verdad.
 struct NeverPublishesToBroker;
 
 #[async_trait::async_trait]
@@ -115,9 +136,8 @@ async fn spawn_gateway() -> GatewayUnderTest {
     .await
     .expect("discovery contra el IdP de prueba debe funcionar");
 
-    // Esta feature no ejercita `usuarios_client` (solo enumera rutas y
-    // valida `/api/me`): apunta a una URL de laboratorio que nunca se
-    // contacta en estos tests.
+    // Esta feature no ejerce `usuarios_client` (solo CORS + `/api/me`):
+    // apunta a una URL de laboratorio que nunca se contacta en estos tests.
     let usuarios_client = UsuariosClient::new(
         "http://ms-usuarios.invalid".to_string(),
         SecretString::from("lab-only-not-a-real-secret".to_string()),
@@ -131,8 +151,8 @@ async fn spawn_gateway() -> GatewayUnderTest {
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
-        front_base_url: "https://front.lab".to_string(),
-        front_origin: HeaderValue::from_static("https://front.lab"),
+        front_base_url: TEST_FRONT_BASE_URL.to_string(),
+        front_origin: HeaderValue::from_static(TEST_FRONT_ORIGIN),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
@@ -192,75 +212,21 @@ fn valid_session_cookie_value() -> String {
     .expect("debe poder firmar una sesión de laboratorio válida")
 }
 
-/// Enumera cada ruta declarada en [`gateway::api::ROUTES`] (la tabla
-/// canónica que también usa `app_router` para construirse) y verifica, sin
-/// cookie de sesión, que las rutas marcadas `protected: true` responden
-/// `401` y las marcadas `protected: false` no. Así una ruta nueva que se
-/// añada a `app_router` sin añadirse a `ROUTES` (o viceversa) deja de
-/// reflejar el router real, en vez de quedar protegida o desprotegida por
-/// accidente en silencio.
+/// Criterio de aceptación 1/2 (parcial): una request real con el `Origin`
+/// configurado (`FRONT_BASE_URL`, sin `path`) a una ruta protegida recibe
+/// `Access-Control-Allow-Origin` con ese mismo valor y
+/// `Access-Control-Allow-Credentials: true` — sin esto, el navegador
+/// bloquea la respuesta de `GET /api/me` aunque este Gateway la procese
+/// bien (causa raíz del bucle de redirect a `/auth/login` en despliegue
+/// real).
 #[tokio::test]
-async fn enumerates_routes_and_verifies_which_carry_the_session_middleware() {
-    let gateway = spawn_gateway().await;
-    let http = http_client_no_redirects();
-
-    assert!(
-        ROUTES.iter().any(|r| r.path == "/api/me" && r.protected),
-        "la tabla ROUTES debe listar /api/me como protegida"
-    );
-    assert!(
-        ROUTES
-            .iter()
-            .any(|r| r.path == "/auth/login" && !r.protected),
-        "la tabla ROUTES debe listar /auth/login como pública"
-    );
-    assert!(
-        ROUTES
-            .iter()
-            .any(|r| r.path == "/auth/callback" && !r.protected),
-        "la tabla ROUTES debe listar /auth/callback como pública"
-    );
-    assert!(
-        ROUTES.iter().any(|r| r.path == "/health" && !r.protected),
-        "la tabla ROUTES debe listar /health como pública"
-    );
-
-    for route in ROUTES {
-        let method = reqwest::Method::from_bytes(route.method.as_bytes())
-            .expect("método HTTP válido en ROUTES");
-        let response = http
-            .request(method, format!("http://{}{}", gateway.addr, route.path))
-            .send()
-            .await
-            .unwrap_or_else(|err| panic!("{} {} debe responder: {err}", route.method, route.path));
-
-        if route.protected {
-            assert_eq!(
-                response.status(),
-                reqwest::StatusCode::UNAUTHORIZED,
-                "{} {} está marcada como protegida en ROUTES pero no exigió sesión",
-                route.method,
-                route.path
-            );
-        } else {
-            assert_ne!(
-                response.status(),
-                reqwest::StatusCode::UNAUTHORIZED,
-                "{} {} está marcada como pública en ROUTES pero exigió sesión",
-                route.method,
-                route.path
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn me_with_valid_session_returns_the_session_identity() {
+async fn get_me_with_allowed_origin_receives_correct_cors_headers() {
     let gateway = spawn_gateway().await;
     let http = http_client_no_redirects();
 
     let response = http
         .get(format!("http://{}/api/me", gateway.addr))
+        .header(reqwest::header::ORIGIN, TEST_FRONT_ORIGIN)
         .header(
             reqwest::header::COOKIE,
             format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
@@ -269,76 +235,119 @@ async fn me_with_valid_session_returns_the_session_identity() {
         .await
         .expect("GET /api/me debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-
-    let body: serde_json::Value = response.json().await.expect("cuerpo JSON válido");
-    assert_eq!(body["sub"], "google-sub-123");
-    assert_eq!(body["email"], "user@example.com");
-    assert_eq!(body["name"], "Test User");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "una request real con Origin permitido y sesión válida sigue debiendo ejecutar el handler"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("debe llevar Access-Control-Allow-Origin"),
+        TEST_FRONT_ORIGIN,
+        "el origen reflejado debe ser exactamente FRONT_BASE_URL (sin path), nunca un wildcard"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-credentials")
+            .expect("debe llevar Access-Control-Allow-Credentials"),
+        "true"
+    );
 }
 
+/// Criterio de aceptación 2: un preflight `OPTIONS` a una ruta protegida
+/// (`/api/me`, que lleva `require_session`) responde 200/204 con las
+/// cabeceras CORS correctas **sin** cookie de sesión — un preflight real de
+/// navegador nunca la envía, y el middleware de sesión nunca debe
+/// exigírsela. La `CorsLayer` se aplica como capa externa en `app_router`
+/// precisamente para que esto sea así (ver `src/api.rs::app_router`).
 #[tokio::test]
-async fn me_without_session_cookie_is_rejected() {
+async fn preflight_options_to_protected_route_does_not_require_session() {
     let gateway = spawn_gateway().await;
     let http = http_client_no_redirects();
 
     let response = http
-        .get(format!("http://{}/api/me", gateway.addr))
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://{}/api/me", gateway.addr),
+        )
+        .header(reqwest::header::ORIGIN, TEST_FRONT_ORIGIN)
+        .header("Access-Control-Request-Method", "GET")
         .send()
         .await
-        .expect("GET /api/me debe responder");
+        .expect("el preflight OPTIONS debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        response.status() == reqwest::StatusCode::OK
+            || response.status() == reqwest::StatusCode::NO_CONTENT,
+        "un preflight OPTIONS debe responder 200/204, no {}",
+        response.status()
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .expect("el preflight debe llevar Access-Control-Allow-Origin"),
+        TEST_FRONT_ORIGIN
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-credentials")
+            .expect("el preflight debe llevar Access-Control-Allow-Credentials"),
+        "true"
+    );
 }
 
+/// Criterio de aceptación 3: una request con un `Origin` distinto al
+/// configurado no recibe `Access-Control-Allow-Origin` (el navegador la
+/// bloquearía) — pero este Gateway igual la procesa normalmente del lado
+/// del servidor (CORS es una restricción del navegador sobre la
+/// *respuesta*, no una capa de autorización propia de este Gateway).
 #[tokio::test]
-async fn me_with_invalid_signature_session_is_rejected() {
+async fn get_me_with_disallowed_origin_does_not_receive_allow_origin_header() {
     let gateway = spawn_gateway().await;
     let http = http_client_no_redirects();
 
-    let token_signed_with_wrong_key = issue_session_token(
-        &lab_session(),
-        &SecretString::from("a-completely-different-lab-key".to_string()),
-        SESSION_AUDIENCE,
-        SESSION_ISSUER,
-    )
-    .expect("debe poder firmar con otra clave de laboratorio");
-
     let response = http
         .get(format!("http://{}/api/me", gateway.addr))
+        .header(reqwest::header::ORIGIN, DISALLOWED_ORIGIN)
         .header(
             reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={token_signed_with_wrong_key}"),
+            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
         )
         .send()
         .await
         .expect("GET /api/me debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "CORS no cambia la autorización: una sesión válida sigue viendo su propia identidad"
+    );
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "un origen no permitido nunca debe recibir Access-Control-Allow-Origin"
+    );
 }
 
+/// Criterio de aceptación "una request real sigue exigiendo sesión válida
+/// igual que antes": CORS solo habilita que el navegador lea la respuesta,
+/// nunca reemplaza al middleware de sesión de una request real (no
+/// preflight), incluso con el `Origin` permitido.
 #[tokio::test]
-async fn me_with_expired_session_is_rejected() {
+async fn get_me_with_allowed_origin_but_without_session_is_still_rejected() {
     let gateway = spawn_gateway().await;
     let http = http_client_no_redirects();
 
-    let mut expired_session = lab_session();
-    expired_session.exp = now_epoch_secs() - 3600;
-
-    let expired_token = issue_session_token(
-        &expired_session,
-        &SecretString::from(SESSION_SIGNING_KEY.to_string()),
-        SESSION_AUDIENCE,
-        SESSION_ISSUER,
-    )
-    .expect("debe poder firmar una sesión ya vencida");
-
     let response = http
         .get(format!("http://{}/api/me", gateway.addr))
-        .header(
-            reqwest::header::COOKIE,
-            format!("{SESSION_COOKIE_NAME}={expired_token}"),
-        )
+        .header(reqwest::header::ORIGIN, TEST_FRONT_ORIGIN)
         .send()
         .await
         .expect("GET /api/me debe responder");
