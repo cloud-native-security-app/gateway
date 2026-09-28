@@ -9,13 +9,12 @@
 
 ## Plan
 
-_Vacío — sin sesión activa._
+_—_
 
 ## Bitácora
 
-_Vacío — sin sesión activa._
+_—_
 
 ## Próximo paso
 
-_Vacío — sin sesión activa. `feature_list.json` no tiene features `pending`
-a la fecha del último cierre de sesión (ver `progress/history.md`)._
+_—_

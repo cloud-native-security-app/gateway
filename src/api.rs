@@ -1,9 +1,12 @@
 //! Handlers y router `axum` de toda ruta pública de este Gateway.
 //!
 //! Expone las rutas de login/callback/logout OIDC (feature `oidc_login`),
-//! una ruta de salud, `GET /api/me` (feature `session_middleware_and_me`) y
-//! `GET /api/profile` (feature `usuarios_profile_proxy`), protegidas por el
-//! middleware de sesión de [`crate::auth::require_session`]. `POST
+//! una ruta de salud, `GET /api/me` (feature `session_middleware_and_me`),
+//! `GET /api/profile` (feature `usuarios_profile_proxy`) y
+//! `GET`/`POST /api/network-credentials` + `DELETE
+//! /api/network-credentials/{id}` (feature `network_credentials_proxy`),
+//! protegidas por el middleware de sesión de
+//! [`crate::auth::require_session`]. `POST
 //! /api/scans` lleva además un rate limiter por usuario (feature
 //! `rate_limiting`, ver [`ScanSubmissionRateLimiter`]). Cada handler lleva
 //! además su anotación `#[utoipa::path(...)]` (feature `openapi_docs`,
@@ -18,17 +21,18 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use futures_util::Stream;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
@@ -37,7 +41,8 @@ use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPubli
 use crate::domain::{ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
 use crate::usuarios_client::{
-    ScanHistoryEntry, ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
+    CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry, ScanStatus, UserProfile,
+    UsuariosClient, UsuariosClientError,
 };
 
 /// Entrada de [`ScanOwnershipRegistry`]: qué `scan_id` le asignó
@@ -290,6 +295,20 @@ pub struct AppState {
     pub session_audience: String,
     /// Emisor (`iss`) que se embebe en la sesión propia emitida.
     pub session_issuer: String,
+    /// URL fija de `front` a la que `GET /auth/callback` redirige (`302`)
+    /// tras completar el login (feature `post_login_redirect`), tomada de
+    /// [`crate::config::Config::front_base_url`]. Nunca se deriva de la
+    /// query string de la request original: usar siempre este valor evita
+    /// un open redirect.
+    pub front_base_url: String,
+    /// Origen (`scheme://host[:puerto]`, sin `path`) de `front`, derivado de
+    /// [`crate::config::Config::front_origin`] (feature `cors_for_front`) y
+    /// ya validado/convertido a [`HeaderValue`] en `wiring` — construir
+    /// `app_router` nunca puede fallar por esto. Único origen que refleja
+    /// la [`CorsLayer`] de [`app_router`], nunca un wildcard (las llamadas
+    /// de `front` van con `credentials: "include"`, ver
+    /// `docs/security-scope.md`).
+    pub front_origin: HeaderValue,
     /// Cliente HTTP hacia `ms-usuarios` (único módulo que le habla
     /// directamente, ver `docs/architecture.md` capa `usuarios_client`).
     pub usuarios_client: Arc<UsuariosClient>,
@@ -357,6 +376,11 @@ async fn health() -> StatusCode {
 /// capa de sesión de todo este router, se ejecuta después de que
 /// [`crate::auth::require_session`] ya validó la sesión e insertó
 /// `Extension<Session>`.
+///
+/// `GET`/`POST /api/network-credentials` y `DELETE
+/// /api/network-credentials/:id` (feature `network_credentials_proxy`)
+/// llevan el mismo nivel de protección que `/api/profile`, sin capa
+/// adicional propia.
 fn protected_router(state: AppState) -> Router {
     let validator = SessionValidator::new(
         state.session_signing_key.clone(),
@@ -378,6 +402,14 @@ fn protected_router(state: AppState) -> Router {
         )
         .route("/api/scans/:scan_id/events", get(scan_events))
         .route("/api/scans/:scan_id/cancel", post(cancel_scan))
+        .route(
+            "/api/network-credentials",
+            get(list_network_credentials).post(create_network_credential),
+        )
+        .route(
+            "/api/network-credentials/:id",
+            delete(delete_network_credential),
+        )
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -449,6 +481,100 @@ async fn profile(
 ) -> Result<Json<UserProfile>, UsuariosClientError> {
     let profile = state.usuarios_client.get_profile(&session).await?;
     Ok(Json(profile))
+}
+
+/// Devuelve las credenciales de red del usuario de la sesión activa,
+/// proxeando `GET /users/me/network-credentials` de `ms-usuarios` (feature
+/// `network_credentials_proxy`) — nunca incluye `ssh_credentials_ref` (ver
+/// `crate::usuarios_client::NetworkCredential`). Mismo mapeo de errores que
+/// [`profile`].
+#[utoipa::path(
+    get,
+    path = "/api/network-credentials",
+    tag = "network-credentials",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "Credenciales de red del usuario de la sesión activa, tal como las reporta ms-usuarios (nunca incluye ssh_credentials_ref).", body = [NetworkCredential]),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
+async fn list_network_credentials(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<Json<Vec<NetworkCredential>>, UsuariosClientError> {
+    let credentials = state
+        .usuarios_client
+        .list_network_credentials(&session)
+        .await?;
+    Ok(Json(credentials))
+}
+
+/// Crea o actualiza una credencial de red del usuario de la sesión activa,
+/// proxeando `POST /users/me/network-credentials` de `ms-usuarios` (feature
+/// `network_credentials_proxy`): reenvía `body` tal cual, incluido
+/// `ssh_credentials_ref` (una credencial SSH real, ver
+/// `docs/security-scope.md`), pero la respuesta nunca la incluye — el tipo
+/// [`NetworkCredential`] simplemente no tiene ese campo. Mismo mapeo de
+/// errores que [`profile`].
+#[utoipa::path(
+    post,
+    path = "/api/network-credentials",
+    tag = "network-credentials",
+    security(("session_cookie" = [])),
+    request_body = CreateNetworkCredentialRequest,
+    responses(
+        (status = 200, description = "Credencial de red creada o actualizada, tal como la reporta ms-usuarios (nunca incluye ssh_credentials_ref).", body = NetworkCredential),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
+async fn create_network_credential(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Json(body): Json<CreateNetworkCredentialRequest>,
+) -> Result<Json<NetworkCredential>, UsuariosClientError> {
+    let credential = state
+        .usuarios_client
+        .create_network_credential(&session, &body)
+        .await?;
+    Ok(Json(credential))
+}
+
+/// Borra la credencial de red `id` del usuario de la sesión activa,
+/// proxeando `DELETE /users/me/network-credentials/{id}` de `ms-usuarios`
+/// (feature `network_credentials_proxy`): reenvía el status de `ms-usuarios`
+/// tal cual — `id` inexistente o de otro usuario responde `404` (nunca
+/// `403`, mismo criterio que `user-service`, ver
+/// [`crate::usuarios_client::UsuariosClientError::NetworkCredentialNotFound`]).
+#[utoipa::path(
+    delete,
+    path = "/api/network-credentials/{id}",
+    tag = "network-credentials",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Identificador de la credencial de red a borrar, asignado por ms-usuarios.")
+    ),
+    responses(
+        (status = 204, description = "Credencial de red borrada."),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 404, description = "La entrada no existe o no pertenece al usuario de la sesión activa."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
+async fn delete_network_credential(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, UsuariosClientError> {
+    state
+        .usuarios_client
+        .delete_network_credential(&session, &id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Entrada del histórico de escaneos devuelta por `GET /api/scans` (RF-13):
@@ -944,6 +1070,21 @@ pub const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/network-credentials",
+        protected: true,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/network-credentials",
+        protected: true,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/api/network-credentials/:id",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/openapi.json",
         protected: false,
     },
@@ -955,11 +1096,55 @@ pub const ROUTES: &[RouteSpec] = &[
 /// protegidas por el middleware de sesión (`crate::auth::require_session`).
 /// Ver [`ROUTES`] para la tabla canónica de qué ruta queda pública o
 /// protegida.
+///
+/// La [`CorsLayer`] de `cors_layer` se aplica como capa **externa**, tras
+/// fusionar todos los routers (incluido `protected_router`, que ya lleva
+/// `require_session` como su propia capa interna) — así un preflight
+/// `OPTIONS` de `front` (feature `cors_for_front`) lo resuelve por completo
+/// esa capa antes de que la request llegue al middleware de sesión, que
+/// nunca debe exigirle cookie a un preflight (un navegador nunca la envía
+/// en uno).
 pub fn app_router(state: AppState) -> Router {
+    let cors = cors_layer(state.front_origin.clone());
+
     auth_router(state.clone())
         .merge(health_router())
         .merge(openapi_router())
         .merge(protected_router(state))
+        .layer(cors)
+}
+
+/// Construye la [`CorsLayer`] que permite a `front` llamar a este Gateway
+/// desde otro origen del navegador (RF-01, feature `cors_for_front`):
+/// `front/src/api/httpClient.ts` hace `fetch(..., { credentials: "include"
+/// })` hacia este Gateway desde un origen distinto (mismo host, puerto
+/// distinto en despliegue real, ver `docs/architecture.md`), así que sin
+/// estas cabeceras el navegador bloquea la respuesta aunque este Gateway la
+/// procese bien — causa confirmada de un bucle de redirect a `/auth/login`
+/// en un despliegue real (`SessionProvider` trata el bloqueo del navegador
+/// como sesión anónima).
+///
+/// `front_origin` es el único origen permitido (nunca un wildcard: un
+/// origen con `allow_credentials(true)` no puede reflejar `*`, tiene que
+/// ser el origen exacto) — con [`AllowOrigin::predicate`], no
+/// [`AllowOrigin::exact`]/`allow_origin(HeaderValue)`: ese último fija un
+/// único valor de `Access-Control-Allow-Origin` en **toda** respuesta sin
+/// mirar el `Origin` real de la request, así que un origen no permitido
+/// también lo recibiría (solo el navegador, no este Gateway, lo bloquearía
+/// al no coincidir con su propio origen). El criterio de aceptación de esta
+/// feature exige explícitamente que un origen no permitido no reciba la
+/// cabecera en absoluto, así que se compara contra `front_origin` a mano y
+/// solo se refleja si coincide exactamente. Permite `GET`/`POST` (los
+/// métodos que usa `front` hoy) y el header `Content-Type` (que `front`
+/// manda en toda llamada con cuerpo JSON).
+fn cors_layer(front_origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(move |origin, _request_parts| {
+            *origin == front_origin
+        }))
+        .allow_credentials(true)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
 }
 
 /// Construye el router `axum` con la especificación OpenAPI pública de este
@@ -1023,6 +1208,9 @@ impl Modify for SessionCookieSecurity {
         list_scan_history,
         scan_events,
         cancel_scan,
+        list_network_credentials,
+        create_network_credential,
+        delete_network_credential,
     ),
     components(schemas(
         MeResponse,
@@ -1030,13 +1218,16 @@ impl Modify for SessionCookieSecurity {
         ScanSubmissionResponse,
         ScanHistoryEntryResponse,
         crate::usuarios_client::ScanStatus,
+        crate::usuarios_client::NetworkCredential,
+        crate::usuarios_client::CreateNetworkCredentialRequest,
     )),
     tags(
         (name = "auth", description = "Login/callback/logout delegados en Google OIDC."),
         (name = "health", description = "Comprobación de vida del proceso."),
         (name = "docs", description = "Documentación OpenAPI de este Gateway (RNF-08)."),
         (name = "session", description = "Identidad y perfil de la sesión activa."),
-        (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos.")
+        (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos."),
+        (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios.")
     ),
     modifiers(&SessionCookieSecurity)
 )]
@@ -1078,18 +1269,29 @@ struct CallbackParams {
 
 /// Intercambia el código de autorización por tokens, valida el ID token del
 /// proveedor de identidad y, si es válido, emite la sesión propia de este
-/// Gateway como cookie `HttpOnly` + `Secure` + `SameSite=Strict`.
+/// Gateway como cookie `HttpOnly` + `Secure` + `SameSite=Strict`, y redirige
+/// (`302`) de vuelta a `front` (feature `post_login_redirect`): `front`
+/// inicia el login con una navegación de página completa
+/// (`window.location.href`, ver `front/src/auth/LoginButton.tsx`), así que
+/// sin este redirect el navegador queda en una página en blanco tras
+/// completar el login con Google.
 ///
-/// Rechaza el callback (sin crear sesión) si falta o no coincide el `state`
-/// (mitigación CSRF), si falta el código, o si el ID token es inválido,
-/// expiró, o tiene una audiencia/emisor/nonce inesperados.
+/// El destino del redirect es siempre [`AppState::front_base_url`] (tomado
+/// de configuración) — **nunca** se concatena ni se refleja ningún parámetro
+/// de la query string de esta request, para no introducir un open redirect
+/// (ver `docs/security-scope.md`).
+///
+/// Rechaza el callback (sin crear sesión ni redirigir) si falta o no
+/// coincide el `state` (mitigación CSRF), si falta el código, o si el ID
+/// token es inválido, expiró, o tiene una audiencia/emisor/nonce
+/// inesperados.
 #[utoipa::path(
     get,
     path = "/auth/callback",
     tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 200, description = "Sesión propia emitida como cookie HttpOnly + Secure + SameSite=Strict tras validar el ID token."),
+        (status = 302, description = "Sesión propia emitida como cookie HttpOnly + Secure + SameSite=Strict tras validar el ID token; el header Location redirige siempre a la URL de front fijada en configuración (FRONT_BASE_URL), nunca a un valor derivado de la request."),
         (status = 400, description = "Falta el parámetro `state`/`code`, o el `state` no coincide con ningún login vigente."),
         (status = 401, description = "El ID token es inválido, expiró, o tiene una audiencia/emisor/nonce inesperados."),
         (status = 500, description = "No se pudo completar el descubrimiento OIDC o emitir la sesión propia.")
@@ -1099,7 +1301,7 @@ async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
     jar: CookieJar,
-) -> Result<(CookieJar, StatusCode), AuthError> {
+) -> Result<(CookieJar, Response), AuthError> {
     let state_param = params.state.ok_or(AuthError::MissingState)?;
     let (nonce, pkce_verifier) = state
         .login_states
@@ -1128,7 +1330,7 @@ async fn callback(
     )?;
 
     let cookie = auth::session_cookie(token, state.session_ttl_secs);
-    Ok((jar.add(cookie), StatusCode::OK))
+    Ok((jar.add(cookie), redirect_found(&state.front_base_url)))
 }
 
 /// Borra la cookie de sesión del lado del navegador.
@@ -1212,6 +1414,11 @@ impl IntoResponse for UsuariosClientError {
             // La API existe pero no hay credenciales de red configuradas
             // para este usuario/objetivo.
             UsuariosClientError::ScanTargetNotConfigured => StatusCode::UNPROCESSABLE_ENTITY,
+            // `DELETE /users/me/network-credentials/{id}` de ms-usuarios
+            // respondió 404: la entrada no existe o no pertenece al usuario
+            // activo (feature `network_credentials_proxy`) — se reenvía tal
+            // cual, a diferencia de UnexpectedResponse (que siempre es 502).
+            UsuariosClientError::NetworkCredentialNotFound => StatusCode::NOT_FOUND,
         };
 
         tracing::warn!(error = %self, %status, "fallo al comunicarse con el servicio de usuarios");

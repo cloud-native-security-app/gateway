@@ -427,10 +427,19 @@ pub fn session_cookie(token: String, ttl_secs: u64) -> Cookie<'static> {
 
 /// Cookie de borrado de la sesión propia, para usar en `POST /auth/logout`.
 ///
-/// Debe llevar el mismo nombre y `path` que [`session_cookie`] para que el
-/// navegador la reconozca como la misma cookie y la elimine.
+/// Debe llevar el mismo nombre, `path` **y el resto de atributos**
+/// (`HttpOnly`, `Secure`, `SameSite=Strict`) que [`session_cookie`]: los
+/// navegadores modernos (política "Leave Secure Cookies Alone") ignoran en
+/// silencio un `Set-Cookie` de borrado que no lleve `Secure` si la cookie
+/// original sí lo tenía, dejando la sesión original intacta pese a que la
+/// respuesta HTTP muestre `Max-Age=0`.
 pub fn removal_cookie() -> Cookie<'static> {
-    Cookie::build((SESSION_COOKIE_NAME, "")).path("/").build()
+    Cookie::build((SESSION_COOKIE_NAME, ""))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict)
+        .path("/")
+        .build()
 }
 
 /// Valida la sesión propia de este Gateway (firma, `exp`, `aud`, `iss`) en
@@ -571,10 +580,27 @@ mod tests {
 
     #[test]
     fn removal_cookie_matches_session_cookie_name_and_path() {
+        let session = session_cookie("some.jwt.token".to_string(), 3600);
         let removal = removal_cookie();
 
         assert_eq!(removal.name(), SESSION_COOKIE_NAME);
         assert_eq!(removal.path(), Some("/"));
+        assert_eq!(
+            removal.secure(),
+            session.secure(),
+            "la cookie de borrado debe llevar Secure igual que session_cookie(), o el \
+             navegador la ignora en silencio (política 'Leave Secure Cookies Alone')"
+        );
+        assert_eq!(
+            removal.http_only(),
+            session.http_only(),
+            "la cookie de borrado debe llevar HttpOnly igual que session_cookie()"
+        );
+        assert_eq!(
+            removal.same_site(),
+            session.same_site(),
+            "la cookie de borrado debe llevar SameSite igual que session_cookie()"
+        );
     }
 
     #[test]

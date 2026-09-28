@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::http::HeaderValue;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,6 +40,16 @@ const TEST_CLIENT_ID: &str = "test-client-id";
 const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
+/// URL de `front` de laboratorio a la que debe redirigir (`302`) un
+/// `GET /auth/callback` exitoso (feature `post_login_redirect`). Fija, nunca
+/// derivada de la request original (ver `docs/security-scope.md`: evita un
+/// open redirect).
+const TEST_FRONT_BASE_URL: &str = "https://front.lab/post-login";
+/// Origen (sin `path`) de [`TEST_FRONT_BASE_URL`] — esta feature no ejerce
+/// CORS (usa [`auth_router`] directamente, no [`gateway::api::app_router`]),
+/// pero [`AppState::front_origin`](gateway::api::AppState::front_origin) es
+/// un campo requerido del struct.
+const TEST_FRONT_ORIGIN: &str = "https://front.lab";
 
 /// Doble de prueba de [`ScanRequestPublisher`]: esta feature (`oidc_login`)
 /// no ejerce `POST /api/scans`, así que un `AppState` de prueba solo
@@ -255,6 +266,8 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        front_base_url: TEST_FRONT_BASE_URL.to_string(),
+        front_origin: HeaderValue::from_static(TEST_FRONT_ORIGIN),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher: Arc::new(NeverPublishesToBroker),
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
@@ -404,7 +417,18 @@ async fn callback_with_valid_id_token_creates_session() {
         .await
         .expect("GET /auth/callback debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("un callback exitoso debe redirigir (302) de vuelta a front")
+        .to_str()
+        .expect("Location debe ser ASCII válido");
+    assert_eq!(
+        location, TEST_FRONT_BASE_URL,
+        "el Location debe ser exactamente la URL de front configurada"
+    );
 
     let set_cookie = response
         .headers()
@@ -457,6 +481,62 @@ async fn callback_with_valid_id_token_creates_session() {
     assert!(!body.contains(&raw_id_token));
 
     let _ = gateway.session_signing_key; // usada arriba solo conceptualmente
+}
+
+#[tokio::test]
+async fn callback_success_redirect_ignores_extra_query_params() {
+    // Un callback exitoso siempre redirige a la URL de front fija en
+    // configuración, sin importar qué otros parámetros traiga la query
+    // string de la request original (mitigación de open redirect, ver
+    // docs/security-scope.md y el criterio de aceptación de la feature
+    // `post_login_redirect`).
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let http = http_client_no_redirects();
+
+    let (state_value, nonce_value) = start_login(&http, &gateway).await;
+
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(&key, &claims));
+
+    let malicious_redirect = "https://evil.example/steal-session";
+    let response = http
+        .get(format!(
+            "http://{}/auth/callback?code=irrelevant-code&state={state_value}\
+             &redirect_uri={malicious_redirect}&next={malicious_redirect}",
+            gateway.addr
+        ))
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("debe incluir el header Location")
+        .to_str()
+        .expect("Location debe ser ASCII válido");
+
+    assert_eq!(
+        location, TEST_FRONT_BASE_URL,
+        "el Location nunca debe reflejar un parámetro de la query string original"
+    );
+    assert_ne!(location, malicious_redirect);
 }
 
 #[tokio::test]

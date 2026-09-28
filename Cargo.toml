@@ -46,13 +46,29 @@ futures-util = "0.3"
 # `utoipa-swagger-ui` porque el criterio de aceptación solo exige servir el
 # JSON generado en `GET /api/openapi.json`, no una UI interactiva.
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
+# `CorsLayer` para que `front` (otro origen del navegador, ver
+# `docs/architecture.md`) pueda leer la respuesta de una ruta protegida
+# (RF-01, feature `cors_for_front`). Versión `0.6` para reutilizar la
+# resolución transitiva que ya fija `reqwest` en `Cargo.lock` (misma major
+# version que exige `http` 1.x, la que ya usa `axum` 0.7), en vez de
+# duplicar el árbol de dependencias con una `0.5` en paralelo.
+tower-http = { version = "0.6", features = ["cors"] }
+# Deriva el origen (`scheme://host[:puerto]`, sin `path`) de `FRONT_BASE_URL`
+# para la `CorsLayer` de arriba (`src/config.rs`, feature `cors_for_front`):
+# el header `Origin` de un navegador nunca lleva `path`, así que no basta
+# con reflejar el string crudo de `FRONT_BASE_URL` (que sí lo lleva, ver
+# feature `post_login_redirect`). Ya está resuelta transitivamente vía
+# `openidconnect`/`reqwest` (y ya era dev-dependency), se declara explícita
+# para poder nombrarla en `src/config.rs`.
+url = "2"
 
 [dev-dependencies]
 testcontainers = "0.20"
 rsa = "0.9.10"
 rand = "0.8"
 base64 = "0.22"
-url = "2"
+# `url` ya está en `[dependencies]` (feature `cors_for_front`, ver arriba) y
+# por lo tanto ya disponible en `tests/`; no se repite aquí.
 # Instalación defensiva del backend criptográfico de `rustls` antes de la
 # primera conexión AMQPS en tests (ver `progress/explore_lapin_testcontainers.md`
 # §4, gotcha de doble-proveedor `rustls`).

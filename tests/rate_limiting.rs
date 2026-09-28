@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::Query;
+use axum::http::HeaderValue;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
@@ -230,6 +231,8 @@ async fn spawn_gateway_with(
         session_ttl_secs: 3600,
         session_audience: SESSION_AUDIENCE.to_string(),
         session_issuer: SESSION_ISSUER.to_string(),
+        front_base_url: "https://front.lab".to_string(),
+        front_origin: HeaderValue::from_static("https://front.lab"),
         usuarios_client: Arc::new(usuarios_client),
         broker_publisher,
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
