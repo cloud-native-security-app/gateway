@@ -20,7 +20,7 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use cookie::time::Duration as CookieDuration;
+use cookie::time::{Duration as CookieDuration, OffsetDateTime};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
@@ -433,12 +433,20 @@ pub fn session_cookie(token: String, ttl_secs: u64) -> Cookie<'static> {
 /// silencio un `Set-Cookie` de borrado que no lleve `Secure` si la cookie
 /// original sí lo tenía, dejando la sesión original intacta pese a que la
 /// respuesta HTTP muestre `Max-Age=0`.
+///
+/// La cookie sale ya expirada por sí misma (`Max-Age=0` y
+/// `Expires` = epoch Unix), así que se emite con `CookieJar::add`, no con
+/// `CookieJar::remove`: `remove` solo genera el `Set-Cookie` de borrado si
+/// la request trae la cookie, y detrás de un proxy/ALB puede no llegar,
+/// dejando un `204` sin borrar nada en el navegador.
 pub fn removal_cookie() -> Cookie<'static> {
     Cookie::build((SESSION_COOKIE_NAME, ""))
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
         .path("/")
+        .max_age(CookieDuration::ZERO)
+        .expires(OffsetDateTime::UNIX_EPOCH)
         .build()
 }
 
@@ -601,6 +609,14 @@ mod tests {
             session.same_site(),
             "la cookie de borrado debe llevar SameSite igual que session_cookie()"
         );
+    }
+
+    #[test]
+    fn removal_cookie_is_already_expired() {
+        let removal = removal_cookie();
+
+        assert_eq!(removal.max_age(), Some(CookieDuration::ZERO));
+        assert_eq!(removal.expires_datetime(), Some(OffsetDateTime::UNIX_EPOCH));
     }
 
     #[test]

@@ -345,3 +345,60 @@ async fn me_with_expired_session_is_rejected() {
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+fn cache_control_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn me_with_valid_session_is_marked_no_store() {
+    let gateway = spawn_gateway().await;
+    let http = http_client_no_redirects();
+
+    let response = http
+        .get(format!("http://{}/api/me", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+        )
+        .send()
+        .await
+        .expect("GET /api/me debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(cache_control_of(&response).as_deref(), Some("no-store"));
+}
+
+#[tokio::test]
+async fn me_without_session_is_rejected_and_marked_no_store() {
+    let gateway = spawn_gateway().await;
+    let http = http_client_no_redirects();
+
+    let response = http
+        .get(format!("http://{}/api/me", gateway.addr))
+        .send()
+        .await
+        .expect("GET /api/me debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(cache_control_of(&response).as_deref(), Some("no-store"));
+}
+
+#[tokio::test]
+async fn logout_is_marked_no_store() {
+    let gateway = spawn_gateway().await;
+    let http = http_client_no_redirects();
+
+    let response = http
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(cache_control_of(&response).as_deref(), Some("no-store"));
+}

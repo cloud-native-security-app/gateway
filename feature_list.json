@@ -235,6 +235,24 @@
         "cargo test e ./init.sh pasan en verde"
       ],
       "status": "done"
+    },
+    {
+      "id": 16,
+      "name": "robust_logout",
+      "title": "Fix: logout robusto detrás de proxy/CDN (cookie ya expirada + Clear-Site-Data + Cache-Control: no-store)",
+      "description": "Bug que persiste en AWS (ECS Fargate detrás de ALB): POST /auth/logout responde 204 pero la sesión sigue activa. La feature 15 (añadir Secure a removal_cookie) no era la causa real: 'Leave Secure Cookies Alone' solo aplica a respuestas servidas por HTTP, no HTTPS. Causas reales: (1) el handler logout usa CookieJar::remove, que solo emite el Set-Cookie de borrado si la request trae la cookie; detrás de un proxy puede no llegar y la respuesta es un 204 sin ningún Set-Cookie. (2) Ninguna respuesta del gateway lleva Cache-Control, así que un CDN/proxy puede servir un GET /api/me 200 cacheado después del logout.",
+      "acceptance": [
+        "removal_cookie() en src/auth.rs devuelve una cookie ya expirada por sí misma: .max_age(Duration::ZERO) + .expires(OffsetDateTime::UNIX_EPOCH), manteniendo HttpOnly, Secure, SameSite=Strict y Path=/ (mismos atributos que session_cookie() salvo valor/expiración)",
+        "Test unitario removal_cookie_is_already_expired en src/auth.rs verifica max_age == 0 y expires == UNIX_EPOCH (además del test existente que compara atributos con session_cookie())",
+        "El handler logout (src/api.rs) usa jar.add(auth::removal_cookie()) en vez de jar.remove(...), de modo que el Set-Cookie de borrado se emite SIEMPRE, traiga o no la request la cookie de sesión",
+        "La respuesta de logout añade el header Clear-Site-Data: \"cookies\" (con las comillas, tal como exige la spec)",
+        "app_router aplica una capa middleware::map_response que inserta Cache-Control: no-store en toda respuesta que no tenga ya un Cache-Control fijado por el handler (no pisa el Cache-Control del stream SSE ni ningún otro fijado explícitamente)",
+        "Test de integración nuevo en tests/oidc_login.rs: POST /auth/logout SIN cookie en la request responde con Set-Cookie de gateway_session que incluye max-age=0, expires, path=/, secure, httponly, samesite=strict, y con el header Clear-Site-Data",
+        "Tests de integración nuevos en tests/session_middleware_and_me.rs: Cache-Control: no-store presente en GET /api/me con sesión válida (200) y sin sesión (401), y en POST /auth/logout",
+        "La documentación OpenAPI de /auth/logout sigue siendo coherente (sin cambio de status code)",
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (incluidos --ignored) e ./init.sh pasan en verde"
+      ],
+      "status": "done"
     }
   ]
 }

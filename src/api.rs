@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
@@ -1104,6 +1104,12 @@ pub const ROUTES: &[RouteSpec] = &[
 /// esa capa antes de que la request llegue al middleware de sesión, que
 /// nunca debe exigirle cookie a un preflight (un navegador nunca la envía
 /// en uno).
+///
+/// La capa `default_no_store` va **por fuera** de la `CorsLayer`, así que
+/// es la última en tocar cualquier respuesta: cubre rutas públicas y
+/// protegidas, los `401` que emite `require_session` (capa interna de
+/// `protected_router`) y también las respuestas que la propia `CorsLayer`
+/// genera sin llegar a ninguna ruta (preflight `OPTIONS`).
 pub fn app_router(state: AppState) -> Router {
     let cors = cors_layer(state.front_origin.clone());
 
@@ -1112,6 +1118,20 @@ pub fn app_router(state: AppState) -> Router {
         .merge(openapi_router())
         .merge(protected_router(state))
         .layer(cors)
+        .layer(middleware::map_response(default_no_store))
+}
+
+/// Inserta `Cache-Control: no-store` en toda respuesta que no traiga ya un
+/// `Cache-Control` propio, para que ningún CDN/proxy sirva una respuesta
+/// cacheada (p. ej. un `GET /api/me` `200` después de un logout). No pisa
+/// el `Cache-Control` que fije explícitamente un handler (p. ej. el del
+/// stream SSE).
+async fn default_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Construye la [`CorsLayer`] que permite a `front` llamar a este Gateway
@@ -1333,17 +1353,31 @@ async fn callback(
     Ok((jar.add(cookie), redirect_found(&state.front_base_url)))
 }
 
+/// Header `Clear-Site-Data` (sin constante propia en `http`).
+const CLEAR_SITE_DATA: HeaderName = HeaderName::from_static("clear-site-data");
+
 /// Borra la cookie de sesión del lado del navegador.
+///
+/// Emite **siempre** el `Set-Cookie` de borrado (cookie ya expirada de
+/// [`auth::removal_cookie`], añadida con `jar.add`, no `jar.remove`), traiga
+/// o no la request la cookie de sesión — detrás de un proxy/ALB puede no
+/// llegar. Añade además `Clear-Site-Data: "cookies"` como refuerzo del lado
+/// del navegador.
 #[utoipa::path(
     post,
     path = "/auth/logout",
     tag = "auth",
     responses(
-        (status = 204, description = "Cookie de sesión borrada del lado del navegador.")
+        (status = 204, description = "Cookie de sesión borrada del lado del navegador \
+            (`Set-Cookie` ya expirado, `Clear-Site-Data: \"cookies\"`).")
     )
 )]
-async fn logout(jar: CookieJar) -> (CookieJar, StatusCode) {
-    (jar.remove(auth::removal_cookie()), StatusCode::NO_CONTENT)
+async fn logout(jar: CookieJar) -> impl IntoResponse {
+    (
+        jar.add(auth::removal_cookie()),
+        [(CLEAR_SITE_DATA, HeaderValue::from_static("\"cookies\""))],
+        StatusCode::NO_CONTENT,
+    )
 }
 
 /// Construye una respuesta `302 Found` con el header `Location` indicado.
