@@ -1058,3 +1058,70 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
 - **Estado final:** feature 15 (`fix_logout_cookie_removal`) pasó a
   `"done"` en `feature_list.json`. Era la última feature listada en
   `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-09-29 — Feature 16: robust_logout — DONE
+
+- **Agente:** subagente `implementer` + subagente `reviewer` (coordinados
+  por `leader`).
+- **Bug (persistía en AWS, ECS Fargate detrás de ALB):** `POST
+  /auth/logout` respondía `204` pero la sesión seguía activa. La feature 15
+  (añadir `Secure` a `removal_cookie()`) no era la causa real: "Leave
+  Secure Cookies Alone" solo aplica a respuestas servidas por HTTP, no
+  HTTPS.
+- **Causas raíz reales:** (1) el handler `logout` usaba
+  `CookieJar::remove`, que solo emite el `Set-Cookie` de borrado si la
+  request trae la cookie; detrás de un proxy puede no llegar y la respuesta
+  era un `204` sin ningún `Set-Cookie`. (2) Ninguna respuesta del Gateway
+  llevaba `Cache-Control`, así que un CDN/proxy podía servir un `GET
+  /api/me` `200` cacheado después del logout.
+- **Qué se hizo:**
+  - `removal_cookie()` (`src/auth.rs`, ~L436-451) devuelve una cookie ya
+    expirada por sí misma: `.max_age(CookieDuration::ZERO)` +
+    `.expires(OffsetDateTime::UNIX_EPOCH)` (de `cookie::time`, sin
+    dependencias nuevas), manteniendo `HttpOnly`/`Secure`/
+    `SameSite=Strict`/`Path=/`. Rustdoc actualizado.
+  - Handler `logout` (`src/api.rs`, ~L1359-1381) usa
+    `jar.add(auth::removal_cookie())` (el `Set-Cookie` de borrado se emite
+    siempre) y añade `Clear-Site-Data: "cookies"` (constante
+    `CLEAR_SITE_DATA`, ~L1357). OpenAPI de `/auth/logout` sigue en `204`,
+    solo se amplió la descripción.
+  - `app_router` (`src/api.rs`, ~L1113-1122) añade
+    `middleware::map_response(default_no_store)` como capa **más externa**
+    (por fuera de la `CorsLayer` y de `require_session`): inserta
+    `Cache-Control: no-store` solo si la respuesta no trae ya uno
+    (`entry(..).or_insert(..)`), así que no pisa el `no-cache` del SSE.
+    Cubre rutas públicas y protegidas, los `401` del middleware de sesión
+    y las respuestas que genera la propia `CorsLayer` (preflight).
+- **Tests:** unitario nuevo `removal_cookie_is_already_expired`
+  (`src/auth.rs`); se conserva
+  `removal_cookie_matches_session_cookie_name_and_path`. Integración nueva
+  `logout_without_session_cookie_still_emits_an_expired_set_cookie`
+  (`tests/oidc_login.rs`: POST sin cookie → `Set-Cookie` con `max-age=0`,
+  `expires`, `path=/`, `secure`, `httponly`, `samesite=strict` y
+  `Clear-Site-Data`). En `tests/session_middleware_and_me.rs` (sobre
+  `app_router`): `me_with_valid_session_is_marked_no_store`,
+  `me_without_session_is_rejected_and_marked_no_store`,
+  `logout_is_marked_no_store`.
+- **Verificación:** sin `cargo` local, `./init.sh` completo se corrió
+  dentro de `rust:1.98-bookworm` (misma imagen que el `Dockerfile`), con el
+  repo montado en `/run/desktop/mnt/host/c/Users/maldo/gateway` (para que
+  los bind mounts de testcontainers resuelvan en Docker Desktop),
+  `--network host`, socket de Docker montado y `/.dockerenv` borrado en el
+  contenedor efímero (testcontainers 0.20.1 usa entonces `localhost`, que
+  coincide con el SAN del cert de laboratorio generado con
+  `rabbitmq/generate-lab-certs.sh`). Resultado: exit 0 — fmt, clippy
+  `--all-targets -D warnings`, 61 unitarios + integración (115 en total,
+  0 fallidos), 3 `--ignored` con testcontainers, `cargo doc` sin warnings.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras correr `./init.sh` de
+  forma independiente con el mismo resultado y verificar los 9 criterios
+  de acceptance y los checkpoints C1-C5. Observaciones no bloqueantes: no
+  hay test de regresión del `no-cache` del SSE ni del `no-store` en
+  preflight; `Clear-Site-Data: "cookies"` borra todas las cookies del
+  origen del Gateway (hoy solo existe `gateway_session`). Detalle en
+  `progress/review_robust_logout.md` (informe del implementer en
+  `progress/impl_robust_logout.md`).
+- **Estado final:** feature 16 (`robust_logout`) pasó a `"done"` en
+  `feature_list.json`. Era la última feature listada en
+  `feature_list.json` a la fecha de este cierre.

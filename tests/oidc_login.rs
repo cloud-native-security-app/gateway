@@ -728,8 +728,8 @@ async fn logout_clears_the_session_cookie() {
     let http = http_client_no_redirects();
 
     // Simula un navegador que ya tiene la cookie de sesión (como quedaría
-    // tras un login exitoso): `CookieJar::remove` solo emite un `Set-Cookie`
-    // de borrado para cookies que el request dice tener.
+    // tras un login exitoso). El caso sin cookie lo cubre
+    // `logout_without_session_cookie_still_emits_an_expired_set_cookie`.
     let response = http
         .post(format!("http://{}/auth/logout", gateway.addr))
         .header(
@@ -755,4 +755,56 @@ async fn logout_clears_the_session_cookie() {
             || set_cookie.to_lowercase().contains("expires="),
         "el Set-Cookie de logout debe expirar la cookie: {set_cookie}"
     );
+}
+
+#[tokio::test]
+async fn logout_without_session_cookie_still_emits_an_expired_set_cookie() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let http = http_client_no_redirects();
+
+    // Detrás de un proxy/ALB la cookie puede no llegar al Gateway: el
+    // logout tiene que emitir el Set-Cookie de borrado igualmente.
+    let response = http
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let set_cookie = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with(&format!("{SESSION_COOKIE_NAME}=")))
+        .expect("logout sin cookie debe emitir igualmente el Set-Cookie de borrado")
+        .to_lowercase();
+
+    for attribute in [
+        "max-age=0",
+        "expires=",
+        "path=/",
+        "secure",
+        "httponly",
+        "samesite=strict",
+    ] {
+        assert!(
+            set_cookie.contains(attribute),
+            "el Set-Cookie de logout debe incluir `{attribute}`: {set_cookie}"
+        );
+    }
+
+    let clear_site_data = response
+        .headers()
+        .get("clear-site-data")
+        .expect("logout debe emitir Clear-Site-Data")
+        .to_str()
+        .expect("Clear-Site-Data debe ser ASCII válido");
+    assert_eq!(clear_site_data, "\"cookies\"");
 }
