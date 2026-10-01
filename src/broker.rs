@@ -42,19 +42,34 @@
 //!   `progress/explore_lapin_publish.md` §4 para el análisis completo. El
 //!   canal del consumidor no activa `confirm_select` (es específico de
 //!   publicar, no de consumir).
-//! - **`BrokerConsumer` sigue sin reconexión automática**: `lapin` 2.5.5 no
-//!   reconecta solo (ver `progress/explore_lapin_consume.md` §2.2). Si la
-//!   conexión/canal AMQPS del consumidor se cae, [`BrokerConsumer::run`]
-//!   loggea el fin del stream y termina (`return`), sin reintentar por su
-//!   cuenta. El relay de avance en tiempo real (RF-07/RF-08) es una capa de
-//!   UX (progreso en vivo por SSE), no la vía de registro autoritativo del
-//!   resultado de un escaneo (`ms-analisis` lo consume de forma
-//!   independiente) — construir aquí un supervisor con backoff/reintentos
-//!   sería sobre-ingeniería para esta feature; si la caída del relay se
-//!   considera inaceptable en producción, la mejora natural es que el
-//!   **proceso completo** se reinicie (orquestador/`systemd`/Kubernetes),
-//!   no que este módulo reimplemente su propio supervisor de reconexión
-//!   AMQP.
+//! - **`BrokerConsumer` sí reconecta (feature
+//!   `scan_outcome_consumer_reconnect`, incidente confirmado en AWS)**: igual
+//!   motivación que `BrokerPublisher` (abajo), pero del lado del consumidor
+//!   de `gateway.scan-outcomes`. `lapin` 2.5.5 no reconecta solo (ver
+//!   `progress/explore_lapin_consume.md` §2.2); antes de esta feature, si la
+//!   conexión/canal AMQPS del consumidor se caía, [`BrokerConsumer::run`]
+//!   loggeaba el fin del stream y terminaba (`return`) sin que nadie se
+//!   enterase (`crate::lib::run` lo lanza con un `tokio::spawn` suelto, sin
+//!   guardar el `JoinHandle`) — el servidor HTTP seguía sirviendo normal, el
+//!   health check de ECS seguía viendo el proceso sano, y el relay SSE
+//!   quedaba muerto en silencio (síntoma real: escaneos ya fallados en
+//!   `ms-nmap` seguían mostrándose "en progreso" en `front`). A diferencia
+//!   de `BrokerPublisher`, [`BrokerConsumer::run`] consume `self` por valor y
+//!   corre en una única tarea (lanzada una sola vez al arrancar el proceso,
+//!   ver `crate::wiring`) — no hay llamadas concurrentes a este consumidor
+//!   como sí las hay al publicador desde múltiples requests HTTP, así que no
+//!   hace falta ningún `RwLock`/interior-mutability aquí: [`BrokerConsumer`]
+//!   guarda `amqps_url`/`vhost`/la CA de laboratorio opcional (igual que
+//!   [`BrokerPublisher`]) y [`BrokerConsumer::run`] opera sobre variables
+//!   locales mutables (desestructuradas de `self`) que reemplaza al
+//!   reconectar. Al fallar `basic_consume` o agotarse el `Stream` de
+//!   entregas (fin de stream o fallo de canal/conexión — hoy no existe
+//!   ningún mecanismo de shutdown ordenado en este codebase, así que
+//!   cualquier fin del stream se trata como fallo de conexión), reintenta
+//!   hasta `RECONNECT_MAX_ATTEMPTS` veces (backoff exponencial simple entre
+//!   intentos, 1s/2s/4s/8s, ~15s de espera acumulada en el peor caso) antes
+//!   de loggear el error real y terminar la tarea — mismo comportamiento de
+//!   antes como último recurso, nunca un loop infinito.
 //! - **`BrokerPublisher` sí reconecta (feature `broker_publisher_reconnect`,
 //!   incidente confirmado en AWS)**: a diferencia del consumidor, un fallo
 //!   del publicador bloquea `POST /api/scans` (camino síncrono, RNF-04)
@@ -88,6 +103,7 @@
 //!   Broker real).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use lapin::options::{
@@ -128,6 +144,21 @@ pub const QUEUE_GATEWAY_SCAN_OUTCOMES: &str = "gateway.scan-outcomes";
 /// Identificador (`consumer_tag`) con el que este Gateway se registra como
 /// consumidor de [`QUEUE_GATEWAY_SCAN_OUTCOMES`].
 const CONSUMER_TAG: &str = "gateway-scan-outcome-relay";
+
+/// Número máximo de intentos de reconexión que [`BrokerConsumer::run`] hace
+/// (vía [`reconnect_consumer`]) antes de darse por vencido y terminar la
+/// tarea — acotado a propósito para no entrar en un loop de reconexión
+/// agresivo si el Broker está genuinamente caído por un rato largo (feature
+/// `scan_outcome_consumer_reconnect`).
+const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+
+/// Espera antes del primer reintento de reconexión de [`BrokerConsumer`];
+/// se duplica después de cada intento fallido (1s/2s/4s/8s entre los 5
+/// intentos que permite [`RECONNECT_MAX_ATTEMPTS`] — el 5.º intento, si
+/// también falla, ya no espera: se da por vencido de inmediato, ~15s de
+/// espera acumulada en el peor caso) — backoff simple, suficiente para este
+/// caso sin sobre-ingeniería.
+const RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Mensaje publicado en [`EXCHANGE_SCAN_REQUESTS`] (routing key
 /// [`ROUTING_KEY_SCAN_REQUEST`]), consumido por `ms-nmap`. Shape copiado
@@ -560,8 +591,23 @@ pub trait ScanOutcomeHandler: Send + Sync {
 /// persistentes dedicados a consumir [`QUEUE_GATEWAY_SCAN_OUTCOMES`]. A
 /// diferencia de [`BrokerPublisher`], su canal no activa `confirm_select`
 /// (irrelevante para consumir).
+///
+/// Guarda `amqps_url`/`vhost`/la CA de laboratorio opcional (igual que
+/// [`BrokerPublisher`]) para que [`Self::run`] pueda reconectar sin
+/// pedírselos de nuevo al llamante (`crate::wiring`) — ver la nota de diseño
+/// "`BrokerConsumer` sí reconecta" al inicio de este módulo (feature
+/// `scan_outcome_consumer_reconnect`). A diferencia de [`BrokerPublisher`],
+/// no hace falta ningún `RwLock`: [`Self::run`] consume `self` por valor y
+/// corre en una única tarea, así que no hay acceso concurrente que proteger.
 pub struct BrokerConsumer {
-    // Igual que en `BrokerPublisher`: se conserva únicamente para mantener
+    amqps_url: SecretString,
+    vhost: String,
+    // `None` si se conectó sin CA de laboratorio (`Self::connect`, el caso
+    // de producción) — mismo motivo que `BrokerPublisher::ca_pem` para
+    // guardar el PEM en vez del `OwnedTLSConfig` ya construido (no deriva
+    // `Clone`, ver `tcp-stream` 0.28.0).
+    ca_pem: Option<String>,
+    // Igual que en `BrokerPublisher`: se conservan únicamente para mantener
     // viva la conexión mientras exista el canal.
     connection: Connection,
     channel: Channel,
@@ -601,8 +647,12 @@ impl BrokerConsumer {
         vhost: &str,
         tls_config: OwnedTLSConfig,
     ) -> Result<Self, BrokerError> {
+        let ca_pem = tls_config.cert_chain.clone();
         let (connection, channel) = connect_channel(amqps_url, vhost, tls_config).await?;
         Ok(Self {
+            amqps_url: amqps_url.clone(),
+            vhost: vhost.to_string(),
+            ca_pem,
             connection,
             channel,
         })
@@ -627,89 +677,180 @@ impl BrokerConsumer {
     ///   `routing_key`, y el tamaño en bytes — nunca contenido potencialmente
     ///   sensible del mensaje, ver `docs/security-scope.md`). Nunca tumba
     ///   este bucle.
-    /// - Esta función **no reconecta** si el `Stream` del consumidor
-    ///   termina (canal/conexión cerrados): loggea el fin y retorna (ver la
+    /// - Al fallar `basic_consume`, o al agotarse el `Stream` de entregas
+    ///   (fin de stream, canal/conexión cerrados — hoy no existe ningún
+    ///   mecanismo de shutdown ordenado en este codebase, así que cualquier
+    ///   fin del stream se trata como fallo de conexión), intenta reconectar
+    ///   vía `reconnect_consumer` (hasta `RECONNECT_MAX_ATTEMPTS` intentos,
+    ///   backoff exponencial 1s/2s/4s/8s entre ellos) y retoma el consumo en
+    ///   vez de terminar la tarea. Si se agotan los intentos, loggea el error real
+    ///   y recién ahí retorna — terminal, mismo comportamiento de antes como
+    ///   último recurso (feature `scan_outcome_consumer_reconnect`, ver la
     ///   nota de diseño al inicio de este módulo). Pensada para lanzarse una
     ///   única vez con `tokio::spawn` al arrancar el proceso (ver
     ///   `crate::wiring`).
     pub async fn run(self, handler: Arc<dyn ScanOutcomeHandler>) {
-        let mut consumer = match self
-            .channel
-            .basic_consume(
-                QUEUE_GATEWAY_SCAN_OUTCOMES,
-                CONSUMER_TAG,
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-        {
-            Ok(consumer) => consumer,
-            Err(source) => {
-                // `?` (Debug), no `%` (Display): mismo criterio que
-                // `src/api.rs` (feature `log_broker_publish_errors`) — el
-                // Debug derivado de `BrokerError` encadena el `lapin::Error`
-                // original (`#[source]`) en el log del servidor, sin tocar
-                // el `Display` (nunca expuesto a ningún llamante HTTP de
-                // todos modos, este call site solo loggea).
-                tracing::error!(
-                    error = ?BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
-                    "no se pudo iniciar el consumo de gateway.scan-outcomes"
-                );
-                return;
-            }
-        };
+        let BrokerConsumer {
+            amqps_url,
+            vhost,
+            ca_pem,
+            mut connection,
+            mut channel,
+        } = self;
 
-        while let Some(delivery) = consumer.next().await {
-            let delivery = match delivery {
-                Ok(delivery) => delivery,
-                Err(err) => {
+        loop {
+            let mut consumer = match channel
+                .basic_consume(
+                    QUEUE_GATEWAY_SCAN_OUTCOMES,
+                    CONSUMER_TAG,
+                    BasicConsumeOptions::default(),
+                    FieldTable::default(),
+                )
+                .await
+            {
+                Ok(consumer) => consumer,
+                Err(source) => {
+                    // `?` (Debug), no `%` (Display): mismo criterio que
+                    // `src/api.rs` (feature `log_broker_publish_errors`) — el
+                    // Debug derivado de `BrokerError` encadena el `lapin::Error`
+                    // original (`#[source]`) en el log del servidor, sin tocar
+                    // el `Display` (nunca expuesto a ningún llamante HTTP de
+                    // todos modos, este call site solo loggea).
                     tracing::error!(
-                        error = %err,
-                        "error de transporte consumiendo gateway.scan-outcomes"
+                        error = ?BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
+                        "no se pudo iniciar el consumo de gateway.scan-outcomes"
                     );
-                    continue;
+                    match reconnect_consumer(&amqps_url, &vhost, &ca_pem).await {
+                        Some((new_connection, new_channel)) => {
+                            connection = new_connection;
+                            channel = new_channel;
+                            continue;
+                        }
+                        None => return,
+                    }
                 }
             };
+            tracing::debug!(
+                connected = connection.status().connected(),
+                "consumidor de gateway.scan-outcomes (re)iniciado"
+            );
 
-            match serde_json::from_slice::<ScanOutcomeEvent>(&delivery.data) {
-                Ok(event) => {
-                    if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+            while let Some(delivery) = consumer.next().await {
+                let delivery = match delivery {
+                    Ok(delivery) => delivery,
+                    Err(err) => {
                         tracing::error!(
                             error = %err,
-                            "no se pudo confirmar (ack) un ScanOutcome consumido"
+                            "error de transporte consumiendo gateway.scan-outcomes"
                         );
+                        continue;
                     }
-                    handler.handle(event).await;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        routing_key = %delivery.routing_key.as_str(),
-                        payload_len = delivery.data.len(),
-                        "mensaje malformado en gateway.scan-outcomes descartado"
-                    );
-                    if let Err(nack_err) = delivery
-                        .nack(BasicNackOptions {
-                            multiple: false,
-                            requeue: false,
-                        })
-                        .await
-                    {
-                        tracing::error!(
-                            error = %nack_err,
-                            "no se pudo descartar (nack) un mensaje malformado de gateway.scan-outcomes"
+                };
+
+                match serde_json::from_slice::<ScanOutcomeEvent>(&delivery.data) {
+                    Ok(event) => {
+                        if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+                            tracing::error!(
+                                error = %err,
+                                "no se pudo confirmar (ack) un ScanOutcome consumido"
+                            );
+                        }
+                        handler.handle(event).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            routing_key = %delivery.routing_key.as_str(),
+                            payload_len = delivery.data.len(),
+                            "mensaje malformado en gateway.scan-outcomes descartado"
                         );
+                        if let Err(nack_err) = delivery
+                            .nack(BasicNackOptions {
+                                multiple: false,
+                                requeue: false,
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                error = %nack_err,
+                                "no se pudo descartar (nack) un mensaje malformado de gateway.scan-outcomes"
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        tracing::error!(
-            "el consumidor de gateway.scan-outcomes terminó (stream agotado, canal/conexión \
-             cerrados); no se reconecta automáticamente (ver la nota de diseño al inicio de \
-             este módulo)"
-        );
+            tracing::warn!(
+                "el consumidor de gateway.scan-outcomes terminó (stream agotado, canal/conexión \
+                 cerrados); intentando reconectar"
+            );
+            match reconnect_consumer(&amqps_url, &vhost, &ca_pem).await {
+                Some((new_connection, new_channel)) => {
+                    connection = new_connection;
+                    channel = new_channel;
+                }
+                None => return,
+            }
+        }
     }
+}
+
+/// Repite la lógica de conexión de
+/// [`BrokerConsumer::connect_with_tls_config`] contra `amqps_url`/`vhost`/
+/// `ca_pem` ya guardados, con hasta [`RECONNECT_MAX_ATTEMPTS`] intentos y
+/// backoff exponencial simple ([`RECONNECT_INITIAL_BACKOFF`] duplicado tras
+/// cada intento fallido: 1s/2s/4s/8s entre los 5 intentos, el 5.º ya no
+/// espera si también falla) — usado por [`BrokerConsumer::run`] cuando
+/// `basic_consume` falla o el `Stream` de entregas se agota (feature
+/// `scan_outcome_consumer_reconnect`, incidente confirmado en AWS). Devuelve
+/// `None`, tras loguear (`?err`, Debug — mismo criterio que el resto de este
+/// módulo) el `lapin::Error` real del último intento, si se agotan los
+/// intentos sin éxito.
+async fn reconnect_consumer(
+    amqps_url: &SecretString,
+    vhost: &str,
+    ca_pem: &Option<String>,
+) -> Option<(Connection, Channel)> {
+    let mut backoff = RECONNECT_INITIAL_BACKOFF;
+
+    for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
+        let tls_config = OwnedTLSConfig {
+            identity: None,
+            cert_chain: ca_pem.clone(),
+        };
+
+        match connect_channel(amqps_url, vhost, tls_config).await {
+            Ok((connection, channel)) => {
+                tracing::info!(
+                    attempt,
+                    "BrokerConsumer reconectado tras perder la conexión AMQPS"
+                );
+                return Some((connection, channel));
+            }
+            Err(err) if attempt < RECONNECT_MAX_ATTEMPTS => {
+                tracing::warn!(
+                    error = ?err,
+                    attempt,
+                    max_attempts = RECONNECT_MAX_ATTEMPTS,
+                    backoff_secs = backoff.as_secs(),
+                    "BrokerConsumer no pudo reconectar, reintentando con backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = ?err,
+                    attempts = RECONNECT_MAX_ATTEMPTS,
+                    "BrokerConsumer agotó los reintentos de reconexión; el consumidor de \
+                     gateway.scan-outcomes termina"
+                );
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 /// Construye la URI AMQPS completa (`<base>/<vhost>`) que espera

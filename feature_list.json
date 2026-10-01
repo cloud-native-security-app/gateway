@@ -300,6 +300,21 @@
         "cargo test e ./init.sh pasan en verde"
       ],
       "status": "done"
+    },
+    {
+      "id": 20,
+      "name": "scan_outcome_consumer_reconnect",
+      "title": "Resiliencia: BrokerConsumer (relay SSE) reconecta en vez de morir en silencio",
+      "description": "Incidente confirmado en AWS: BrokerConsumer::run (relay de gateway.scan-outcomes hacia SSE, feature scan_outcome_relay) no reconecta si se cae la conexión AMQP -- termina (return) y crate::run (src/lib.rs) lo lanza con un tokio::spawn(...) suelto sin guardar el JoinHandle, así que nadie se entera: el servidor HTTP sigue sirviendo normal, ECS lo ve sano para siempre (su health check es un GET /health ajeno a este consumidor), y el relay queda muerto en silencio. Síntoma real observado: escaneos ya fallados en nmap-service seguían mostrándose 'en progreso' en front durante el resto de la sesión. Una alternativa descartada por decisión explícita (ver conversación) es terminar el proceso completo de gateway para que ECS lo reemplace: dado que rabbitmq ya mostró inestabilidad repetida en este entorno, eso arriesgaría tirar abajo TODO gateway (login, escaneos, todo) en bucle por la caída de una capa que es solo UX -- es peor el remedio que la enfermedad. La solución correcta es reconectar el consumidor, mismo patrón ya probado y en producción en BrokerPublisher (feature broker_publisher_reconnect).",
+      "acceptance": [
+        "BrokerConsumer::run, al detectar un fallo de conexión/canal (no un fin de stream ordenado por cierre explícito, si existe esa distinción), reconecta (repite la lógica de BrokerConsumer::connect) y retoma el consumo, en vez de retornar y terminar la tarea",
+        "Reintentos acotados con backoff simple (p. ej. unos pocos intentos con espera creciente) para no entrar en un loop de reconexión agresivo si rabbitmq está genuinamente caído por un rato largo -- tras agotar los reintentos, recién ahí loguea y termina (mismo comportamiento de hoy como último recurso, no un bucle infinito)",
+        "Ningún cambio de contrato observable: mientras la conexión esté sana, el relay de SSE funciona exactamente igual que hoy",
+        "docs/architecture.md y el comentario de BrokerConsumer en broker.rs se actualizan para reflejar la reconexión (reemplazando la nota de 'si se cae, se espera a que el proceso se reinicie externamente')",
+        "Test de integración nuevo (mismo patrón que scan_outcome_relay.rs, testcontainers, #[ignore = \"requiere Docker\"]): se fuerza el cierre de la conexión AMQP del consumidor y se confirma que vuelve a relayar eventos SSE de un escaneo posterior sin reiniciar el proceso de gateway",
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (incluidos --ignored) e ./init.sh pasan en verde"
+      ],
+      "status": "done"
     }
   ]
 }

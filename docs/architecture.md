@@ -65,6 +65,21 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
   consume `gateway.scan-outcomes` (bindeada a las 3 variantes de
   `ScanOutcome`: `started`/`completed`/`failed`) y relaya cada evento al
   stream SSE del `scanId` correspondiente.
+- **El Broker reconecta solo (publicador y consumidor), nunca reinicia el
+  proceso completo (incidentes confirmados en AWS).** `BrokerPublisher`
+  (feature `broker_publisher_reconnect`) y `BrokerConsumer` (feature
+  `scan_outcome_consumer_reconnect`) guardan la URL/vhost/CA del Broker y
+  repiten su propia lógica de conexión si la detectan caída, en vez de
+  depender de que alguien reinicie el proceso a mano (publicador) o de
+  dejar el relay SSE muerto en silencio (consumidor) hasta el próximo
+  reinicio externo. El publicador reconecta bajo un `RwLock` porque
+  `publish_scan_request`/`publish_scan_cancellation` pueden invocarse
+  concurrentemente desde múltiples requests HTTP; el consumidor corre en
+  una única tarea de fondo (lanzada una vez al arrancar el proceso), así
+  que reconecta con un loop simple y reintentos acotados (backoff
+  exponencial, pocos intentos) sin necesitar ningún mecanismo de
+  sincronización — ver el detalle en los doc-comments de `BrokerPublisher`/
+  `BrokerConsumer` en `src/broker.rs`.
 - **Rate limiting por usuario (RF-12)** con `tower_governor` sobre la ruta
   de encolado de escaneos, con la identidad de la sesión de Gateway como
   clave (no la IP del cliente, que puede compartirse tras un NAT/proxy).
