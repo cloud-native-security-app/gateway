@@ -1330,3 +1330,81 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_log_broker_publish_errors.md`.
 - **Estado final:** feature 19 (`log_broker_publish_errors`) pasó a
   `"done"` en `feature_list.json`.
+
+---
+
+## 2026-10-01 — Feature 20: scan_outcome_consumer_reconnect — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Investigación previa:** el leader confirmó, leyendo `src/broker.rs`
+  completo y `src/wiring.rs`, que `BrokerConsumer::run(self, ...)` consume
+  `self` por valor y corre en una única tarea (`tokio::spawn`, lanzada una
+  sola vez al arrancar el proceso) — a diferencia de `BrokerPublisher`
+  (feature 18, ya `done`), no hay llamadas concurrentes que proteger, así
+  que no haría falta el `RwLock`/double-checked locking del publicador. Se
+  confirmó por `grep` que `docs/architecture.md` no tenía todavía ninguna
+  nota sobre reconexión del Broker (la descripción de la feature insinuaba
+  "reemplazar" una nota existente que en realidad no existía).
+- **Qué se hizo:** `BrokerConsumer` (relay de `gateway.scan-outcomes` hacia
+  SSE, feature 7) reconecta en vez de terminar en silencio. `src/broker.rs`
+  gana en `BrokerConsumer` los mismos 3 campos que ya tenía `BrokerPublisher`
+  (`amqps_url: SecretString`, `vhost: String`, `ca_pem: Option<String>`,
+  poblados en `connect_with_tls_config` con el mismo patrón) para poder
+  reconectar sin pedírselos de nuevo al llamante. `BrokerConsumer::run` se
+  reescribió: desestructura `self` en variables locales mutables y envuelve
+  la lógica de consumo en un `loop`; al fallar `basic_consume` o agotarse el
+  `Stream` de entregas (sin mecanismo de shutdown ordenado en este
+  codebase, cualquier fin de stream se trata como fallo de conexión), llama
+  al nuevo helper privado `reconnect_consumer` (reutiliza `connect_channel`,
+  la función libre ya compartida con el publicador, sin duplicarla) con
+  backoff exponencial simple — `RECONNECT_MAX_ATTEMPTS = 5`, esperas de
+  1s/2s/4s/8s entre los 5 intentos (~15s acumulados en el peor caso; el 5.º
+  intento, si también falla, ya no espera y se rinde de inmediato) — y si
+  reconecta, reemplaza `connection`/`channel` y retoma el consumo; si se
+  agotan los intentos, loguea el `lapin::Error` real (`?err`, Debug, mismo
+  criterio que la feature 19) y termina, terminal como antes. `BrokerPublisher`
+  no se tocó (solo comparte `connect_channel`). `docs/architecture.md` gana
+  una nota breve nueva (no reemplaza ninguna existente) junto a la sección
+  de notificación SSE, explicando que tanto publicador como consumidor
+  reconectan solos y por qué el publicador necesita `RwLock` y el consumidor
+  no. Nuevo archivo `tests/scan_outcome_consumer_reconnect.rs`
+  (`#[ignore = "requiere Docker"]`, mismo patrón `testcontainers` que
+  `scan_outcome_relay.rs`/`broker_publisher_reconnect.rs`): fuerza el cierre
+  de la conexión AMQP del consumidor vía la Management HTTP API (reutiliza
+  el mecanismo de `broker_publisher_reconnect.rs`), espera
+  determinísticamente (polling de `/api/connections`, sin tiempos fijos ni
+  republicación a ciegas) a que aparezca una conexión nueva, y confirma que
+  un escaneo publicado después sigue relayándose por SSE sin reiniciar el
+  proceso de gateway (misma tarea `tokio::spawn` de principio a fin del
+  test), además de un sanity check previo a la caída (el relay sigue
+  funcionando igual mientras la conexión está sana).
+- **Corrección post-revisión (no bloqueante):** el reviewer notó que el
+  doc-comment original describía el backoff como "1s/2s/4s/8s/16s" (~31s),
+  pero el código real nunca llega a usar una 5.ª espera (el intento 5, si
+  falla, se rinde sin esperar) — total real ~15s con 4 esperas. Se
+  corrigieron los doc-comments de `src/broker.rs` (cabecera del módulo,
+  `RECONNECT_INITIAL_BACKOFF`, `BrokerConsumer::run`, `reconnect_consumer`)
+  y `progress/impl_scan_outcome_consumer_reconnect.md` para describir el
+  comportamiento real (opción más simple que ajustar el código, sin impacto
+  en `docs/architecture.md`, que no mencionaba el detalle numérico), y se
+  re-ejecutaron `cargo fmt --check`/`cargo clippy --all-targets -- -D
+  warnings`/`cargo doc --no-deps`/`cargo test`/`cargo test -- --ignored`,
+  todos en verde.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (67 unitarios + tests de
+  integración sin Docker en verde, ninguna feature 1-19 se rompió), `cargo
+  test -- --ignored` (Docker disponible: 5 tests de integración con
+  RabbitMQ real, incluido el nuevo de esta feature en 15.4s, sin
+  contenedores huérfanos), `cargo doc --no-deps` (sin warnings, tras
+  corregir enlaces `rustdoc::private_intra_doc_links` a los nuevos símbolos
+  privados) y `./init.sh` — todo en verde, 0 warnings. Detalle completo en
+  `progress/impl_scan_outcome_consumer_reconnect.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) verificando los 6 criterios
+  de aceptación uno por uno, la decisión de no usar `RwLock` (correcta para
+  una tarea única sin concurrencia) y confirmando que no hay fuga de
+  credenciales. Única observación no bloqueante: discrepancia entre el
+  doc-comment/informe y el comportamiento real del backoff (ver corrección
+  arriba, ya resuelta). Detalle completo en
+  `progress/review_scan_outcome_consumer_reconnect.md`.
+- **Estado final:** feature 20 (`scan_outcome_consumer_reconnect`) pasó a
+  `"done"` en `feature_list.json`.
