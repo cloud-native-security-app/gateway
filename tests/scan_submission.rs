@@ -29,6 +29,7 @@ use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRa
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
     BrokerError, BrokerPublisher, ScanCancellation, ScanRequest, ScanRequestPublisher,
+    EXCHANGE_SCAN_REQUESTS,
 };
 use gateway::domain::Session;
 use gateway::realtime::RealtimeRegistry;
@@ -81,6 +82,31 @@ struct NeverPublishesToBroker;
 impl ScanRequestPublisher for NeverPublishesToBroker {
     async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
         panic!("este escenario no debe llegar a publicar en el Broker");
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        panic!("este escenario no debe llegar a publicar una cancelación en el Broker");
+    }
+}
+
+/// Doble de prueba de [`ScanRequestPublisher`] que siempre falla con
+/// [`BrokerError::PublishFailed`] (feature `log_broker_publish_errors`):
+/// usado para confirmar que, tras agregar el `lapin::Error` real al log del
+/// servidor (`?err` en vez de `%err`, ver `src/api.rs`), la respuesta HTTP
+/// hacia el cliente no cambia en absoluto — el `Display`/contrato externo de
+/// `BrokerError` sigue intacto.
+struct AlwaysFailsToPublish;
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for AlwaysFailsToPublish {
+    async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
+        Err(BrokerError::PublishFailed {
+            exchange: EXCHANGE_SCAN_REQUESTS.to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        })
     }
 
     async fn publish_scan_cancellation(
@@ -404,6 +430,41 @@ async fn scan_submission_returns_an_explicit_error_when_ms_usuarios_has_no_crede
         .expect("POST /api/scans debe responder");
 
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn scan_submission_broker_publish_failure_response_is_unchanged_when_logging_the_real_error()
+{
+    // `ms-usuarios` resuelve los 3 campos y registra el histórico
+    // normalmente (camino feliz hasta justo antes de publicar) — el único
+    // fallo es el publicador del Broker, para aislar exclusivamente el
+    // contrato HTTP de `ScanSubmitError::Broker` (feature
+    // `log_broker_publish_errors`).
+    let usuarios_base_url = spawn_happy_usuarios_stub().await;
+    let gateway = spawn_gateway(usuarios_base_url, Arc::new(AlwaysFailsToPublish)).await;
+    let http = http_client();
+
+    let response = http
+        .post(format!("http://{}/api/scans", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+        )
+        .json(&json!({ "target": "192.0.2.10" }))
+        .send()
+        .await
+        .expect("POST /api/scans debe responder");
+
+    // Mismo status/cuerpo que antes de agregar `?err` al log del servidor:
+    // el cambio de esta feature es exclusivamente qué llega al logger, nunca
+    // el `Display`/contrato externo de `BrokerError` (criterio de aceptación
+    // 1 y 3 de `log_broker_publish_errors`).
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("debe poder leer el cuerpo");
+    assert_eq!(body, "no se pudo encolar la solicitud de escaneo");
+    // El `lapin::Error` interno (`ChannelsLimitReached`, elegido arbitrariamente
+    // para este test) nunca debe filtrarse al cliente HTTP.
+    assert!(!body.contains("ChannelsLimitReached"));
 }
 
 fn fixture_path(relative: &str) -> PathBuf {

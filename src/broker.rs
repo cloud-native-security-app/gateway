@@ -42,15 +42,12 @@
 //!   `progress/explore_lapin_publish.md` §4 para el análisis completo. El
 //!   canal del consumidor no activa `confirm_select` (es específico de
 //!   publicar, no de consumir).
-//! - **Sin reconexión automática**: `lapin` 2.5.5 no reconecta solo (ver
-//!   `progress/explore_lapin_publish.md` §3.3 y
-//!   `progress/explore_lapin_consume.md` §2.2). Ni el publicador ni
-//!   [`BrokerConsumer::run`] implementan lógica de reconexión: si la
-//!   conexión/canal AMQPS se cae, el publicador reporta [`BrokerError`] en
-//!   la próxima publicación, y la tarea de fondo del consumidor loggea el
-//!   fin del stream y termina (`return`), sin reintentar por su cuenta. El
-//!   relay de avance en tiempo real (RF-07/RF-08) es una capa de UX
-//!   (progreso en vivo por SSE), no la vía de registro autoritativo del
+//! - **`BrokerConsumer` sigue sin reconexión automática**: `lapin` 2.5.5 no
+//!   reconecta solo (ver `progress/explore_lapin_consume.md` §2.2). Si la
+//!   conexión/canal AMQPS del consumidor se cae, [`BrokerConsumer::run`]
+//!   loggea el fin del stream y termina (`return`), sin reintentar por su
+//!   cuenta. El relay de avance en tiempo real (RF-07/RF-08) es una capa de
+//!   UX (progreso en vivo por SSE), no la vía de registro autoritativo del
 //!   resultado de un escaneo (`ms-analisis` lo consume de forma
 //!   independiente) — construir aquí un supervisor con backoff/reintentos
 //!   sería sobre-ingeniería para esta feature; si la caída del relay se
@@ -58,6 +55,27 @@
 //!   **proceso completo** se reinicie (orquestador/`systemd`/Kubernetes),
 //!   no que este módulo reimplemente su propio supervisor de reconexión
 //!   AMQP.
+//! - **`BrokerPublisher` sí reconecta (feature `broker_publisher_reconnect`,
+//!   incidente confirmado en AWS)**: a diferencia del consumidor, un fallo
+//!   del publicador bloquea `POST /api/scans` (camino síncrono, RNF-04)
+//!   hasta que alguien reinicie el proceso a mano — inaceptable para un
+//!   incidente tan frecuente como que ECS reemplace la task de RabbitMQ tras
+//!   un health check fallido. [`BrokerPublisher`] guarda su conexión/canal
+//!   vigentes detrás de un `tokio::sync::RwLock` (en vez de campos
+//!   directos) y conserva `amqps_url`/`vhost`/la CA de laboratorio
+//!   opcional, para poder repetir la lógica de conexión sin pedírselos de
+//!   nuevo a quien lo construyó (`crate::wiring`). Si `basic_publish` o la
+//!   confirmación del Broker fallan por un problema de conexión
+//!   ([`BrokerError::PublishFailed`]/[`BrokerError::ConnectionFailed`] —
+//!   nunca [`BrokerError::NotAcknowledged`], un `nack` real del Broker no es
+//!   un problema de conexión), el publicador intenta exactamente una
+//!   reconexión y reintenta la publicación una sola vez, propagando el
+//!   error original si el reintento también falla. La
+//!   reconexión usa *double-checked locking* sobre el mismo `RwLock`
+//!   (escala a escritura solo al reconectar, verifica bajo el write-lock si
+//!   otra tarea ya reconectó mientras tanto) para que, si dos publicaciones
+//!   fallan a la vez, a lo sumo una reconexión real quede en vuelo — sin
+//!   necesitar un `Mutex`/semáforo aparte.
 //! - **Mensaje malformado -> `nack(requeue: false)`, nunca `ack` ni
 //!   `nack(requeue: true)`**: un mensaje que no decodifica contra
 //!   [`crate::domain::ScanOutcomeEvent`] es un fallo permanente (el
@@ -82,6 +100,7 @@ use lapin::types::FieldTable;
 use lapin::{Channel, Connection, ConnectionProperties};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
+use tokio::sync::RwLock;
 
 use crate::domain::ScanOutcomeEvent;
 
@@ -269,16 +288,38 @@ pub trait ScanRequestPublisher: Send + Sync {
     ) -> Result<(), BrokerError>;
 }
 
-/// Cliente `lapin` sobre AMQPS de este Gateway: conexión y canal
-/// persistentes (una sola vez, reutilizados entre requests — ver
-/// `progress/explore_lapin_publish.md` §5), con `confirm_select` ya
-/// activado.
-pub struct BrokerPublisher {
+/// Conexión y canal AMQPS vigentes de [`BrokerPublisher`], agrupados para
+/// poder reemplazarlos atómicamente al reconectar (ver
+/// [`BrokerPublisher::reconnect`]).
+struct PublisherConnection {
     // Se conserva únicamente para mantener viva la conexión mientras exista
     // el canal (`lapin::Channel` deja de funcionar si su `Connection` se
     // destruye) — ver `is_connected`, que sí la lee.
     connection: Connection,
     channel: Channel,
+}
+
+/// Cliente `lapin` sobre AMQPS de este Gateway: conexión y canal
+/// persistentes (reutilizados entre requests — ver
+/// `progress/explore_lapin_publish.md` §5), con `confirm_select` ya
+/// activado.
+///
+/// La conexión/canal vigentes viven detrás de un `tokio::sync::RwLock` (en
+/// vez de campos directos) para poder reconectar sin pedirle de nuevo
+/// `amqps_url`/`vhost`/la CA de laboratorio al llamante — ver la nota de
+/// diseño "`BrokerPublisher` sí reconecta" al inicio de este módulo
+/// (feature `broker_publisher_reconnect`, incidente confirmado en AWS).
+pub struct BrokerPublisher {
+    amqps_url: SecretString,
+    vhost: String,
+    // `None` si se conectó sin CA de laboratorio (`Self::connect`, el caso
+    // de producción: certificado firmado por una CA pública/estándar). Se
+    // guarda el PEM en vez del `OwnedTLSConfig` ya construido porque este
+    // último no deriva `Clone` (`tcp-stream` 0.28.0, dependencia transitiva
+    // de `lapin`) — reconstruirlo desde el mismo dato de origen es más
+    // simple que intentar clonarlo.
+    ca_pem: Option<String>,
+    conn: RwLock<PublisherConnection>,
 }
 
 impl BrokerPublisher {
@@ -320,6 +361,7 @@ impl BrokerPublisher {
         vhost: &str,
         tls_config: OwnedTLSConfig,
     ) -> Result<Self, BrokerError> {
+        let ca_pem = tls_config.cert_chain.clone();
         let (connection, channel) = connect_channel(amqps_url, vhost, tls_config).await?;
         channel
             .confirm_select(ConfirmSelectOptions::default())
@@ -327,15 +369,72 @@ impl BrokerPublisher {
             .map_err(BrokerError::ConnectionFailed)?;
 
         Ok(Self {
-            connection,
-            channel,
+            amqps_url: amqps_url.clone(),
+            vhost: vhost.to_string(),
+            ca_pem,
+            conn: RwLock::new(PublisherConnection {
+                connection,
+                channel,
+            }),
         })
     }
 
     /// `true` si la conexión AMQPS subyacente sigue activa.
-    pub fn is_connected(&self) -> bool {
-        self.connection.status().connected()
+    ///
+    /// Pasa a ser `async` (antes era síncrona) porque ahora lee el estado a
+    /// través del `RwLock` que protege la conexión/canal vigentes — ningún
+    /// llamante de este repo la invocaba todavía, así que no hay ningún
+    /// contrato existente que romper (feature `broker_publisher_reconnect`).
+    pub async fn is_connected(&self) -> bool {
+        self.conn.read().await.connection.status().connected()
     }
+
+    /// Repite la lógica de conexión de [`Self::connect_with_tls_config`]
+    /// contra la `amqps_url`/`vhost`/CA ya guardados, y reemplaza la
+    /// conexión/canal vigentes.
+    ///
+    /// *Double-checked locking*: adquiere el write-lock y, antes de volver a
+    /// conectar de verdad, comprueba si la conexión vigente ya está sana
+    /// (otra tarea concurrente pudo haber reconectado mientras esta
+    /// esperaba el lock) — así, si dos publicaciones fallan a la vez, a lo
+    /// sumo una reconexión real queda en vuelo, sin necesitar un
+    /// `Mutex`/semáforo aparte (criterio de aceptación de
+    /// `broker_publisher_reconnect`).
+    async fn reconnect(&self) -> Result<(), BrokerError> {
+        let mut guard = self.conn.write().await;
+        if guard.connection.status().connected() {
+            return Ok(());
+        }
+
+        let tls_config = OwnedTLSConfig {
+            identity: None,
+            cert_chain: self.ca_pem.clone(),
+        };
+        let (connection, channel) =
+            connect_channel(&self.amqps_url, &self.vhost, tls_config).await?;
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .map_err(BrokerError::ConnectionFailed)?;
+
+        *guard = PublisherConnection {
+            connection,
+            channel,
+        };
+        Ok(())
+    }
+}
+
+/// `true` si `err` refleja un problema de conexión (vale la pena reconectar
+/// y reintentar), `false` en cualquier otro caso — en particular,
+/// [`BrokerError::NotAcknowledged`] (un `nack` real del Broker) nunca
+/// dispara una reconexión: el mensaje sí llegó, el Broker simplemente lo
+/// rechazó.
+fn is_connection_error(err: &BrokerError) -> bool {
+    matches!(
+        err,
+        BrokerError::PublishFailed { .. } | BrokerError::ConnectionFailed(_)
+    )
 }
 
 impl BrokerPublisher {
@@ -346,6 +445,13 @@ impl BrokerPublisher {
     /// [`ScanRequestPublisher::publish_scan_request`] y
     /// [`ScanRequestPublisher::publish_scan_cancellation`], que solo difieren
     /// en el tipo de mensaje y el exchange/routing key de destino.
+    ///
+    /// Si el primer intento falla por un problema de conexión (ver
+    /// [`is_connection_error`] — nunca por [`BrokerError::NotAcknowledged`]),
+    /// intenta exactamente una reconexión ([`Self::reconnect`]) y reintenta
+    /// la publicación una sola vez más; si la reconexión o ese reintento
+    /// también fallan, se propaga el error **original** del primer intento
+    /// (feature `broker_publisher_reconnect`).
     async fn publish_and_confirm(
         &self,
         exchange: &'static str,
@@ -354,13 +460,41 @@ impl BrokerPublisher {
     ) -> Result<(), BrokerError> {
         let payload = serde_json::to_vec(message).map_err(BrokerError::SerializationFailed)?;
 
-        let publisher_confirm = self
+        match self
+            .try_publish_and_confirm(exchange, routing_key, &payload)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(original_err) if is_connection_error(&original_err) => {
+                if self.reconnect().await.is_err() {
+                    return Err(original_err);
+                }
+                self.try_publish_and_confirm(exchange, routing_key, &payload)
+                    .await
+                    .map_err(|_retry_err| original_err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Un único intento de publicar `payload` (ya serializado) en `exchange`
+    /// y esperar la confirmación del Broker — sin ninguna lógica de
+    /// reconexión, esa vive en [`Self::publish_and_confirm`].
+    async fn try_publish_and_confirm(
+        &self,
+        exchange: &'static str,
+        routing_key: &'static str,
+        payload: &[u8],
+    ) -> Result<(), BrokerError> {
+        let conn = self.conn.read().await;
+
+        let publisher_confirm = conn
             .channel
             .basic_publish(
                 exchange,
                 routing_key,
                 BasicPublishOptions::default(),
-                &payload,
+                payload,
                 BasicProperties::default().with_content_type("application/json".into()),
             )
             .await
@@ -511,8 +645,14 @@ impl BrokerConsumer {
         {
             Ok(consumer) => consumer,
             Err(source) => {
+                // `?` (Debug), no `%` (Display): mismo criterio que
+                // `src/api.rs` (feature `log_broker_publish_errors`) — el
+                // Debug derivado de `BrokerError` encadena el `lapin::Error`
+                // original (`#[source]`) en el log del servidor, sin tocar
+                // el `Display` (nunca expuesto a ningún llamante HTTP de
+                // todos modos, este call site solo loggea).
                 tracing::error!(
-                    error = %BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
+                    error = ?BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
                     "no se pudo iniciar el consumo de gateway.scan-outcomes"
                 );
                 return;
@@ -598,6 +738,78 @@ mod tests {
             build_amqps_uri("amqps://gateway:secret@broker.lab:5671/", "security-app"),
             "amqps://gateway:secret@broker.lab:5671/security-app"
         );
+    }
+
+    #[test]
+    fn publish_failed_display_never_changes_regardless_of_the_source_lapin_error() {
+        // Mismo `Display` (el único mensaje que puede llegar a un llamante
+        // HTTP, ver `src/api.rs`) sin importar el `lapin::Error` real detrás
+        // -- feature `log_broker_publish_errors`: el fix agrega el detalle
+        // real al logger del servidor (`?err`, Debug), nunca al `Display`.
+        let err = BrokerError::PublishFailed {
+            exchange: "scan.requests".to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "no se pudo publicar en el exchange 'scan.requests'"
+        );
+        assert!(!err.to_string().contains("ChannelsLimitReached"));
+    }
+
+    #[test]
+    fn publish_failed_debug_includes_the_real_source_lapin_error() {
+        // A diferencia del `Display` de arriba, el `Debug` derivado SÍ debe
+        // encadenar el `lapin::Error` original (vía el `#[source]` de
+        // `thiserror`) -- es justamente lo que ahora consume `tracing::error!`
+        // con `?err` en `src/api.rs`/`src/broker.rs` para no perder la causa
+        // real en el log del servidor.
+        let err = BrokerError::PublishFailed {
+            exchange: "scan.requests".to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        };
+
+        let debug_output = format!("{err:?}");
+        assert!(
+            debug_output.contains("ChannelsLimitReached"),
+            "el Debug de BrokerError::PublishFailed debe incluir el lapin::Error real: \
+             {debug_output}"
+        );
+    }
+
+    #[test]
+    fn is_connection_error_is_true_for_publish_failed() {
+        assert!(is_connection_error(&BrokerError::PublishFailed {
+            exchange: "scan.requests".to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        }));
+    }
+
+    #[test]
+    fn is_connection_error_is_true_for_connection_failed() {
+        assert!(is_connection_error(&BrokerError::ConnectionFailed(
+            lapin::Error::ChannelsLimitReached
+        )));
+    }
+
+    #[test]
+    fn is_connection_error_is_false_for_not_acknowledged() {
+        // Un nack real del Broker no es un problema de conexión (el mensaje
+        // sí llegó) y no debe disparar una reconexión — criterio de
+        // aceptación de `broker_publisher_reconnect`.
+        assert!(!is_connection_error(&BrokerError::NotAcknowledged {
+            exchange: "scan.requests".to_string(),
+        }));
+    }
+
+    #[test]
+    fn is_connection_error_is_false_for_serialization_failed() {
+        let serialization_err =
+            serde_json::from_str::<()>("not json").expect_err("debe fallar al parsear");
+        assert!(!is_connection_error(&BrokerError::SerializationFailed(
+            serialization_err
+        )));
     }
 
     #[test]

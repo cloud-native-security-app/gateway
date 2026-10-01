@@ -1125,3 +1125,208 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
 - **Estado final:** feature 16 (`robust_logout`) pasó a `"done"` en
   `feature_list.json`. Era la última feature listada en
   `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-10-01 — Feature 17: provision_user_profile_on_login — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  fix acotado a un solo handler, reutiliza `UsuariosClient::upsert_profile`
+  y `UserProfile` ya existentes, sin crates ni APIs externas nuevas).
+- **Contexto:** bug de integración confirmado en producción (AWS):
+  `POST /api/network-credentials` respondía `502` para cualquier cuenta
+  real. Causa raíz confirmada en `ms-usuarios`:
+  `network_credentials.user_id REFERENCES users(user_id)`, y la única vía
+  que crea esa fila es `PUT /users/me` — el callback OIDC de este Gateway
+  nunca lo llamaba, así que ninguna cuenta que entra por Google llegaba a
+  tener fila en `users`, y cualquier `INSERT` posterior con esa FK rompía
+  con una violación de foreign key vista solo como `502`/`500` genérico del
+  lado del cliente. Decisión de diseño (acordada con el usuario): el fix va
+  en este Gateway, en el momento del login, no como upsert defensivo
+  repetido en cada endpoint de `ms-usuarios`.
+- **Qué se hizo:** en `fn callback` (`src/api.rs`), inmediatamente después
+  de construir `Session` y antes de `auth::issue_session_token`/emitir la
+  cookie/redirigir, se agregó una llamada a
+  `state.usuarios_client.upsert_profile(&session, &serde_json::json!({ "display_name": session.name }))`
+  — `display_name` sale siempre de `session.name` (ya verificado del ID
+  token de Google), nunca de un parámetro de la request de callback. Nuevo
+  enum `CallbackError` (`thiserror`, `#[error(transparent)]` sobre
+  `AuthError`/`UsuariosClientError`, mismo patrón que `ScanSubmitError`),
+  con `fn callback` devolviendo `Result<(CookieJar, Response), CallbackError>`
+  en vez de `Result<_, AuthError>`; un fallo de `upsert_profile` se propaga
+  con `?` sin llegar a issuar cookie ni `302`, delegando en el `IntoResponse`
+  ya existente de cada error (sin inventar un mapeo HTTP nuevo). El
+  `#[utoipa::path(...)]` de `/auth/callback` se amplió con las respuestas
+  `502`/`504` (el `302` del camino feliz no cambia). No se tocó
+  `usuarios_client.rs`: se reutilizan `UsuariosClient::upsert_profile` y
+  `UserProfile` (`serde_json::Value`) tal cual los usaba ya el proxy
+  `GET`/`PUT /api/profile`. En `tests/oidc_login.rs`, `spawn_gateway` ganó
+  un parámetro `usuarios_base_url` (antes apuntaba siempre a una URL
+  inválida nunca contactada, lo que habría roto el camino feliz tras el
+  fix); se agregó un stub real de `ms-usuarios` (`PUT /users/me` sobre un
+  puerto efímero, con modo `fail` para simular `5xx`) y 2 tests nuevos:
+  éxito dispara `PUT /users/me` con el header de identidad y
+  `display_name` correctos antes del `302`/`Set-Cookie`; un `5xx` de
+  `ms-usuarios` no emite cookie ni `302` y responde `502` sin exponer la
+  URL interna del stub en el cuerpo. `docs/security-scope.md` ganó una
+  viñeta nueva en "Identidad y sesión" documentando esta llamada y
+  reafirmando el origen verificado de `display_name`.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (todos los tests de las
+  features 1-16 siguen en verde, incluidos los 12 de `tests/oidc_login.rs`
+  con los 2 nuevos y los 2 de `tests/openapi_docs.rs` sin tocar), `cargo
+  test -- --ignored` (Docker disponible: los 3 tests con RabbitMQ real
+  —`scan_submission`, `scan_outcome_relay`, `scan_history_and_cancellation`—
+  siguen en verde), `cargo doc --no-deps` y `./init.sh` — todo en verde, 0
+  warnings. Detalle completo en
+  `progress/impl_provision_user_profile_on_login.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 9 criterios de aceptación uno por
+  uno contra el código y los tests (líneas concretas citadas), confirmar
+  que `tests/openapi_docs.rs` (anti-drift) sigue pasando sin cambios
+  manuales a pesar de que el shape de `#[utoipa::path]` de `/auth/callback`
+  cambió, confirmar por `git diff --stat` que el alcance se limitó a
+  `docs/security-scope.md`, `src/api.rs` y `tests/oidc_login.rs` (sin tocar
+  `usuarios_client.rs` ni ningún repo hermano), y confirmar que ningún log
+  o cuerpo de error filtra el token de Google, la sesión firmada, la
+  credencial de `ms-usuarios` o la credencial AMQPS. Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_provision_user_profile_on_login.md`.
+- **Estado final:** feature 17 (`provision_user_profile_on_login`) pasó a
+  `"done"` en `feature_list.json`. No quedan features `pending` ni
+  `in_progress` en `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-10-01 — Feature 18: broker_publisher_reconnect — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  refactor de concurrencia acotado a un struct de `src/broker.rs`, sin
+  crates nuevas — `tokio::sync::RwLock` ya es dependencia transitiva de
+  `tokio`).
+- **Investigación previa:** el leader confirmó la estructura real de
+  `BrokerPublisher` (`connection`/`channel` como campos directos, sin
+  interior-mutability ni datos guardados para reconectar) y que
+  `publish_and_confirm` ya diferenciaba `PublishFailed`/`ConnectionFailed`
+  de `NotAcknowledged` antes de despachar al implementer. Incidente real en
+  AWS documentado en la propia feature: ECS reemplaza la task de RabbitMQ
+  tras un health check fallido, la `Connection`/`Channel` de `gateway`
+  queda apuntando a una instancia muerta, y todo `POST /api/scans` falla
+  con `502` hasta reiniciar `gateway` a mano, aunque RabbitMQ ya esté sano.
+- **Qué se hizo:** `src/broker.rs` — `BrokerPublisher` guarda su conexión y
+  canal vigentes agrupados en un struct privado `PublisherConnection`
+  detrás de `conn: RwLock<PublisherConnection>`, junto con `amqps_url:
+  SecretString`, `vhost: String` y `ca_pem: Option<String>` (fuente para
+  reconstruir `OwnedTLSConfig` al reconectar, ya que ese tipo de `lapin`/
+  `tcp-stream` 0.28.0 no deriva `Clone`). `connect`/`connect_with_ca_pem`
+  no cambiaron de firma pública. `publish_and_confirm` se dividió en un
+  intento base (`try_publish_and_confirm`, solo toma un `read()` del lock —
+  publicaciones sanas concurrentes no se serializan entre sí) y la lógica
+  de reconexión: si el primer intento falla con un error de conexión
+  (`is_connection_error`, nueva función privada que distingue
+  `PublishFailed`/`ConnectionFailed` de `NotAcknowledged` — un nack real
+  nunca dispara reconexión), se reconecta exactamente una vez
+  (`reconnect()`, que escala a `write()` y hace *double-checked locking*:
+  si otra tarea ya reconectó mientras esta esperaba el lock, no abre una
+  segunda conexión real) y se reintenta la publicación una sola vez,
+  propagando siempre el error **original** del primer intento si la
+  reconexión o el reintento también fallan. `is_connected()` pasó de
+  síncrona a `async fn` (ahora lee a través del lock); se verificó en todo
+  el repo que ningún llamante de producción ni de tests la invocaba
+  todavía, así que el cambio no rompe ningún contrato existente.
+  `BrokerConsumer` no se tocó de forma observable (comparte
+  `connect_channel`, sin cambios; sigue sin reconexión, documentado
+  explícitamente en la nota de diseño del módulo, que ahora distingue el
+  comportamiento del publicador del consumidor). Nuevo archivo
+  `tests/broker_publisher_reconnect.rs` (`#[ignore = "requiere Docker"]`,
+  mismo patrón `testcontainers` que `scan_submission.rs`/
+  `scan_outcome_relay.rs`): fuerza el cierre de la conexión AMQP
+  subyacente de un `BrokerPublisher` real vía la Management HTTP API de
+  `rabbitmq:4.3.5-management` (`DELETE /api/connections/{name}`, con el
+  usuario `lab-admin`, más simple y determinista que reiniciar el
+  contenedor entero), espera con polling acotado a que `is_connected()`
+  refleje el corte, y confirma que una publicación posterior tiene éxito
+  —verificando el mensaje real en una cola de prueba, no solo el resultado
+  del método— sin reiniciar el proceso ni reconstruir el publicador (misma
+  instancia de principio a fin). 4 tests unitarios nuevos para
+  `is_connection_error`.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (65 unitarios + toda la
+  suite de integración sin Docker en verde, ninguna feature 1-17 se
+  rompió), `cargo test -- --ignored` (Docker disponible: todos los
+  `#[ignore]` en verde, incluido el nuevo de esta feature), `cargo doc
+  --no-deps` (se corrigió un warning de `rustdoc::private_intra_doc_links`
+  detectado en esta misma verificación) y `./init.sh` — todo en verde, 0
+  warnings. Detalle completo en
+  `progress/impl_broker_publisher_reconnect.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 7 criterios de aceptación uno por
+  uno contra el código y los tests (líneas concretas citadas), confirmar
+  con `rg "is_connected" .` en todo el repo que el cambio sync→async no
+  rompe ningún llamante existente, confirmar por `git diff` que
+  `src/wiring.rs` y el trait `ScanRequestPublisher` no cambiaron, y que las
+  únicas líneas tocadas de `BrokerConsumer` son comentarios de la nota de
+  diseño del módulo. Confirmó que la credencial AMQPS sigue sin loggearse
+  (`amqps_url`/`ca_pem` nunca aparecen en un log, `BrokerPublisher`/
+  `PublisherConnection` no derivan `Debug`) y que no hay `unwrap`/`expect`/
+  `panic!` nuevos fuera de tests en `src/broker.rs`. Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_broker_publisher_reconnect.md`.
+- **Estado final:** feature 18 (`broker_publisher_reconnect`) pasó a
+  `"done"` en `feature_list.json`.
+
+---
+
+## 2026-10-01 — Feature 19: log_broker_publish_errors — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Qué se hizo:** fix de observabilidad acotado. `BrokerError::PublishFailed`/
+  `ConnectionFailed`/`ConsumeFailed` ya guardaban el `lapin::Error` original
+  como `#[source]` (`thiserror`), a propósito nunca incluido en su `Display`
+  (para no filtrar la URL/credencial AMQPS) — pero el único log existente de
+  cada call site usaba `%err` (Display), así que ese `lapin::Error` real
+  tampoco llegaba nunca al log del servidor. Se corrigieron los 3 call sites
+  reales (identificados por el leader vía grep, no solo el nombrado en la
+  descripción de la feature): `src/api.rs:904` (`ScanCancelError::Broker`),
+  `src/api.rs:1524` (`ScanSubmitError::Broker`, el nombrado explícitamente) y
+  `src/broker.rs:648-650` (`BrokerConsumer::run`, construye
+  `BrokerError::ConsumeFailed` inline) — en los 3, `error = %err` pasó a
+  `error = ?err` (Debug). `BrokerError` deriva `#[derive(Debug,
+  thiserror::Error)]`, así que el `Debug` derivado encadena el `lapin::Error`
+  real vía `#[source]` sin tocar el `impl Display` manual (`#[error("...")]`),
+  que sigue siendo exactamente el mismo texto genérico expuesto a cualquier
+  llamante HTTP. Se verificó además, leyendo el código fuente real de
+  `lapin` 2.5.5 (`error.rs`), que ninguna variante de `lapin::Error`
+  transporta la URL/credencial AMQPS, así que loguear su `Debug` es seguro.
+  Los otros `tracing::error!/warn!` cercanos en `src/broker.rs` (líneas
+  ~660-700) loguean un `lapin::Error`/`serde_json::Error` crudo directamente
+  (no un `BrokerError` envuelto) y quedaron fuera de alcance a propósito, sin
+  scope creep. `docs/security-scope.md` no requirió ningún cambio: ya
+  documentaba que "el detalle real" va "solo en logs del lado del servidor
+  (sin credenciales)". Se agregaron 2 tests unitarios nuevos en
+  `src/broker.rs` (`publish_failed_display_never_changes_...`,
+  `publish_failed_debug_includes_the_real_source_lapin_error`) y un test de
+  integración end-to-end nuevo en `tests/scan_submission.rs`
+  (`scan_submission_broker_publish_failure_response_is_unchanged_when_logging_the_real_error`,
+  con un doble `AlwaysFailsToPublish`) que confirma que `POST /api/scans`
+  sigue respondiendo `502` con el mismo cuerpo exacto de antes, sin filtrar
+  el detalle interno del `lapin::Error`.
+- **Verificación:** `cargo build`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo fmt --check`, `cargo test` (todo verde, incluye el test
+  nuevo; ninguna feature 1-18 se rompió) y `./init.sh` completo (Docker
+  disponible: los `#[ignore]` también pasaron, incluido `cargo doc
+  --no-deps` sin warnings) — todo en verde. Detalle completo en
+  `progress/impl_log_broker_publish_errors.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 4 criterios de aceptación uno por uno
+  contra el código/tests (líneas concretas citadas), confirmar por `git
+  diff docs/security-scope.md` vacío que el documento sigue siendo preciso
+  sin cambios, y confirmar que los demás `tracing::error!/warn!` de
+  `src/broker.rs` no fueron tocados (sin scope creep). Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_log_broker_publish_errors.md`.
+- **Estado final:** feature 19 (`log_broker_publish_errors`) pasó a
+  `"done"` en `feature_list.json`.

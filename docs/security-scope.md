@@ -29,6 +29,20 @@
 - Un `logout` invalida la sesión del lado del navegador (borra la cookie);
   si en el futuro se necesita invalidación server-side (revocación antes de
   `exp`), es una feature nueva a discutir, no se asume aquí.
+- Feature `provision_user_profile_on_login` (fix de bug de producción): el
+  callback OIDC, inmediatamente después de construir la sesión propia y
+  **antes** de emitir su cookie/redirigir a `front`, llama a
+  `UsuariosClient::upsert_profile` (`PUT /users/me`) para garantizar que
+  `ms-usuarios` tenga la fila de `users` correspondiente — sin eso, cualquier
+  INSERT posterior que referencie esa fila (`network_credentials`, histórico
+  de escaneos) rompe con una violación de foreign key. El único campo que
+  viaja en ese `PUT` (`display_name`) sale siempre de `session.name`, la
+  identidad ya verificada contra el ID token de Google — **nunca** de un
+  parámetro de query/body de la request de callback (mismo principio de
+  no-input-no-verificado del resto de este documento). Si esa llamada falla
+  (red o respuesta no-2xx de `ms-usuarios`), el callback no emite la cookie
+  de sesión ni el `302`: nunca debe quedar un usuario con sesión válida pero
+  sin fila en `ms-usuarios`.
 
 ## Comunicación con `ms-usuarios`
 
