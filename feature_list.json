@@ -299,7 +299,7 @@
         "Test que confirma que un BrokerError::PublishFailed simulado sigue teniendo el mismo Display/contrato externo de antes (no debe cambiar ninguna respuesta HTTP)",
         "cargo test e ./init.sh pasan en verde"
       ],
-      "status": "pending"
+      "status": "done"
     }
   ]
 }

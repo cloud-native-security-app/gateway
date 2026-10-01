@@ -1276,3 +1276,57 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
   `progress/review_broker_publisher_reconnect.md`.
 - **Estado final:** feature 18 (`broker_publisher_reconnect`) pasó a
   `"done"` en `feature_list.json`.
+
+---
+
+## 2026-10-01 — Feature 19: log_broker_publish_errors — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer).
+- **Qué se hizo:** fix de observabilidad acotado. `BrokerError::PublishFailed`/
+  `ConnectionFailed`/`ConsumeFailed` ya guardaban el `lapin::Error` original
+  como `#[source]` (`thiserror`), a propósito nunca incluido en su `Display`
+  (para no filtrar la URL/credencial AMQPS) — pero el único log existente de
+  cada call site usaba `%err` (Display), así que ese `lapin::Error` real
+  tampoco llegaba nunca al log del servidor. Se corrigieron los 3 call sites
+  reales (identificados por el leader vía grep, no solo el nombrado en la
+  descripción de la feature): `src/api.rs:904` (`ScanCancelError::Broker`),
+  `src/api.rs:1524` (`ScanSubmitError::Broker`, el nombrado explícitamente) y
+  `src/broker.rs:648-650` (`BrokerConsumer::run`, construye
+  `BrokerError::ConsumeFailed` inline) — en los 3, `error = %err` pasó a
+  `error = ?err` (Debug). `BrokerError` deriva `#[derive(Debug,
+  thiserror::Error)]`, así que el `Debug` derivado encadena el `lapin::Error`
+  real vía `#[source]` sin tocar el `impl Display` manual (`#[error("...")]`),
+  que sigue siendo exactamente el mismo texto genérico expuesto a cualquier
+  llamante HTTP. Se verificó además, leyendo el código fuente real de
+  `lapin` 2.5.5 (`error.rs`), que ninguna variante de `lapin::Error`
+  transporta la URL/credencial AMQPS, así que loguear su `Debug` es seguro.
+  Los otros `tracing::error!/warn!` cercanos en `src/broker.rs` (líneas
+  ~660-700) loguean un `lapin::Error`/`serde_json::Error` crudo directamente
+  (no un `BrokerError` envuelto) y quedaron fuera de alcance a propósito, sin
+  scope creep. `docs/security-scope.md` no requirió ningún cambio: ya
+  documentaba que "el detalle real" va "solo en logs del lado del servidor
+  (sin credenciales)". Se agregaron 2 tests unitarios nuevos en
+  `src/broker.rs` (`publish_failed_display_never_changes_...`,
+  `publish_failed_debug_includes_the_real_source_lapin_error`) y un test de
+  integración end-to-end nuevo en `tests/scan_submission.rs`
+  (`scan_submission_broker_publish_failure_response_is_unchanged_when_logging_the_real_error`,
+  con un doble `AlwaysFailsToPublish`) que confirma que `POST /api/scans`
+  sigue respondiendo `502` con el mismo cuerpo exacto de antes, sin filtrar
+  el detalle interno del `lapin::Error`.
+- **Verificación:** `cargo build`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo fmt --check`, `cargo test` (todo verde, incluye el test
+  nuevo; ninguna feature 1-18 se rompió) y `./init.sh` completo (Docker
+  disponible: los `#[ignore]` también pasaron, incluido `cargo doc
+  --no-deps` sin warnings) — todo en verde. Detalle completo en
+  `progress/impl_log_broker_publish_errors.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 4 criterios de aceptación uno por uno
+  contra el código/tests (líneas concretas citadas), confirmar por `git
+  diff docs/security-scope.md` vacío que el documento sigue siendo preciso
+  sin cambios, y confirmar que los demás `tracing::error!/warn!` de
+  `src/broker.rs` no fueron tocados (sin scope creep). Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_log_broker_publish_errors.md`.
+- **Estado final:** feature 19 (`log_broker_publish_errors`) pasó a
+  `"done"` en `feature_list.json`.

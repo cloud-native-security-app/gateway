@@ -901,7 +901,14 @@ impl IntoResponse for ScanCancelError {
             }
             ScanCancelError::Usuarios(err) => err.into_response(),
             ScanCancelError::Broker(err) => {
-                tracing::error!(error = %err, "fallo al publicar la cancelación de escaneo en el Broker");
+                // `?err` (Debug), no `%err` (Display): `BrokerError` deriva
+                // `Debug` y sus variantes anotan el `lapin::Error` original
+                // como `#[source]` (ver `src/broker.rs`), así que el Debug
+                // derivado encadena esa causa real en el log del servidor —
+                // a propósito nunca en el `Display`, que es lo único que
+                // llega a un llamante HTTP (feature `log_broker_publish_errors`,
+                // `docs/security-scope.md`).
+                tracing::error!(error = ?err, "fallo al publicar la cancelación de escaneo en el Broker");
                 (
                     StatusCode::BAD_GATEWAY,
                     "no se pudo encolar la cancelación del escaneo".to_string(),
@@ -1521,7 +1528,11 @@ impl IntoResponse for ScanSubmitError {
             }
             ScanSubmitError::Usuarios(err) => err.into_response(),
             ScanSubmitError::Broker(err) => {
-                tracing::error!(error = %err, "fallo al publicar la solicitud de escaneo en el Broker");
+                // `?err` (Debug), no `%err` (Display): ver la misma nota en
+                // `ScanCancelError::Broker` arriba — este era el call site
+                // nombrado explícitamente por el incidente de producción que
+                // motivó la feature `log_broker_publish_errors`.
+                tracing::error!(error = ?err, "fallo al publicar la solicitud de escaneo en el Broker");
                 (
                     StatusCode::BAD_GATEWAY,
                     "no se pudo encolar la solicitud de escaneo".to_string(),

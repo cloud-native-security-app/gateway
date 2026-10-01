@@ -645,8 +645,14 @@ impl BrokerConsumer {
         {
             Ok(consumer) => consumer,
             Err(source) => {
+                // `?` (Debug), no `%` (Display): mismo criterio que
+                // `src/api.rs` (feature `log_broker_publish_errors`) — el
+                // Debug derivado de `BrokerError` encadena el `lapin::Error`
+                // original (`#[source]`) en el log del servidor, sin tocar
+                // el `Display` (nunca expuesto a ningún llamante HTTP de
+                // todos modos, este call site solo loggea).
                 tracing::error!(
-                    error = %BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
+                    error = ?BrokerError::ConsumeFailed { queue: QUEUE_GATEWAY_SCAN_OUTCOMES, source },
                     "no se pudo iniciar el consumo de gateway.scan-outcomes"
                 );
                 return;
@@ -731,6 +737,44 @@ mod tests {
         assert_eq!(
             build_amqps_uri("amqps://gateway:secret@broker.lab:5671/", "security-app"),
             "amqps://gateway:secret@broker.lab:5671/security-app"
+        );
+    }
+
+    #[test]
+    fn publish_failed_display_never_changes_regardless_of_the_source_lapin_error() {
+        // Mismo `Display` (el único mensaje que puede llegar a un llamante
+        // HTTP, ver `src/api.rs`) sin importar el `lapin::Error` real detrás
+        // -- feature `log_broker_publish_errors`: el fix agrega el detalle
+        // real al logger del servidor (`?err`, Debug), nunca al `Display`.
+        let err = BrokerError::PublishFailed {
+            exchange: "scan.requests".to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "no se pudo publicar en el exchange 'scan.requests'"
+        );
+        assert!(!err.to_string().contains("ChannelsLimitReached"));
+    }
+
+    #[test]
+    fn publish_failed_debug_includes_the_real_source_lapin_error() {
+        // A diferencia del `Display` de arriba, el `Debug` derivado SÍ debe
+        // encadenar el `lapin::Error` original (vía el `#[source]` de
+        // `thiserror`) -- es justamente lo que ahora consume `tracing::error!`
+        // con `?err` en `src/api.rs`/`src/broker.rs` para no perder la causa
+        // real en el log del servidor.
+        let err = BrokerError::PublishFailed {
+            exchange: "scan.requests".to_string(),
+            source: lapin::Error::ChannelsLimitReached,
+        };
+
+        let debug_output = format!("{err:?}");
+        assert!(
+            debug_output.contains("ChannelsLimitReached"),
+            "el Debug de BrokerError::PublishFailed debe incluir el lapin::Error real: \
+             {debug_output}"
         );
     }
 
