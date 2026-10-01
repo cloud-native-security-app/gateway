@@ -1287,14 +1287,37 @@ struct CallbackParams {
     state: Option<String>,
 }
 
+/// Errores de `GET /auth/callback`, agregando los del propio handshake OIDC
+/// ([`AuthError`]) y los de garantizar el perfil en `ms-usuarios` antes de
+/// emitir la sesión ([`UsuariosClientError`], feature
+/// `provision_user_profile_on_login`) en un único tipo con su propio mapeo a
+/// un status HTTP explícito — mismo patrón que [`ScanSubmitError`].
+#[derive(Debug, thiserror::Error)]
+enum CallbackError {
+    /// Fallo del propio handshake OIDC (código/state ausente o inválido, ID
+    /// token inválido/expirado/con audiencia o nonce inesperados).
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    /// Fallo al garantizar (`PUT /users/me`) que exista la fila de `users`
+    /// en `ms-usuarios` para esta identidad, antes de emitir la cookie de
+    /// sesión.
+    #[error(transparent)]
+    Usuarios(#[from] UsuariosClientError),
+}
+
 /// Intercambia el código de autorización por tokens, valida el ID token del
-/// proveedor de identidad y, si es válido, emite la sesión propia de este
-/// Gateway como cookie `HttpOnly` + `Secure` + `SameSite=Strict`, y redirige
-/// (`302`) de vuelta a `front` (feature `post_login_redirect`): `front`
-/// inicia el login con una navegación de página completa
-/// (`window.location.href`, ver `front/src/auth/LoginButton.tsx`), así que
-/// sin este redirect el navegador queda en una página en blanco tras
-/// completar el login con Google.
+/// proveedor de identidad y, si es válido, garantiza (`PUT /users/me`, feature
+/// `provision_user_profile_on_login`) que exista la fila de `users`
+/// correspondiente en `ms-usuarios` — sin eso, cualquier INSERT posterior que
+/// referencie esa fila (`network_credentials`, histórico de escaneos)
+/// rompería con una violación de foreign key (ver
+/// `docs/architecture.md`/bug de producción en AWS). Solo entonces emite la
+/// sesión propia de este Gateway como cookie `HttpOnly` + `Secure` +
+/// `SameSite=Strict`, y redirige (`302`) de vuelta a `front` (feature
+/// `post_login_redirect`): `front` inicia el login con una navegación de
+/// página completa (`window.location.href`, ver
+/// `front/src/auth/LoginButton.tsx`), así que sin este redirect el navegador
+/// queda en una página en blanco tras completar el login con Google.
 ///
 /// El destino del redirect es siempre [`AppState::front_base_url`] (tomado
 /// de configuración) — **nunca** se concatena ni se refleja ningún parámetro
@@ -1302,26 +1325,31 @@ struct CallbackParams {
 /// (ver `docs/security-scope.md`).
 ///
 /// Rechaza el callback (sin crear sesión ni redirigir) si falta o no
-/// coincide el `state` (mitigación CSRF), si falta el código, o si el ID
-/// token es inválido, expiró, o tiene una audiencia/emisor/nonce
-/// inesperados.
+/// coincide el `state` (mitigación CSRF), si falta el código, si el ID token
+/// es inválido, expiró, o tiene una audiencia/emisor/nonce inesperados, o si
+/// `ms-usuarios` no pudo confirmar el perfil (`502`/`504`) — en ese último
+/// caso tampoco se emite la cookie de sesión, para no dejar nunca un usuario
+/// con sesión válida pero sin fila en `ms-usuarios` (ver
+/// `docs/security-scope.md`).
 #[utoipa::path(
     get,
     path = "/auth/callback",
     tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 302, description = "Sesión propia emitida como cookie HttpOnly + Secure + SameSite=Strict tras validar el ID token; el header Location redirige siempre a la URL de front fijada en configuración (FRONT_BASE_URL), nunca a un valor derivado de la request."),
+        (status = 302, description = "Sesión propia emitida como cookie HttpOnly + Secure + SameSite=Strict tras validar el ID token y confirmar el perfil en ms-usuarios; el header Location redirige siempre a la URL de front fijada en configuración (FRONT_BASE_URL), nunca a un valor derivado de la request."),
         (status = 400, description = "Falta el parámetro `state`/`code`, o el `state` no coincide con ningún login vigente."),
         (status = 401, description = "El ID token es inválido, expiró, o tiene una audiencia/emisor/nonce inesperados."),
-        (status = 500, description = "No se pudo completar el descubrimiento OIDC o emitir la sesión propia.")
+        (status = 500, description = "No se pudo completar el descubrimiento OIDC o emitir la sesión propia."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado al garantizar el perfil."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios para garantizar el perfil.")
     )
 )]
 async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
     jar: CookieJar,
-) -> Result<(CookieJar, Response), AuthError> {
+) -> Result<(CookieJar, Response), CallbackError> {
     let state_param = params.state.ok_or(AuthError::MissingState)?;
     let (nonce, pkce_verifier) = state
         .login_states
@@ -1341,6 +1369,20 @@ async fn callback(
         name: identity.name,
         exp,
     };
+
+    // Feature `provision_user_profile_on_login`: garantiza la fila de
+    // `users` en `ms-usuarios` *antes* de emitir la cookie de sesión/redirigir
+    // a front, usando únicamente `session.name` (ya verificado del ID token
+    // de Google) — nunca un valor derivado de esta request (ver
+    // `docs/security-scope.md`). Un fallo aquí se propaga (`?`) sin llegar a
+    // issuar cookie ni 302.
+    state
+        .usuarios_client
+        .upsert_profile(
+            &session,
+            &serde_json::json!({ "display_name": session.name }),
+        )
+        .await?;
 
     let token = auth::issue_session_token(
         &session,
@@ -1458,6 +1500,15 @@ impl IntoResponse for UsuariosClientError {
         tracing::warn!(error = %self, %status, "fallo al comunicarse con el servicio de usuarios");
 
         (status, self.to_string()).into_response()
+    }
+}
+
+impl IntoResponse for CallbackError {
+    fn into_response(self) -> Response {
+        match self {
+            CallbackError::Auth(err) => err.into_response(),
+            CallbackError::Usuarios(err) => err.into_response(),
+        }
     }
 }
 

@@ -253,6 +253,24 @@
         "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (incluidos --ignored) e ./init.sh pasan en verde"
       ],
       "status": "done"
+    },
+    {
+      "id": 17,
+      "name": "provision_user_profile_on_login",
+      "title": "Fix: crear el perfil en ms-usuarios durante el login, no dejarlo huérfano",
+      "description": "Bug de integración confirmado en producción (AWS): POST /api/network-credentials responde 502 para cualquier cuenta real. Causa raíz confirmada en ms-usuarios: network_credentials.user_id tiene REFERENCES users(user_id) (migración 20260920120000_create_network_credentials.sql), y la única vía que crea una fila en users es PUT /users/me (handler put_profile, src/api.rs, que llama repository::upsert_user). El callback OIDC de este Gateway (fn callback, src/api.rs) nunca llama a UsuariosClient::upsert_profile tras validar el ID token, y front tampoco tiene ninguna pantalla de perfil que lo dispare -se confirmó revisando front/src completo-. Resultado: NINGUNA cuenta que entra por Google llega jamás a tener fila en users, así que cualquier INSERT posterior que referencie user_id (network_credentials, y previsiblemente también scan_history y audit_log, mismo REFERENCES users(user_id)) choca con una violación de foreign key (Postgres 23503) que hoy se ve en el log del servidor gracias a la feature log_repo_errors, pero el cliente solo recibe un 502/500 genérico. Decisión de diseño (ver conversación con el usuario): el fix va en este Gateway, en el momento del login, no como upsert defensivo repetido en cada endpoint de ms-usuarios.",
+      "acceptance": [
+        "En fn callback (src/api.rs), inmediatamente después de construir Session y antes de issuar la cookie de sesión/redirigir a front, se llama a state.usuarios_client.upsert_profile(&session, ...) para garantizar que la fila de users exista en ms-usuarios antes de que el navegador llegue a cualquier pantalla protegida",
+        "El body que se envía es el payload mínimo que ya exige UpsertProfileRequest en ms-usuarios ({\"display_name\": ...}) usando session.name (el nombre ya verificado del ID token de Google, el mismo campo que Session ya guarda) — nunca un valor derivado de query/body de la request de callback, mismo principio de no-input-no-verificado ya documentado para este handler",
+        "No se crea ningún tipo ni endpoint nuevo en usuarios_client.rs: se reutiliza UsuariosClient::upsert_profile y el tipo UserProfile (serde_json::Value) ya existentes, exactamente como ya los usa el proxy GET/PUT /api/profile",
+        "Si upsert_profile falla (error de red o respuesta no-2xx de ms-usuarios), el callback NO emite la cookie de sesión ni el 302 a front — se propaga como error (mismo patrón ya usado en submit_scan con create_scan_history vía UsuariosClientError/?), para no dejar nunca un usuario con cookie de sesión válida pero sin fila en ms-usuarios",
+        "Camino feliz sin cambios observables: con ms-usuarios respondiendo bien, /auth/callback sigue devolviendo 302 a FRONT_BASE_URL con la misma cookie de sesión que antes (mismo contrato que la feature post_login_redirect, ya done)",
+        "Logins repetidos con la misma cuenta de Google no fallan ni duplican filas (ya garantizado por el ON CONFLICT (user_id) DO UPDATE existente en ms-usuarios — este fix no toca ms-usuarios, solo confirma que sigue valiendo)",
+        "Test de integración nuevo en tests/oidc_login.rs: con el servidor de test que ya simula ms-usuarios, un callback exitoso dispara también un PUT /users/me con el header de identidad esperado y el display_name correcto antes del 302; un callback donde ese PUT /users/me responde 5xx no emite Set-Cookie de sesión ni 302, y responde con un error coherente con el resto del Gateway (502/504, nunca detalle interno en el cuerpo)",
+        "docs/security-scope.md actualizado: menciona esta llamada nueva desde el callback y reafirma que display_name sale siempre de la identidad ya verificada, nunca de un input sin verificar",
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test e ./init.sh pasan en verde"
+      ],
+      "status": "done"
     }
   ]
 }

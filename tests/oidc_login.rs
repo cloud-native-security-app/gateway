@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::HeaderValue;
-use axum::routing::{get, post};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -22,7 +22,7 @@ use gateway::api::{auth_router, AppState, ScanOwnershipRegistry, ScanSubmissionR
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::realtime::RealtimeRegistry;
-use gateway::usuarios_client::UsuariosClient;
+use gateway::usuarios_client::{UsuariosClient, FORWARDED_USER_HEADER_NAME};
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
     RSAKeyParameters, RSAKeyType,
@@ -50,6 +50,12 @@ const TEST_FRONT_BASE_URL: &str = "https://front.lab/post-login";
 /// pero [`AppState::front_origin`](gateway::api::AppState::front_origin) es
 /// un campo requerido del struct.
 const TEST_FRONT_ORIGIN: &str = "https://front.lab";
+/// URL de `ms-usuarios` de laboratorio que nunca se contacta: usada en los
+/// tests de esta feature que fallan (callback) o terminan (login/logout)
+/// antes de llegar a `PUT /users/me` (feature
+/// `provision_user_profile_on_login`), para no tener que levantar un stub
+/// real donde no hace falta.
+const NEVER_CONTACTED_USUARIOS_BASE_URL: &str = "http://ms-usuarios.invalid";
 
 /// Doble de prueba de [`ScanRequestPublisher`]: esta feature (`oidc_login`)
 /// no ejerce `POST /api/scans`, así que un `AppState` de prueba solo
@@ -232,6 +238,85 @@ async fn spawn_test_idp(jwks: JwkSet) -> TestIdp {
     }
 }
 
+/// Llamada a `PUT /users/me` capturada por [`spawn_usuarios_upsert_stub`]
+/// (feature `provision_user_profile_on_login`): el header de identidad
+/// reenviado y el `display_name` recibido en el cuerpo.
+#[derive(Debug, Clone)]
+struct CapturedUpsertCall {
+    forwarded_user_header: Option<String>,
+    display_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct UsuariosUpsertStubState {
+    captured: Arc<Mutex<Option<CapturedUpsertCall>>>,
+    fail: bool,
+}
+
+async fn put_users_me(
+    State(state): State<UsuariosUpsertStubState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let forwarded_user_header = headers
+        .get(FORWARDED_USER_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let display_name = body
+        .get("display_name")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    *state
+        .captured
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(CapturedUpsertCall {
+        forwarded_user_header,
+        display_name,
+    });
+
+    if state.fail {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "fallo simulado de ms-usuarios"})),
+        )
+    } else {
+        (StatusCode::OK, Json(body))
+    }
+}
+
+/// Levanta un stub de `ms-usuarios` de prueba que solo implementa
+/// `PUT /users/me` (único endpoint que ejerce el callback OIDC desde la
+/// feature `provision_user_profile_on_login`), capturando cada llamada
+/// recibida. Si `fail` es `true`, responde `500` a toda solicitud (simula un
+/// `ms-usuarios` que no pudo confirmar el perfil).
+async fn spawn_usuarios_upsert_stub(
+    fail: bool,
+) -> (String, Arc<Mutex<Option<CapturedUpsertCall>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind del stub de ms-usuarios");
+    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
+
+    let captured = Arc::new(Mutex::new(None));
+    let state = UsuariosUpsertStubState {
+        captured: captured.clone(),
+        fail,
+    };
+
+    let app = Router::new()
+        .route("/users/me", put(put_users_me))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("servidor del stub de ms-usuarios");
+    });
+
+    (format!("http://{addr}"), captured)
+}
+
 /// Instancia del router de autenticación de este Gateway bajo prueba, ya
 /// escuchando en un puerto efímero.
 struct GatewayUnderTest {
@@ -239,7 +324,7 @@ struct GatewayUnderTest {
     session_signing_key: SecretString,
 }
 
-async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
+async fn spawn_gateway(oidc_issuer_url: &str, usuarios_base_url: &str) -> GatewayUnderTest {
     let oidc_client = OidcClient::discover(
         oidc_issuer_url,
         TEST_CLIENT_ID,
@@ -251,10 +336,13 @@ async fn spawn_gateway(oidc_issuer_url: &str) -> GatewayUnderTest {
 
     let session_signing_key = SecretString::from("lab-only-not-a-real-secret".to_string());
 
-    // Esta feature no ejercita `usuarios_client`: apunta a una URL de
-    // laboratorio que nunca se contacta en estos tests.
+    // Feature `provision_user_profile_on_login`: el callback ahora llama a
+    // `PUT /users/me` antes de emitir la cookie de sesión, así que cada test
+    // debe decidir si le basta con una URL nunca contactada
+    // ([`NEVER_CONTACTED_USUARIOS_BASE_URL`]) o si necesita un stub real
+    // ([`spawn_usuarios_upsert_stub`]).
     let usuarios_client = UsuariosClient::new(
-        "http://ms-usuarios.invalid".to_string(),
+        usuarios_base_url.to_string(),
         SecretString::from("lab-only-not-a-real-secret".to_string()),
     )
     .expect("cliente de laboratorio hacia ms-usuarios debe construirse");
@@ -345,7 +433,7 @@ async fn login_redirects_to_authorization_endpoint_with_oidc_params() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     let response = http
@@ -391,7 +479,8 @@ async fn callback_with_valid_id_token_creates_session() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let (usuarios_base_url, _captured_upsert_calls) = spawn_usuarios_upsert_stub(false).await;
+    let gateway = spawn_gateway(&idp.issuer_url, &usuarios_base_url).await;
     let http = http_client_no_redirects();
 
     let (state_value, nonce_value) = start_login(&http, &gateway).await;
@@ -495,7 +584,8 @@ async fn callback_success_redirect_ignores_extra_query_params() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let (usuarios_base_url, _captured_upsert_calls) = spawn_usuarios_upsert_stub(false).await;
+    let gateway = spawn_gateway(&idp.issuer_url, &usuarios_base_url).await;
     let http = http_client_no_redirects();
 
     let (state_value, nonce_value) = start_login(&http, &gateway).await;
@@ -546,7 +636,7 @@ async fn callback_rejects_id_token_with_wrong_audience() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     let (state_value, nonce_value) = start_login(&http, &gateway).await;
@@ -586,7 +676,7 @@ async fn callback_rejects_expired_id_token() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     let (state_value, nonce_value) = start_login(&http, &gateway).await;
@@ -631,7 +721,7 @@ async fn callback_rejects_id_token_with_invalid_signature() {
         keys: vec![published_key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     let (state_value, nonce_value) = start_login(&http, &gateway).await;
@@ -671,7 +761,7 @@ async fn callback_rejects_missing_state() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     let response = http
@@ -697,7 +787,7 @@ async fn callback_rejects_state_that_does_not_match_any_pending_login() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     // Ni siquiera iniciamos un login: cualquier `state` es "no vigente".
@@ -724,7 +814,7 @@ async fn logout_clears_the_session_cookie() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     // Simula un navegador que ya tiene la cookie de sesión (como quedaría
@@ -764,7 +854,7 @@ async fn logout_without_session_cookie_still_emits_an_expired_set_cookie() {
         keys: vec![key.jwk.clone()],
     })
     .await;
-    let gateway = spawn_gateway(&idp.issuer_url).await;
+    let gateway = spawn_gateway(&idp.issuer_url, NEVER_CONTACTED_USUARIOS_BASE_URL).await;
     let http = http_client_no_redirects();
 
     // Detrás de un proxy/ALB la cookie puede no llegar al Gateway: el
@@ -807,4 +897,147 @@ async fn logout_without_session_cookie_still_emits_an_expired_set_cookie() {
         .to_str()
         .expect("Clear-Site-Data debe ser ASCII válido");
     assert_eq!(clear_site_data, "\"cookies\"");
+}
+
+/// Feature `provision_user_profile_on_login`: un callback exitoso debe
+/// garantizar el perfil en `ms-usuarios` (`PUT /users/me`, con la identidad
+/// ya verificada y `display_name` tomado de `session.name`) antes de emitir
+/// la cookie/redirigir, no después.
+#[tokio::test]
+async fn callback_success_calls_upsert_profile_before_redirecting() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let (usuarios_base_url, captured) = spawn_usuarios_upsert_stub(false).await;
+    let gateway = spawn_gateway(&idp.issuer_url, &usuarios_base_url).await;
+    let http = http_client_no_redirects();
+
+    let (state_value, nonce_value) = start_login(&http, &gateway).await;
+
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(&key, &claims));
+
+    let response = http
+        .get(format!(
+            "http://{}/auth/callback?code=irrelevant-code&state={state_value}",
+            gateway.addr
+        ))
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FOUND,
+        "ms-usuarios respondiendo bien no debe cambiar el camino feliz (302)"
+    );
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .is_some(),
+        "un callback exitoso debe emitir la cookie de sesión"
+    );
+
+    let call = captured
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+        .expect("el callback debe haber llamado a PUT /users/me antes del 302");
+
+    let forwarded_user_header = call
+        .forwarded_user_header
+        .expect("debe reenviar el header de identidad esperado por ms-usuarios");
+    let decoded_identity: serde_json::Value = serde_json::from_str(&forwarded_user_header)
+        .expect("el header de identidad debe ser JSON válido");
+    assert_eq!(decoded_identity["sub"], "google-sub-123");
+    assert_eq!(decoded_identity["email"], "user@example.com");
+
+    assert_eq!(
+        call.display_name,
+        Some("Test User".to_string()),
+        "display_name debe salir de session.name (el ID token ya verificado), no de la request"
+    );
+}
+
+/// Feature `provision_user_profile_on_login`: si `PUT /users/me` falla
+/// (`5xx` de `ms-usuarios`), el callback no debe emitir la cookie de sesión
+/// ni el `302` a front, y el error no debe filtrar la URL interna de
+/// `ms-usuarios` en el cuerpo de la respuesta.
+#[tokio::test]
+async fn callback_when_usuarios_upsert_fails_does_not_create_session_or_redirect() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let (usuarios_base_url, captured) = spawn_usuarios_upsert_stub(true).await;
+    let gateway = spawn_gateway(&idp.issuer_url, &usuarios_base_url).await;
+    let http = http_client_no_redirects();
+
+    let (state_value, nonce_value) = start_login(&http, &gateway).await;
+
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(&key, &claims));
+
+    let response = http
+        .get(format!(
+            "http://{}/auth/callback?code=irrelevant-code&state={state_value}",
+            gateway.addr
+        ))
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+
+    assert!(
+        response.status() == reqwest::StatusCode::BAD_GATEWAY
+            || response.status() == reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "un fallo de ms-usuarios al confirmar el perfil debe ser 502/504, no {}",
+        response.status()
+    );
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .is_none(),
+        "un fallo de ms-usuarios no debe emitir cookie de sesión"
+    );
+    assert!(
+        response.headers().get(reqwest::header::LOCATION).is_none(),
+        "un fallo de ms-usuarios no debe redirigir (302) a front"
+    );
+
+    let body = response.text().await.expect("debe poder leer el cuerpo");
+    assert!(
+        !body.contains(&usuarios_base_url) && !body.contains("127.0.0.1"),
+        "el cuerpo de error nunca debe exponer la URL interna de ms-usuarios: {body}"
+    );
+
+    assert!(
+        captured
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some(),
+        "el stub debe haber recibido el intento de PUT /users/me"
+    );
 }

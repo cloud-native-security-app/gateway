@@ -1125,3 +1125,74 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
 - **Estado final:** feature 16 (`robust_logout`) pasó a `"done"` en
   `feature_list.json`. Era la última feature listada en
   `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-10-01 — Feature 17: provision_user_profile_on_login — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  fix acotado a un solo handler, reutiliza `UsuariosClient::upsert_profile`
+  y `UserProfile` ya existentes, sin crates ni APIs externas nuevas).
+- **Contexto:** bug de integración confirmado en producción (AWS):
+  `POST /api/network-credentials` respondía `502` para cualquier cuenta
+  real. Causa raíz confirmada en `ms-usuarios`:
+  `network_credentials.user_id REFERENCES users(user_id)`, y la única vía
+  que crea esa fila es `PUT /users/me` — el callback OIDC de este Gateway
+  nunca lo llamaba, así que ninguna cuenta que entra por Google llegaba a
+  tener fila en `users`, y cualquier `INSERT` posterior con esa FK rompía
+  con una violación de foreign key vista solo como `502`/`500` genérico del
+  lado del cliente. Decisión de diseño (acordada con el usuario): el fix va
+  en este Gateway, en el momento del login, no como upsert defensivo
+  repetido en cada endpoint de `ms-usuarios`.
+- **Qué se hizo:** en `fn callback` (`src/api.rs`), inmediatamente después
+  de construir `Session` y antes de `auth::issue_session_token`/emitir la
+  cookie/redirigir, se agregó una llamada a
+  `state.usuarios_client.upsert_profile(&session, &serde_json::json!({ "display_name": session.name }))`
+  — `display_name` sale siempre de `session.name` (ya verificado del ID
+  token de Google), nunca de un parámetro de la request de callback. Nuevo
+  enum `CallbackError` (`thiserror`, `#[error(transparent)]` sobre
+  `AuthError`/`UsuariosClientError`, mismo patrón que `ScanSubmitError`),
+  con `fn callback` devolviendo `Result<(CookieJar, Response), CallbackError>`
+  en vez de `Result<_, AuthError>`; un fallo de `upsert_profile` se propaga
+  con `?` sin llegar a issuar cookie ni `302`, delegando en el `IntoResponse`
+  ya existente de cada error (sin inventar un mapeo HTTP nuevo). El
+  `#[utoipa::path(...)]` de `/auth/callback` se amplió con las respuestas
+  `502`/`504` (el `302` del camino feliz no cambia). No se tocó
+  `usuarios_client.rs`: se reutilizan `UsuariosClient::upsert_profile` y
+  `UserProfile` (`serde_json::Value`) tal cual los usaba ya el proxy
+  `GET`/`PUT /api/profile`. En `tests/oidc_login.rs`, `spawn_gateway` ganó
+  un parámetro `usuarios_base_url` (antes apuntaba siempre a una URL
+  inválida nunca contactada, lo que habría roto el camino feliz tras el
+  fix); se agregó un stub real de `ms-usuarios` (`PUT /users/me` sobre un
+  puerto efímero, con modo `fail` para simular `5xx`) y 2 tests nuevos:
+  éxito dispara `PUT /users/me` con el header de identidad y
+  `display_name` correctos antes del `302`/`Set-Cookie`; un `5xx` de
+  `ms-usuarios` no emite cookie ni `302` y responde `502` sin exponer la
+  URL interna del stub en el cuerpo. `docs/security-scope.md` ganó una
+  viñeta nueva en "Identidad y sesión" documentando esta llamada y
+  reafirmando el origen verificado de `display_name`.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (todos los tests de las
+  features 1-16 siguen en verde, incluidos los 12 de `tests/oidc_login.rs`
+  con los 2 nuevos y los 2 de `tests/openapi_docs.rs` sin tocar), `cargo
+  test -- --ignored` (Docker disponible: los 3 tests con RabbitMQ real
+  —`scan_submission`, `scan_outcome_relay`, `scan_history_and_cancellation`—
+  siguen en verde), `cargo doc --no-deps` y `./init.sh` — todo en verde, 0
+  warnings. Detalle completo en
+  `progress/impl_provision_user_profile_on_login.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 9 criterios de aceptación uno por
+  uno contra el código y los tests (líneas concretas citadas), confirmar
+  que `tests/openapi_docs.rs` (anti-drift) sigue pasando sin cambios
+  manuales a pesar de que el shape de `#[utoipa::path]` de `/auth/callback`
+  cambió, confirmar por `git diff --stat` que el alcance se limitó a
+  `docs/security-scope.md`, `src/api.rs` y `tests/oidc_login.rs` (sin tocar
+  `usuarios_client.rs` ni ningún repo hermano), y confirmar que ningún log
+  o cuerpo de error filtra el token de Google, la sesión firmada, la
+  credencial de `ms-usuarios` o la credencial AMQPS. Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_provision_user_profile_on_login.md`.
+- **Estado final:** feature 17 (`provision_user_profile_on_login`) pasó a
+  `"done"` en `feature_list.json`. No quedan features `pending` ni
+  `in_progress` en `feature_list.json` a la fecha de este cierre.
