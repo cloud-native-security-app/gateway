@@ -1196,3 +1196,83 @@ bitácora la añade la sesión que implemente la feature 1 (`scaffolding`)._
 - **Estado final:** feature 17 (`provision_user_profile_on_login`) pasó a
   `"done"` en `feature_list.json`. No quedan features `pending` ni
   `in_progress` en `feature_list.json` a la fecha de este cierre.
+
+---
+
+## 2026-10-01 — Feature 18: broker_publisher_reconnect — DONE
+
+- **Agente:** leader (orquestando implementer + reviewer, sin explorers:
+  refactor de concurrencia acotado a un struct de `src/broker.rs`, sin
+  crates nuevas — `tokio::sync::RwLock` ya es dependencia transitiva de
+  `tokio`).
+- **Investigación previa:** el leader confirmó la estructura real de
+  `BrokerPublisher` (`connection`/`channel` como campos directos, sin
+  interior-mutability ni datos guardados para reconectar) y que
+  `publish_and_confirm` ya diferenciaba `PublishFailed`/`ConnectionFailed`
+  de `NotAcknowledged` antes de despachar al implementer. Incidente real en
+  AWS documentado en la propia feature: ECS reemplaza la task de RabbitMQ
+  tras un health check fallido, la `Connection`/`Channel` de `gateway`
+  queda apuntando a una instancia muerta, y todo `POST /api/scans` falla
+  con `502` hasta reiniciar `gateway` a mano, aunque RabbitMQ ya esté sano.
+- **Qué se hizo:** `src/broker.rs` — `BrokerPublisher` guarda su conexión y
+  canal vigentes agrupados en un struct privado `PublisherConnection`
+  detrás de `conn: RwLock<PublisherConnection>`, junto con `amqps_url:
+  SecretString`, `vhost: String` y `ca_pem: Option<String>` (fuente para
+  reconstruir `OwnedTLSConfig` al reconectar, ya que ese tipo de `lapin`/
+  `tcp-stream` 0.28.0 no deriva `Clone`). `connect`/`connect_with_ca_pem`
+  no cambiaron de firma pública. `publish_and_confirm` se dividió en un
+  intento base (`try_publish_and_confirm`, solo toma un `read()` del lock —
+  publicaciones sanas concurrentes no se serializan entre sí) y la lógica
+  de reconexión: si el primer intento falla con un error de conexión
+  (`is_connection_error`, nueva función privada que distingue
+  `PublishFailed`/`ConnectionFailed` de `NotAcknowledged` — un nack real
+  nunca dispara reconexión), se reconecta exactamente una vez
+  (`reconnect()`, que escala a `write()` y hace *double-checked locking*:
+  si otra tarea ya reconectó mientras esta esperaba el lock, no abre una
+  segunda conexión real) y se reintenta la publicación una sola vez,
+  propagando siempre el error **original** del primer intento si la
+  reconexión o el reintento también fallan. `is_connected()` pasó de
+  síncrona a `async fn` (ahora lee a través del lock); se verificó en todo
+  el repo que ningún llamante de producción ni de tests la invocaba
+  todavía, así que el cambio no rompe ningún contrato existente.
+  `BrokerConsumer` no se tocó de forma observable (comparte
+  `connect_channel`, sin cambios; sigue sin reconexión, documentado
+  explícitamente en la nota de diseño del módulo, que ahora distingue el
+  comportamiento del publicador del consumidor). Nuevo archivo
+  `tests/broker_publisher_reconnect.rs` (`#[ignore = "requiere Docker"]`,
+  mismo patrón `testcontainers` que `scan_submission.rs`/
+  `scan_outcome_relay.rs`): fuerza el cierre de la conexión AMQP
+  subyacente de un `BrokerPublisher` real vía la Management HTTP API de
+  `rabbitmq:4.3.5-management` (`DELETE /api/connections/{name}`, con el
+  usuario `lab-admin`, más simple y determinista que reiniciar el
+  contenedor entero), espera con polling acotado a que `is_connected()`
+  refleje el corte, y confirma que una publicación posterior tiene éxito
+  —verificando el mensaje real en una cola de prueba, no solo el resultado
+  del método— sin reiniciar el proceso ni reconstruir el publicador (misma
+  instancia de principio a fin). 4 tests unitarios nuevos para
+  `is_connection_error`.
+- **Verificación:** `cargo build`, `cargo fmt --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo test` (65 unitarios + toda la
+  suite de integración sin Docker en verde, ninguna feature 1-17 se
+  rompió), `cargo test -- --ignored` (Docker disponible: todos los
+  `#[ignore]` en verde, incluido el nuevo de esta feature), `cargo doc
+  --no-deps` (se corrigió un warning de `rustdoc::private_intra_doc_links`
+  detectado en esta misma verificación) y `./init.sh` — todo en verde, 0
+  warnings. Detalle completo en
+  `progress/impl_broker_publisher_reconnect.md`.
+- **Revisión:** `reviewer` aprobó (`APPROVED`) tras re-ejecutar de forma
+  independiente todos los comandos de verificación (incluido el bloque
+  `--ignored` con Docker), validar los 7 criterios de aceptación uno por
+  uno contra el código y los tests (líneas concretas citadas), confirmar
+  con `rg "is_connected" .` en todo el repo que el cambio sync→async no
+  rompe ningún llamante existente, confirmar por `git diff` que
+  `src/wiring.rs` y el trait `ScanRequestPublisher` no cambiaron, y que las
+  únicas líneas tocadas de `BrokerConsumer` son comentarios de la nota de
+  diseño del módulo. Confirmó que la credencial AMQPS sigue sin loggearse
+  (`amqps_url`/`ca_pem` nunca aparecen en un log, `BrokerPublisher`/
+  `PublisherConnection` no derivan `Debug`) y que no hay `unwrap`/`expect`/
+  `panic!` nuevos fuera de tests en `src/broker.rs`. Sin cambios
+  requeridos. Detalle completo en
+  `progress/review_broker_publisher_reconnect.md`.
+- **Estado final:** feature 18 (`broker_publisher_reconnect`) pasó a
+  `"done"` en `feature_list.json`.

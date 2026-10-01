@@ -271,6 +271,35 @@
         "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test e ./init.sh pasan en verde"
       ],
       "status": "done"
+    },
+    {
+      "id": 18,
+      "name": "broker_publisher_reconnect",
+      "title": "Resiliencia: BrokerPublisher reconecta tras perder la conexión AMQPS",
+      "description": "Incidente confirmado en AWS: BrokerPublisher::connect (src/broker.rs) se conecta UNA sola vez al arrancar gateway (wiring.rs, Arc<BrokerPublisher> compartido) y no tiene ninguna lógica de reconexión. Cuando la task de rabbitmq se reinicia (ECS la reemplaza por fallar su health check, visto repetidas veces en producción), la Connection/Channel de gateway queda apuntando a una instancia que ya no existe, y TODO POST /api/scans falla con 502 (BrokerError::PublishFailed) hasta reiniciar gateway a mano -aunque rabbitmq ya esté sano de nuevo-. BrokerPublisher ya expone is_connected() (connection.status().connected()), pero nada lo usa para recuperarse.",
+      "acceptance": [
+        "BrokerPublisher guarda connection/channel detrás de una interior-mutability (p. ej. tokio::sync::RwLock) en vez de campos directos, conservando lo necesario para reconectar (amqps_url, vhost, tls_config) sin pedirle esos datos de nuevo al llamante",
+        "publish_and_confirm: si basic_publish o el await de la confirmación fallan con un error de conexión (BrokerError::PublishFailed/ConnectionFailed, NO BrokerError::NotAcknowledged -un nack real del Broker no es un problema de conexión y no debe disparar reconexión-), intenta exactamente UNA reconexión (repitiendo la lógica de connect_with_tls_config) y reintenta la publicación UNA sola vez antes de propagar el error original si vuelve a fallar",
+        "Reconexiones concurrentes no duplican conexiones: si dos publicaciones fallan al mismo tiempo, como máximo una reconexión real está en vuelo (la sincronización del lock alcanza, no hace falta un mecanismo aparte)",
+        "is_connected() sigue funcionando igual (refleja el estado de la conexión vigente a través del lock)",
+        "Ningún cambio de contrato en ScanRequestPublisher ni en el camino feliz: mismo comportamiento observable cuando la conexión está sana",
+        "Test de integración nuevo (testcontainers, #[ignore = \"requiere Docker\"], mismo patrón que los tests ya existentes de scan_submission.rs/scan_outcome_relay.rs): se fuerza el cierre de la conexión AMQP subyacente (o se reinicia el contenedor de rabbitmq) y se confirma que una publicación posterior tiene éxito SIN reiniciar el proceso de gateway -reproduce exactamente el incidente de producción-",
+        "cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (incluidos --ignored) e ./init.sh pasan en verde"
+      ],
+      "status": "done"
+    },
+    {
+      "id": 19,
+      "name": "log_broker_publish_errors",
+      "title": "Fix: loguear el lapin::Error real detrás de un BrokerError::PublishFailed",
+      "description": "Mismo patrón de observabilidad ya resuelto en user-service (feature log_repo_errors) pero del lado de gateway: BrokerError::PublishFailed/ConnectionFailed/ConsumeFailed guardan el lapin::Error original como #[source], a propósito nunca incluido en el mensaje Display de BrokerError (para no filtrar la URL/credencial AMQPS, ver docs/security-scope.md). El problema es que el único log existente (src/api.rs:1524, tracing::error!(error = %err, ...)) usa Display, así que ese lapin::Error real tampoco llega nunca al log del servidor -durante el incidente de RabbitMQ en AWS, el log solo decía \"no se pudo publicar en el exchange 'scan.requests'\", sin ninguna pista de la causa real, y hubo que entrar al contenedor con ECS Exec para diagnosticar a mano-.",
+      "acceptance": [
+        "El log de src/api.rs:1524 (y cualquier otro call site que loguee un BrokerError de la misma forma) agrega el lapin::Error real al log del servidor -por ejemplo con error = ?err (Debug, que sí incluye el #[source] vía el derive existente) o recorriendo std::error::Error::source() explícitamente- sin cambiar NADA del mensaje Display expuesto a ningún llamante HTTP",
+        "docs/security-scope.md sigue siendo preciso: la URL/credencial AMQPS nunca aparece en una respuesta HTTP ni en el mensaje Display de BrokerError; el cambio es exclusivamente en qué se manda al logger del servidor",
+        "Test que confirma que un BrokerError::PublishFailed simulado sigue teniendo el mismo Display/contrato externo de antes (no debe cambiar ninguna respuesta HTTP)",
+        "cargo test e ./init.sh pasan en verde"
+      ],
+      "status": "pending"
     }
   ]
 }
