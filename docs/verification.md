@@ -57,8 +57,8 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
 - Todo test de esta categoría se marca `#[ignore = "requiere Docker"]` (ver
   `docs/conventions.md`), se ejecuta con `cargo test -- --ignored`, y
   requiere Docker disponible (local o en CI). Si falla por falta de Docker,
-  se documenta como bloqueo en `progress/current.md` — no se reemplaza por
-  un mock.
+  se reporta como bloqueo en la descripción del cambio — no se reemplaza
+  por un mock.
 
 ## Anti-patrones (no hacer)
 
@@ -72,13 +72,15 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
   `docs/architecture.md` §"Dependencia pendiente") en vez de documentar el
   bloqueo.
 - ❌ Silenciar un warning de `clippy` con `#[allow(...)]` sin comentario.
-- ❌ Marcar la feature como `done` sin pasar `./init.sh`.
+- ❌ Dar una tarea por terminada sin pasar `make verify`.
 
 ## Verificación final antes de cerrar
 
 ```bash
-./init.sh           # debe terminar con [OK] Entorno listo
+make verify         # fmt + clippy + test + test --ignored + doc
+make check          # igual, sin los tests que requieren Docker
 ```
 
-Si `./init.sh` está rojo, **no** marques nada como `done`. Anota el bloqueo
-en `progress/current.md` y pon `"status": "blocked"` en `feature_list.json`.
+Si `make verify` está rojo, **no** des la tarea por terminada. Documenta el
+bloqueo (p. ej. Docker no disponible) en el documento de la tarea
+(`odd/tasks/<feature>.md`) y en la descripción del cambio.

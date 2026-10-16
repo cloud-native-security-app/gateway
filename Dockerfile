@@ -13,7 +13,7 @@
 #
 # Las imágenes base se fijan por tag concreto Y por digest (`@sha256:...`) para
 # builds reproducibles. Mismos digests que ya usa `user-service/Dockerfile`
-# (mismo `rustc`/`cargo` 1.98 que reporta `./init.sh` de este repo) — al
+# (mismo `rustc`/`cargo` 1.98 que usa `make verify` en este repo) — al
 # actualizar una base, refresca el digest con
 # `docker buildx imagetools inspect <imagen:tag>`.
 

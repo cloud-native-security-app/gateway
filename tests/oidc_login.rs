@@ -6,7 +6,7 @@
 //! contra el endpoint real de Google, tal como exige `docs/verification.md`
 //! Nivel 3 para `auth`. No dependen de Docker, por lo que corren en
 //! `cargo test` normal (decisión confirmada para esta feature, ver
-//! `progress/current.md`).
+//! `docs/decisions.md` D-01).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

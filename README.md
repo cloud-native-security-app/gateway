@@ -18,10 +18,29 @@ integración con `testcontainers`.
 
 ## Desarrollo
 
-El repositorio se desarrolla guiado por agentes de IA sobre un arnés
-documental (`AGENTS.md`, `feature_list.json`, `docs/`, `CHECKPOINTS.md`),
-igual que `broker`, `nmap-service`, `user-service` y `front`. Antes de tocar
-código, lee `CLAUDE.md`.
+Documentación de referencia, en este orden: `docs/architecture.md`
+(responsabilidades y decisiones de diseño), `docs/conventions.md`,
+`docs/verification.md`, `docs/security-scope.md` (límites de sesión, OIDC y
+credenciales) y `docs/decisions.md` (registro de decisiones técnicas).
+
+### Verificación local
+
+```
+make verify   # cargo fmt --check, clippy -D warnings, test, test --ignored, doc
+make check    # igual, sin los tests que requieren Docker
+```
+
+Requiere Rust 1.98 (el mismo del `Dockerfile`; `rustup` en `~/.cargo/bin`, que
+el `Makefile` añade al `PATH`). Los tests de integración usan `testcontainers`
+y necesitan Docker; si no está disponible, `make verify` falla en ese paso y
+se debe reportar el bloqueo, nunca reemplazar esos tests por mocks.
+
+### Desarrollo asistido por IA
+
+El trabajo con agentes usa gentle-ai: cada feature sustancial tiene un
+documento de tareas en `odd/tasks/<feature>.md` (Organic Driven Development,
+espejado en Engram bajo `odd/<feature>/tasks`). El plan maestro del despliegue
+está en el repo `infra`, `odd/tasks/cloud-native-deploy.md`.
 
 Antes de implementar la feature `scan_submission`, lee
 `docs/architecture.md` §"Dependencia pendiente": el origen de

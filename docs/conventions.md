@@ -31,7 +31,7 @@
 - **Todo test que dependa de Docker vía `testcontainers` se marca**
   `#[ignore = "requiere Docker"]`. Así `cargo test` (sin flags) corre rápido
   y sin depender de Docker, y `cargo test -- --ignored` corre específicamente
-  los de integración. `init.sh` ejecuta ambos.
+  los de integración. `make verify` ejecuta ambos.
 
 ## Nombres
 

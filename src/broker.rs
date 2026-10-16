@@ -18,7 +18,7 @@
 //! - **`lapin` 2.5.5, no 4.x**: `Cargo.lock` de este repo fija `lapin`
 //!   2.5.5, con una API de conexión distinta a la que documenta el repo
 //!   hermano `broker/` (que usa `lapin` 4.x). Ver
-//!   `progress/explore_lapin_publish.md`/`progress/explore_lapin_consume.md`
+//!   `docs/decisions.md` (D-03, D-05)
 //!   para el detalle verificado contra el código fuente real de esta
 //!   versión.
 //! - **No se declara topología**: el usuario RabbitMQ `gateway` (definido en
@@ -39,14 +39,14 @@
 //!   de "el Broker aceptó el mensaje" — distinción que necesita el criterio
 //!   de aceptación de `scan_submission` sobre marcar `Fallido` un histórico
 //!   cuyo `ScanRequest` no llegó a publicarse. Ver
-//!   `progress/explore_lapin_publish.md` §4 para el análisis completo. El
+//!   `docs/decisions.md` D-04 para el análisis completo. El
 //!   canal del consumidor no activa `confirm_select` (es específico de
 //!   publicar, no de consumir).
 //! - **`BrokerConsumer` sí reconecta (feature
 //!   `scan_outcome_consumer_reconnect`, incidente confirmado en AWS)**: igual
 //!   motivación que `BrokerPublisher` (abajo), pero del lado del consumidor
 //!   de `gateway.scan-outcomes`. `lapin` 2.5.5 no reconecta solo (ver
-//!   `progress/explore_lapin_consume.md` §2.2); antes de esta feature, si la
+//!   `docs/decisions.md` D-11); antes de esta feature, si la
 //!   conexión/canal AMQPS del consumidor se caía, [`BrokerConsumer::run`]
 //!   loggeaba el fin del stream y terminaba (`return`) sin que nadie se
 //!   enterase (`crate::lib::run` lo lanza con un `tokio::spawn` suelto, sin
@@ -97,7 +97,7 @@
 //!   `payload` no cambia entre reintentos), así que se descarta
 //!   inmediatamente hacia `gateway.scan-outcomes.dlq` (ya aprovisionada por
 //!   `broker/rabbitmq/definitions.json`) en vez de reintentarlo o
-//!   descartarlo sin rastro. Ver `progress/explore_lapin_consume.md` §3 para
+//!   descartarlo sin rastro. Ver `docs/decisions.md` D-05 para
 //!   el análisis completo (incluida la nota empírica de por qué
 //!   `nack(requeue: true)` no dispararía `x-delivery-limit` contra este
 //!   Broker real).
@@ -332,7 +332,7 @@ struct PublisherConnection {
 
 /// Cliente `lapin` sobre AMQPS de este Gateway: conexión y canal
 /// persistentes (reutilizados entre requests — ver
-/// `progress/explore_lapin_publish.md` §5), con `confirm_select` ya
+/// `docs/decisions.md` D-03), con `confirm_select` ya
 /// activado.
 ///
 /// La conexión/canal vigentes viven detrás de un `tokio::sync::RwLock` (en
@@ -370,7 +370,7 @@ impl BrokerPublisher {
     /// (`ca_pem`, en formato PEM) indicada — necesario para un Broker con
     /// certificado de una CA de laboratorio, no reconocida por el almacén
     /// nativo del proceso (p. ej. los tests de integración de esta feature,
-    /// ver `progress/explore_lapin_testcontainers.md` §4).
+    /// ver `docs/decisions.md` D-07).
     pub async fn connect_with_ca_pem(
         amqps_url: &SecretString,
         vhost: &str,
