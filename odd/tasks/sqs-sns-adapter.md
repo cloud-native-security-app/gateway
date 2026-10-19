@@ -41,7 +41,7 @@ Out:
 
 - Strict TDD: observe RED before implementing. Runner: `cargo test`; integration tests (`-- --ignored`, Docker) use LocalStack.
 - Credentials come from the default AWS provider chain (ECS task role = shared `LabRole`); never static keys in config.
-- At-least-once delivery: the handler must tolerate duplicates; today the consumer acks before `handler.handle` (to be revisited).
+- At-least-once delivery: the handler must tolerate duplicates. Decision (user, 2026-10-19, option A): the SQS consumer deletes a message only after `handler.handle` returns; a crash mid-handle redelivers it and after 3 receives it lands in the DLQ. A duplicate only re-sends the SSE event and re-applies the same status in user-service. Today's AMQP consumer acks before `handle` (replaced).
 - Proposed env vars (confirm at MSG-GW-01): `AWS_REGION`, `AWS_ENDPOINT_URL` (LocalStack only), `SCAN_REQUESTS_TOPIC_ARN`,
   `SCAN_CANCELLATIONS_TOPIC_ARN`, `GATEWAY_SCAN_OUTCOMES_QUEUE_URL`.
 - Message size limit 256 KB; scan request bodies carry SSH credentials: never log bodies.
