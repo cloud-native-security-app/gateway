@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with the builder image in the Dockerfile (rust:1.98-bookworm).
+  RUST_TOOLCHAIN: "1.98"
+
+jobs:
+  verify:
+    name: verify (make verify)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      # swatinem/rust-cache v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      # fmt, clippy -D warnings, cargo test, cargo test -- --ignored
+      # (LocalStack via testcontainers; Docker is available on ubuntu-latest), cargo doc.
+      - name: make verify
+        run: make verify
+
+  docker-build:
+    name: docker build (no push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --tag gateway:ci-check .
