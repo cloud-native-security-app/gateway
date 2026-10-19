@@ -52,7 +52,7 @@ Out:
 
 - [x] MSG-GW-01 Config: parse the SQS/SNS variables (typed errors, no secrets in `Debug`), RED: config tests first. `BROKER_*` removal moves to MSG-GW-04 so the build stays green.
 - [x] MSG-GW-02 Publisher on `aws-sdk-sns`: publish `ScanRequest` / `ScanCancellation` with the `routing_key` attribute; LocalStack test verifies the body and attribute reach the subscribed queue.
-- [ ] MSG-GW-03 Consumer on `aws-sdk-sqs` for `gateway-scan-outcomes`: long poll, delete after success, malformed handling, redrive to DLQ after 3 receives (LocalStack test), graceful shutdown replacing the AMQP reconnect loop.
+- [x] MSG-GW-03 Consumer on `aws-sdk-sqs` for `gateway-scan-outcomes`: long poll, delete after success, malformed handling, redrive to DLQ after 3 receives (LocalStack test), graceful shutdown replacing the AMQP reconnect loop.
 - [ ] MSG-GW-04 Wiring and cleanup: update `src/wiring.rs`, drop `lapin` and `lapin`-related dependencies from `Cargo.toml`, LocalStack in `docker-compose` and README, `make verify` green.
 
 ## Acceptance criteria
@@ -89,3 +89,12 @@ MSG-GW-01 once broker MSG-01 is signed off (config can start with the proposed n
 - LocalStack image: `localstack/localstack:4.4` (runs without an auth token; readiness = `Ready.` log line).
 - Dependencies: `aws-config 1.12.0` (`behavior-version-latest`), `aws-sdk-sns 1.116.0`; `aws-sdk-sqs 1.114.0` as a dev-dependency only (MSG-GW-03 promotes it to a normal dependency).
 - Change: new `src/sns.rs` (`SnsScanPublisher::{from_client, connect}`, implements `ScanRequestPublisher`, `routing_key` String attribute, bodies never logged, 256 KB limit documented); `BrokerError::SnsPublishFailed { topic, source: Box<dyn Error + Send + Sync> }`; `pub mod sns` in `src/lib.rs`; `tests/sns_publisher_localstack.rs`; Makefile comment.
+
+## MSG-GW-03 evidence
+
+- Route: delegated writer (single bounded writer, parent reviews). `lapin`, `BrokerConsumer` and `src/wiring.rs` untouched (switch in MSG-GW-04).
+- RED: `cargo test --test sqs_consumer_localstack --no-run` -> compile failure (`E0432 unresolved import gateway::sqs`, `could not compile gateway (test "sqs_consumer_localstack")`).
+- GREEN: `cargo test --lib` -> 76 passed (2 new: backoff progression 1,2,4,8,16,30,30; `routing_key` extraction). `cargo test --test sqs_consumer_localstack -- --ignored` -> 5 passed in ~23 s (valid handled once + deleted; malformed to DLQ with body and `routing_key` intact and gone from source, handler never called; abort mid-`handle` leaves the message undeleted and it is redelivered; 3 receives without delete end in the DLQ via the real RedrivePolicy `maxReceiveCount: 3`; cancelling the token stops `run` during long poll in < 5 s).
+- Dependencies: `aws-sdk-sqs 1.114.0` promoted to a normal dependency; `tokio-util 0.7` (`CancellationToken`, already transitive) and tokio feature `time` added.
+- Design: `src/sqs.rs` `SqsScanOutcomeConsumer::{from_client, connect, run(handler, CancellationToken)}`. Delete-after-handle for valid events. Malformed: explicit `SendMessage` of the original body to the DLQ (keeps `routing_key`), then delete from source; if the DLQ send fails the message is not deleted (redrive handles it). Receive errors: logged, exponential backoff 1 s..30 s, loop only exits on shutdown. Shutdown: the token races the long poll and the backoff; an in-flight `handle` finishes first and unprocessed messages of the batch reappear after their visibility timeout. Logs never include bodies (error, `routing_key`, length only). New `BrokerError::SqsFailed { queue, #[source] Box<dyn Error + Send + Sync> }`.
+- Test technique: "not deleted before handle completes" is proven by a handler that never completes and aborting the `run` task (simulated crash), then re-receiving the same message. Redrive is proven by receiving 3 times directly with the SDK (visibility 1 s) and then observing the message in the DLQ; LocalStack 4.4 moved it promptly, no long sleeps needed.

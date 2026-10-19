@@ -14,6 +14,7 @@ pub mod config;
 pub mod domain;
 pub mod realtime;
 pub mod sns;
+pub mod sqs;
 pub mod usuarios_client;
 pub mod wiring;
 
