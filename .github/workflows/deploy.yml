@@ -1,0 +1,95 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-gateway
+  cancel-in-progress: false
+
+env:
+  ECR_REPOSITORY: security-app/gateway
+  ECS_CLUSTER: security-app-cluster-v2
+  ECS_SERVICE: gateway
+  CONTAINER_NAME: gateway
+
+jobs:
+  deploy:
+    name: build, push and roll out to ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # aws-actions/configure-aws-credentials v6.3.0
+      # Learner Lab has no OIDC: temporary keys live in repository secrets,
+      # refreshed by infra scripts/refresh-gh-secrets.sh.
+      - name: Configure AWS credentials
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hint on expired credentials
+        if: failure() && steps.aws-creds.outcome == 'failure'
+        run: |
+          echo "::error::AWS credentials were rejected. Learner Lab credentials expire; run infra scripts/refresh-gh-secrets.sh and re-run this workflow."
+          exit 1
+
+      # aws-actions/amazon-ecr-login v2.1.7
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image="${REGISTRY}/${ECR_REPOSITORY}"
+          docker build --tag "${image}:${GITHUB_SHA}" --tag "${image}:latest" .
+          docker push "${image}:${GITHUB_SHA}"
+          docker push "${image}:latest"
+          echo "IMAGE=${image}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      # Terraform owns the task definition (env, secrets, roles, logging).
+      # CI only swaps the image of the revision the service currently runs.
+      - name: Download current task definition
+        run: |
+          task_def_arn="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+          if [ -z "$task_def_arn" ] || [ "$task_def_arn" = "None" ]; then
+            echo "::error::Service $ECS_SERVICE not found in cluster $ECS_CLUSTER"
+            exit 1
+          fi
+          aws ecs describe-task-definition --task-definition "$task_def_arn" \
+            --query taskDefinition > task-definition.raw.json
+          # Drop read-only fields that RegisterTaskDefinition rejects.
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.raw.json > task-definition.json
+
+      # aws-actions/amazon-ecs-render-task-definition v1.9.1
+      - name: Render task definition with the new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@8d79160660ad39c402a16e5fc7cd2a32e8f7d6b7
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE }}
+
+      # aws-actions/amazon-ecs-deploy-task-definition v2.6.4
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@a00d4d57ac0de1a99b39fe469f3d898d38717c2b
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
