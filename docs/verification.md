@@ -39,11 +39,11 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
 
 ### Nivel 3 — Tests de integración (obligatorio para auth, usuarios_client, broker, api)
 
-- `broker`: contra el contenedor `rabbitmq:management` oficial levantado
-  vía `testcontainers`, con la topología copiada literalmente de
-  `broker/rabbitmq/definitions.json` (mismos exchanges/colas/permisos del
-  usuario `gateway`) aplicada al arrancar el contenedor de test. Nunca
-  contra el Broker de producción, nunca con un mock del protocolo AMQP.
+- `broker` (adaptadores `sns`/`sqs`): contra un contenedor
+  `localstack/localstack:4.4` levantado vía `testcontainers`; cada test crea
+  los topics, colas, suscripciones raw y la DLQ (con `RedrivePolicy`) que
+  necesita (`tests/common/mod.rs`). Nunca contra AWS real, nunca con un
+  mock del SDK de AWS.
 - `usuarios_client`: contra un servidor HTTP de test (real, escuchando en
   un puerto — no una interceptación a nivel de módulo) que implementa el
   contrato documentado de `ms-usuarios`.
@@ -52,7 +52,7 @@ se documenta con `#[allow(...)]` y un comentario explicando por qué.
   de prueba (nunca contra el endpoint real de Google en el test suite) —
   la firma/expiración/audiencia se verifican con esa clave de laboratorio.
 - `api`: tests end-to-end que levantan el servicio real sobre el contenedor
-  RabbitMQ de test y el servidor de contrato de `ms-usuarios`, ejerciendo
+  LocalStack de test y el servidor de contrato de `ms-usuarios`, ejerciendo
   rutas HTTP reales (incluida la suscripción SSE).
 - Todo test de esta categoría se marca `#[ignore = "requiere Docker"]` (ver
   `docs/conventions.md`), se ejecuta con `cargo test -- --ignored`, y

@@ -1,6 +1,5 @@
-//! Consumidor SQS de `gateway-scan-outcomes` (tarea MSG-GW-03), reemplazo
-//! futuro de [`crate::broker::BrokerConsumer`] (el cambio de wiring llega en
-//! MSG-GW-04; hasta entonces ambos conviven).
+//! Consumidor SQS de `gateway-scan-outcomes` (tarea MSG-GW-03), que
+//! reemplazó al consumidor AMQP de RabbitMQ (cableado en [`crate::wiring`]).
 //!
 //! Decisiones de diseño:
 //!

@@ -33,12 +33,6 @@ const ENV_SESSION_SIGNING_KEY: &str = "SESSION_SIGNING_KEY";
 /// Nombre de la variable de entorno con el tiempo de vida (en segundos) de
 /// la sesión propia de este Gateway.
 const ENV_SESSION_TTL_SECS: &str = "SESSION_TTL_SECS";
-/// Nombre de la variable de entorno con la URL AMQPS del Broker (incluye la
-/// credencial del usuario RabbitMQ `gateway`).
-const ENV_BROKER_AMQPS_URL: &str = "BROKER_AMQPS_URL";
-/// Nombre de la variable de entorno con el vhost de RabbitMQ a usar en el
-/// Broker.
-const ENV_BROKER_VHOST: &str = "BROKER_VHOST";
 /// Nombre de la variable de entorno con la URL fija de `front` a la que
 /// `GET /auth/callback` redirige (`302`) tras completar el login (feature
 /// `post_login_redirect`). Nunca se deriva de la query string de la request
@@ -107,11 +101,6 @@ pub struct Config {
     pub session_signing_key: SecretString,
     /// Tiempo de vida, en segundos, de la sesión propia de este Gateway.
     pub session_ttl_secs: u64,
-    /// URL AMQPS del Broker, incluida la credencial del usuario RabbitMQ
-    /// `gateway`. Nunca se loggea.
-    pub broker_amqps_url: SecretString,
-    /// Vhost de RabbitMQ a usar en el Broker.
-    pub broker_vhost: String,
     /// URL fija de `front` a la que `GET /auth/callback` redirige (`302`)
     /// tras completar el login. Nunca se deriva de la request original (ver
     /// `docs/security-scope.md`: evita un open redirect).
@@ -315,8 +304,6 @@ impl Config {
                 name: ENV_SESSION_TTL_SECS,
                 source,
             })?;
-        let broker_amqps_url = required_secret(ENV_BROKER_AMQPS_URL)?;
-        let broker_vhost = required_string(ENV_BROKER_VHOST)?;
         let front_base_url = required_string(ENV_FRONT_BASE_URL)?;
         let front_origin = front_origin_from_base_url(ENV_FRONT_BASE_URL, &front_base_url)?;
         let ms_usuarios_base_url = required_string(ENV_MS_USUARIOS_BASE_URL)?;
@@ -352,8 +339,6 @@ impl Config {
             google_oidc_issuer_url,
             session_signing_key,
             session_ttl_secs,
-            broker_amqps_url,
-            broker_vhost,
             front_base_url,
             front_origin,
             ms_usuarios_base_url,
@@ -388,8 +373,6 @@ mod tests {
         ENV_GOOGLE_REDIRECT_URI,
         ENV_SESSION_SIGNING_KEY,
         ENV_SESSION_TTL_SECS,
-        ENV_BROKER_AMQPS_URL,
-        ENV_BROKER_VHOST,
         ENV_FRONT_BASE_URL,
         ENV_MS_USUARIOS_BASE_URL,
         ENV_MS_USUARIOS_SHARED_SECRET,
@@ -410,10 +393,6 @@ mod tests {
     const VALID_OUTCOMES_DLQ_URL: &str =
         "https://sqs.us-east-1.amazonaws.com/123456789012/gateway-scan-outcomes-dlq";
 
-    /// Valor de laboratorio para `BROKER_AMQPS_URL`, no una credencial real
-    /// (ver `docs/security-scope.md`).
-    const LAB_BROKER_AMQPS_URL: &str = "amqps://gateway:lab-only-not-a-real-secret@broker.lab:5671";
-
     fn clear_all_vars() {
         for name in ALL_REQUIRED_VARS {
             env::remove_var(name);
@@ -430,8 +409,6 @@ mod tests {
         env::set_var(ENV_GOOGLE_REDIRECT_URI, "https://gateway.lab/auth/callback");
         env::set_var(ENV_SESSION_SIGNING_KEY, "lab-only-not-a-real-secret");
         env::set_var(ENV_SESSION_TTL_SECS, "3600");
-        env::set_var(ENV_BROKER_AMQPS_URL, LAB_BROKER_AMQPS_URL);
-        env::set_var(ENV_BROKER_VHOST, "security-app");
         env::set_var(ENV_FRONT_BASE_URL, "https://front.lab/post-login");
         env::set_var(ENV_MS_USUARIOS_BASE_URL, "http://ms-usuarios.internal");
         env::set_var(ENV_MS_USUARIOS_SHARED_SECRET, "lab-only-not-a-real-secret");
@@ -463,11 +440,6 @@ mod tests {
             "lab-only-not-a-real-secret"
         );
         assert_eq!(config.session_ttl_secs, 3600);
-        assert_eq!(
-            config.broker_amqps_url.expose_secret(),
-            LAB_BROKER_AMQPS_URL
-        );
-        assert_eq!(config.broker_vhost, "security-app");
         assert_eq!(config.front_base_url, "https://front.lab/post-login");
         assert_eq!(
             config.front_origin, "https://front.lab",
@@ -764,7 +736,6 @@ mod tests {
         clear_all_vars();
 
         assert!(!debug_output.contains("lab-only-not-a-real-secret"));
-        assert!(!debug_output.contains(LAB_BROKER_AMQPS_URL));
         assert!(debug_output.contains("REDACTED"));
     }
 }

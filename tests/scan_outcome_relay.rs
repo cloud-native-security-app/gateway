@@ -5,18 +5,18 @@
 //!   router real (`gateway::api::app_router`) con
 //!   `AppState::scan_ownership` poblado a mano, sin pasar por el Broker.
 //! - `consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_order_until_terminal_state`
-//!   necesita un RabbitMQ real (`testcontainers`, `#[ignore = "requiere
-//!   Docker"]`, ver `docs/conventions.md`): publica manualmente
-//!   `started`/completed`/`failed` (y un mensaje malformado de por medio,
-//!   para verificar que no tumba el consumidor) en la cola de prueba
-//!   bindeada exactamente como `gateway.scan-outcomes` en
-//!   `broker/rabbitmq/definitions.json`, y verifica que el stream SSE los
-//!   recibe en orden, que `ms-usuarios` se actualiza en cada paso, y que el
-//!   stream se cierra al llegar al estado terminal.
+//!   necesita un LocalStack real (`testcontainers`, `#[ignore = "requiere
+//!   Docker"]`, ver `docs/conventions.md`): encola manualmente
+//!   `started`/`completed` (y un mensaje malformado de por medio, para
+//!   verificar que no tumba el consumidor y que termina en la DLQ) en la
+//!   cola SQS de resultados que consume el Gateway, y verifica que el
+//!   stream SSE los recibe en orden, que `ms-usuarios` se actualiza en cada
+//!   paso, y que el stream se cierra al llegar al estado terminal.
+
+mod common;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path as AxumPath, State};
@@ -27,22 +27,16 @@ use futures_util::StreamExt;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
-    BrokerConsumer, BrokerError, ScanCancellation, ScanOutcomeHandler, ScanRequest,
-    ScanRequestPublisher,
+    BrokerError, ScanCancellation, ScanOutcomeHandler, ScanRequest, ScanRequestPublisher,
 };
 use gateway::domain::{ScanOutcomeEvent, ScanResult, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::sqs::SqsScanOutcomeConsumer;
 use gateway::usuarios_client::{ScanStatus, UsuariosClient};
-use lapin::options::{BasicPublishOptions, ConfirmSelectOptions};
-use lapin::protocol::BasicProperties;
-use lapin::tcp::OwnedTLSConfig;
-use lapin::{Connection, ConnectionProperties};
 use secrecy::SecretString;
 use serde_json::{json, Value};
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 const TEST_CLIENT_ID: &str = "test-client-id";
 const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
@@ -50,12 +44,6 @@ const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const MS_USUARIOS_SHARED_SECRET: &str = "lab-only-not-a-real-secret";
-
-const VHOST: &str = "security-app";
-const GATEWAY_RABBITMQ_USER: &str = "gateway";
-const GATEWAY_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret-gateway";
-const ADMIN_RABBITMQ_USER: &str = "lab-admin";
-const ADMIN_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret";
 
 /// Doble de prueba de [`ScanRequestPublisher`]: ninguno de estos tests
 /// ejerce `POST /api/scans`.
@@ -347,86 +335,6 @@ impl ScanOutcomeHandler for TestRelayHandler {
     }
 }
 
-fn fixture_path(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
-}
-
-static CRYPTO_PROVIDER_INIT: Once = Once::new();
-
-fn install_crypto_provider_once() {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-/// Levanta un `rabbitmq:4.3.5-management` real vía `testcontainers`, con la
-/// topología copiada literalmente de `broker/rabbitmq/definitions.json`
-/// (ver `docs/architecture.md`) — mismo helper que
-/// `tests/scan_submission.rs`.
-async fn start_rabbitmq() -> ContainerAsync<GenericImage> {
-    install_crypto_provider_once();
-
-    GenericImage::new("rabbitmq", "4.3.5-management")
-        .with_exposed_port(5672.tcp())
-        .with_exposed_port(5671.tcp())
-        .with_exposed_port(15672.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/definitions.json")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/definitions.json",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/rabbitmq.conf")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/rabbitmq.conf",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/ca_certificate.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/ca_certificate.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/server_certificate.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/server_certificate.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/server_key.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/server_key.pem",
-        ))
-        .start()
-        .await
-        .expect("el contenedor RabbitMQ de test debe arrancar")
-}
-
-async fn connect_lapin_as(
-    user: &str,
-    password: &str,
-    host: &str,
-    port: u16,
-    ca_pem: &str,
-) -> Connection {
-    let uri = format!("amqps://{user}:{password}@{host}:{port}/{VHOST}");
-    let options = ConnectionProperties::default()
-        .with_executor(tokio_executor_trait::Tokio::current())
-        .with_reactor(tokio_reactor_trait::Tokio);
-    let tls_config = OwnedTLSConfig {
-        identity: None,
-        cert_chain: Some(ca_pem.to_string()),
-    };
-
-    Connection::connect_with_config(&uri, options, tls_config)
-        .await
-        .expect("la conexión AMQPS de prueba debe completarse")
-}
-
 /// Lee del stream de bytes hasta completar el próximo evento SSE (`\n\n`) y
 /// devuelve la concatenación de sus líneas `data: `, o `None` si el stream
 /// terminó sin más eventos.
@@ -461,19 +369,8 @@ async fn next_sse_data_field(
 #[ignore = "requiere Docker"]
 async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_order_until_terminal_state(
 ) {
-    let container = start_rabbitmq().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("host del contenedor de prueba")
-        .to_string();
-    let amqps_port = container
-        .get_host_port_ipv4(5671.tcp())
-        .await
-        .expect("puerto AMQPS publicado del contenedor de prueba");
-
-    let ca_pem = std::fs::read_to_string(fixture_path("rabbitmq/tls/ca_certificate.pem"))
-        .expect("debe poder leer la CA de laboratorio");
+    let localstack = common::LocalStack::start().await;
+    let (queue_url, dlq_url) = localstack.outcomes_queue_with_dlq().await;
 
     let (usuarios_base_url, usuarios_calls) = spawn_usuarios_status_stub().await;
     let usuarios_client = Arc::new(lab_usuarios_client(usuarios_base_url));
@@ -494,22 +391,19 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
         session_for("alice"),
     );
 
-    let scan_outcome_consumer = BrokerConsumer::connect_with_ca_pem(
-        &SecretString::from(format!(
-            "amqps://{GATEWAY_RABBITMQ_USER}:{GATEWAY_RABBITMQ_PASSWORD}@{host}:{amqps_port}"
-        )),
-        VHOST,
-        ca_pem.clone(),
-    )
-    .await
-    .expect("BrokerConsumer debe poder conectar contra el RabbitMQ de prueba");
+    let scan_outcome_consumer = SqsScanOutcomeConsumer::from_client(
+        localstack.sqs.clone(),
+        queue_url.clone(),
+        dlq_url.clone(),
+    );
 
     let handler: Arc<dyn ScanOutcomeHandler> = Arc::new(TestRelayHandler {
         usuarios_client,
         scan_ownership: gateway.scan_ownership.clone(),
         realtime: gateway.realtime.clone(),
     });
-    tokio::spawn(scan_outcome_consumer.run(handler));
+    let shutdown = CancellationToken::new();
+    let consumer_task = tokio::spawn(scan_outcome_consumer.run(handler, shutdown.clone()));
 
     // Cliente SSE, suscrito antes de que se publique nada: `subscribe_stream`
     // crea el canal en el registro al primer `GET`, y el consumidor de fondo
@@ -537,57 +431,23 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
 
-    // Admin: único usuario con permiso `configure` para declarar la cola de
-    // prueba que consume el `BrokerConsumer` de arriba... en realidad el
-    // `BrokerConsumer` ya consume `gateway.scan-outcomes` directamente (ya
-    // declarada por la topología cargada al arrancar el contenedor, ver
-    // `start_rabbitmq`). El admin aquí solo se usa para PUBLICAR en el
-    // exchange `scan.outcomes`, algo que el usuario `gateway` no tiene
-    // permitido (`write` solo sobre `scan.requests`/`scan.cancellations`) —
-    // en producción quien publica ahí es `ms-nmap`, no este Gateway.
-    let admin_connection = connect_lapin_as(
-        ADMIN_RABBITMQ_USER,
-        ADMIN_RABBITMQ_PASSWORD,
-        &host,
-        amqps_port,
-        &ca_pem,
-    )
-    .await;
-    let admin_channel = admin_connection
-        .create_channel()
-        .await
-        .expect("canal de administración de prueba");
-    admin_channel
-        .confirm_select(ConfirmSelectOptions::default())
-        .await
-        .expect("confirm_select del canal de administración");
-
-    async fn publish(channel: &lapin::Channel, routing_key: &str, payload: &[u8]) {
-        channel
-            .basic_publish(
-                "scan.outcomes",
-                routing_key,
-                BasicPublishOptions::default(),
-                payload,
-                BasicProperties::default().with_content_type("application/json".into()),
-            )
-            .await
-            .expect("basic_publish debe enviarse")
-            .await
-            .expect("el Broker debe confirmar la publicación de prueba");
-    }
-
+    // En producción quien publica los resultados (vía SNS -> SQS) es
+    // `ms-nmap`, no este Gateway: el test los encola directamente en la cola
+    // de resultados con el atributo `routing_key`, como los entregaría SNS.
     let started = json!({ "status": "started", "correlation_id": SCAN_ID }).to_string();
-    publish(&admin_channel, "scan.outcome.started", started.as_bytes()).await;
+    localstack
+        .send_with_routing_key(&queue_url, "scan.outcome.started", &started)
+        .await;
 
-    // Mensaje malformado de por medio: JSON inválido. Debe descartarse (log
-    // + nack) sin tumbar el consumidor ni aparecer como evento SSE.
-    publish(
-        &admin_channel,
-        "scan.outcome.completed",
-        b"this is not valid json",
-    )
-    .await;
+    // Mensaje malformado de por medio: JSON inválido. Debe enviarse a la DLQ
+    // (log + DLQ) sin tumbar el consumidor ni aparecer como evento SSE.
+    localstack
+        .send_with_routing_key(
+            &queue_url,
+            "scan.outcome.completed",
+            "this is not valid json",
+        )
+        .await;
 
     let result = ScanResult {
         host: "192.0.2.10".to_string(),
@@ -601,12 +461,9 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
         "result": result,
     }))
     .expect("debe serializar el evento completed de prueba");
-    publish(
-        &admin_channel,
-        "scan.outcome.completed",
-        completed.as_bytes(),
-    )
-    .await;
+    localstack
+        .send_with_routing_key(&queue_url, "scan.outcome.completed", &completed)
+        .await;
 
     let first = tokio::time::timeout(
         Duration::from_secs(15),
@@ -658,4 +515,18 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // El mensaje malformado quedó en la DLQ con su cuerpo original.
+    let dead = localstack
+        .receive_one(&dlq_url)
+        .await
+        .expect("el mensaje malformado debe terminar en la DLQ");
+    assert_eq!(dead.body(), Some("this is not valid json"));
+
+    // Shutdown ordenado del consumidor.
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), consumer_task)
+        .await
+        .expect("el consumidor debe detenerse tras cancelar el token")
+        .expect("el consumidor no debe hacer panic");
 }

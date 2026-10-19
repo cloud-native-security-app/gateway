@@ -3,7 +3,7 @@
 > `gateway` es el **único componente público** de toda la plataforma y el
 > punto donde convergen todas las credenciales: el token de Google, la
 > sesión propia de cada usuario, la credencial de servicio hacia
-> `ms-usuarios`, y la credencial AMQPS del Broker (que a su vez transporta
+> `ms-usuarios`, y los permisos IAM hacia SNS/SQS (por donde viaja
 > `ssh_credentials_ref`, una credencial SSH real — ver
 > `broker/docs/security-scope.md`). Un error aquí compromete todo lo demás.
 > Este documento define los límites duros que aplican tanto al desarrollo
@@ -60,13 +60,16 @@
 
 ## Comunicación con el Broker
 
-- La credencial AMQPS del usuario RabbitMQ `gateway` (definida en
-  `broker/rabbitmq/definitions.json`, mínimo privilegio: solo `write` en
-  `scan.requests`/`scan.cancellations`, solo `read` en
-  `gateway.scan-outcomes`) se lee de `Config` — nunca hardcodeada, nunca
-  loggeada.
-- Toda conexión al Broker usa AMQPS (TLS), nunca el puerto AMQP en claro
-  que `broker/docker-compose.yml` documenta como "solo depuración local".
+- Este Gateway no tiene credencial de Broker en `Config`: las credenciales
+  de AWS salen de la cadena de proveedores por defecto (rol de la tarea ECS,
+  `LabRole` compartido en el laboratorio) — nunca claves estáticas en código,
+  variables de entorno de producción ni logs. Mínimo privilegio deseado:
+  `sns:Publish` sobre los dos topics de salida y
+  `sqs:ReceiveMessage`/`DeleteMessage`/`ChangeMessageVisibility` sobre la cola
+  de resultados más `sqs:SendMessage` sobre su DLQ (los define `broker`/
+  Terraform, no este repo).
+- Toda conexión a SNS/SQS usa HTTPS (SDK de AWS). `AWS_ENDPOINT_URL` (HTTP a
+  LocalStack) existe solo para desarrollo y tests locales.
 - El cuerpo completo de un `ScanRequest` (que lleva `ssh_credentials_ref`,
   una credencial SSH real) **nunca** se loggea de forma persistente a
   stdout/stderr — mismo límite que ya documentan `broker/` y
@@ -134,7 +137,7 @@
 - Ningún test de este repo llama al endpoint real de Google ni a un
   `user-service`/Broker de producción — todos usan servidores/contenedores
   de laboratorio (ver `docs/verification.md`).
-- Ninguna identidad de Google, credencial de servicio, o credencial AMQPS
+- Ninguna identidad de Google, credencial de servicio, o credencial de AWS
   real aparece en fixtures, ejemplos o código de este repo — solo valores
   sintéticos de laboratorio.
 

@@ -10,42 +10,33 @@
 //!   Docker: nunca llegan a publicar en el Broker (doble de prueba que haría
 //!   panic si se invocara).
 //! - `POST /api/scans/{scan_id}/cancel` de un scan propio en curso sí
-//!   necesita un RabbitMQ real (`testcontainers`,
+//!   necesita un LocalStack real (`testcontainers`,
 //!   `#[ignore = "requiere Docker"]`, ver `docs/conventions.md`): publica de
-//!   verdad un `ScanCancellation` y lo verifica contra una cola de prueba
-//!   bindeada a `scan.cancellations`/`scan.cancellation`, mismo patrón que
+//!   verdad un `ScanCancellation` en SNS y lo verifica contra una cola de
+//!   prueba suscrita (raw) al topic de cancelaciones, mismo patrón que
 //!   `tests/scan_submission.rs`.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Once};
+mod common;
+
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::routing::get;
 use axum::{Json, Router};
-use futures_util::StreamExt;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
-    BrokerError, BrokerPublisher, ScanCancellation, ScanRequest, ScanRequestPublisher,
+    BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher, ROUTING_KEY_SCAN_CANCELLATION,
 };
 use gateway::domain::Session;
 use gateway::realtime::RealtimeRegistry;
+use gateway::sns::SnsScanPublisher;
 use gateway::usuarios_client::UsuariosClient;
-use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, ConfirmSelectOptions, QueueBindOptions,
-    QueueDeclareOptions,
-};
-use lapin::tcp::OwnedTLSConfig;
-use lapin::types::FieldTable;
-use lapin::{Connection, ConnectionProperties};
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::net::TcpListener;
 
 const TEST_CLIENT_ID: &str = "test-client-id";
@@ -54,12 +45,6 @@ const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const MS_USUARIOS_SHARED_SECRET: &str = "lab-only-not-a-real-secret";
-
-const VHOST: &str = "security-app";
-const GATEWAY_RABBITMQ_USER: &str = "gateway";
-const GATEWAY_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret-gateway";
-const ADMIN_RABBITMQ_USER: &str = "lab-admin";
-const ADMIN_RABBITMQ_PASSWORD: &str = "lab-only-not-a-real-secret";
 
 /// Doble de prueba de [`ScanRequestPublisher`]: los escenarios que nunca
 /// deben llegar a publicar nada en el Broker (scan ajeno/inexistente, scan
@@ -411,178 +396,21 @@ async fn cancel_scan_already_in_a_terminal_state_is_rejected_without_publishing(
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
 }
 
-fn fixture_path(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
-}
-
-static CRYPTO_PROVIDER_INIT: Once = Once::new();
-
-fn install_crypto_provider_once() {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        // Instalación defensiva del backend criptográfico de `rustls`, ver
-        // `docs/decisions.md` D-07.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-/// Levanta un `rabbitmq:4.3.5-management` real vía `testcontainers`, con la
-/// topología copiada literalmente de `broker/rabbitmq/definitions.json` (ver
-/// `docs/architecture.md`) — mismo helper que `tests/scan_submission.rs`.
-async fn start_rabbitmq() -> ContainerAsync<GenericImage> {
-    install_crypto_provider_once();
-
-    GenericImage::new("rabbitmq", "4.3.5-management")
-        .with_exposed_port(5672.tcp())
-        .with_exposed_port(5671.tcp())
-        .with_exposed_port(15672.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("Server startup complete"))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/definitions.json")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/definitions.json",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/rabbitmq.conf")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/rabbitmq.conf",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/ca_certificate.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/ca_certificate.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/server_certificate.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/server_certificate.pem",
-        ))
-        .with_mount(Mount::bind_mount(
-            fixture_path("rabbitmq/tls/server_key.pem")
-                .to_string_lossy()
-                .into_owned(),
-            "/etc/rabbitmq/tls/server_key.pem",
-        ))
-        .start()
-        .await
-        .expect("el contenedor RabbitMQ de test debe arrancar")
-}
-
-/// Conexión AMQPS "a mano" (sin pasar por `gateway::broker`, que solo expone
-/// publicar) usada por el test para preparar/leer la cola de verificación
-/// con el usuario `lab-admin` (ver
-/// `docs/decisions.md` D-07: el usuario `gateway` tiene
-/// `configure: "^$"`, no puede declarar nada).
-async fn connect_lapin_as(
-    user: &str,
-    password: &str,
-    host: &str,
-    port: u16,
-    ca_pem: &str,
-) -> Connection {
-    let uri = format!("amqps://{user}:{password}@{host}:{port}/{VHOST}");
-    let options = ConnectionProperties::default()
-        .with_executor(tokio_executor_trait::Tokio::current())
-        .with_reactor(tokio_reactor_trait::Tokio);
-    let tls_config = OwnedTLSConfig {
-        identity: None,
-        cert_chain: Some(ca_pem.to_string()),
-    };
-
-    Connection::connect_with_config(&uri, options, tls_config)
-        .await
-        .expect("la conexión AMQPS de prueba debe completarse")
-}
-
 #[tokio::test]
 #[ignore = "requiere Docker"]
 async fn cancel_scan_owned_and_in_progress_publishes_a_valid_scan_cancellation() {
-    let container = start_rabbitmq().await;
-    let host = container
-        .get_host()
-        .await
-        .expect("host del contenedor de prueba")
-        .to_string();
-    let amqps_port = container
-        .get_host_port_ipv4(5671.tcp())
-        .await
-        .expect("puerto AMQPS publicado del contenedor de prueba");
+    let localstack = common::LocalStack::start().await;
+    // Cola de verificación ad-hoc suscrita (raw) al topic de cancelaciones.
+    let (requests_arn, _requests_queue) = localstack.topic_with_queue("scan-requests").await;
+    let (cancellations_arn, cancellations_queue) =
+        localstack.topic_with_queue("scan-cancellations").await;
 
-    let ca_pem = std::fs::read_to_string(fixture_path("rabbitmq/tls/ca_certificate.pem"))
-        .expect("debe poder leer la CA de laboratorio");
-
-    // Conexión de administración: declara y bindea la cola de verificación
-    // ad-hoc de este test (nunca la declara el código de producción, que usa
-    // el usuario `gateway`, sin permiso `configure`).
-    let admin_connection = connect_lapin_as(
-        ADMIN_RABBITMQ_USER,
-        ADMIN_RABBITMQ_PASSWORD,
-        &host,
-        amqps_port,
-        &ca_pem,
-    )
-    .await;
-    let admin_channel = admin_connection
-        .create_channel()
-        .await
-        .expect("canal de administración de prueba");
-
-    admin_channel
-        .queue_declare(
-            "test.scan-cancellations-verify",
-            QueueDeclareOptions {
-                durable: false,
-                exclusive: true,
-                auto_delete: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await
-        .expect("declarar la cola de verificación de prueba");
-
-    admin_channel
-        .queue_bind(
-            "test.scan-cancellations-verify",
-            "scan.cancellations",
-            "scan.cancellation",
-            QueueBindOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .expect("bindear la cola de verificación de prueba");
-
-    admin_channel
-        .confirm_select(ConfirmSelectOptions::default())
-        .await
-        .expect("confirm_select del canal de administración");
-
-    let mut consumer = admin_channel
-        .basic_consume(
-            "test.scan-cancellations-verify",
-            "test-consumer",
-            BasicConsumeOptions::default(),
-            FieldTable::default(),
-        )
-        .await
-        .expect("consumir la cola de verificación de prueba");
-
-    // Publicador real de producción, conectado como el usuario `gateway`
-    // (mínimo privilegio: `write` sobre `scan.requests`/`scan.cancellations`).
-    let broker_publisher: Arc<dyn ScanRequestPublisher> = Arc::new(
-        BrokerPublisher::connect_with_ca_pem(
-            &SecretString::from(format!(
-                "amqps://{GATEWAY_RABBITMQ_USER}:{GATEWAY_RABBITMQ_PASSWORD}@{host}:{amqps_port}"
-            )),
-            VHOST,
-            ca_pem,
-        )
-        .await
-        .expect("BrokerPublisher debe poder conectar contra el RabbitMQ de prueba"),
-    );
+    // Publicador real de producción sobre SNS.
+    let broker_publisher: Arc<dyn ScanRequestPublisher> = Arc::new(SnsScanPublisher::from_client(
+        localstack.sns.clone(),
+        requests_arn,
+        cancellations_arn,
+    ));
 
     let history = json!([
         {
@@ -623,14 +451,19 @@ async fn cancel_scan_owned_and_in_progress_publishes_a_valid_scan_cancellation()
 
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
 
-    let delivery = tokio::time::timeout(Duration::from_secs(10), consumer.next())
+    let delivery = localstack
+        .receive_one(&cancellations_queue)
         .await
-        .expect("no debe hacer timeout esperando el ScanCancellation publicado")
-        .expect("debe llegar un mensaje a la cola de verificación")
-        .expect("sin error de protocolo AMQP");
+        .expect("debe llegar un mensaje a la cola de verificación");
+    assert_eq!(
+        common::routing_key_of(&delivery),
+        ROUTING_KEY_SCAN_CANCELLATION,
+        "el ScanCancellation debe viajar con el atributo routing_key=scan.cancellation"
+    );
 
     let scan_cancellation: HashMap<String, Value> =
-        serde_json::from_slice(&delivery.data).expect("el mensaje debe ser JSON válido");
+        serde_json::from_str(delivery.body().expect("cuerpo del mensaje"))
+            .expect("el mensaje debe ser JSON válido");
 
     assert_eq!(scan_cancellation["correlation_id"], json!(SCAN_ID));
     assert_eq!(scan_cancellation["requested_by"], json!("alice"));
@@ -641,10 +474,4 @@ async fn cancel_scan_owned_and_in_progress_publishes_a_valid_scan_cancellation()
         expected_keys.len(),
         "el ScanCancellation publicado no debe traer campos extra (additionalProperties: false)"
     );
-
-    delivery
-        .acker
-        .ack(BasicAckOptions::default())
-        .await
-        .expect("debe poder confirmar el mensaje consumido");
 }

@@ -9,7 +9,7 @@ Este repo implementa **únicamente el API Manager / Gateway**: el único
 componente de la plataforma expuesto en subred pública (ver diagrama de
 arquitectura). `ms-usuarios`, `ms-nmap`, `ms-analisis`, el Broker y `front`
 son otros repos — este repo no conoce su lógica interna, solo los contratos
-que ya documentan (`broker/contracts/`, `broker/rabbitmq/definitions.json`,
+que ya documentan (`broker/contracts/`, la topología SNS/SQS de `broker/`,
 `user-service/docs/architecture.md`, `front/docs/architecture.md`).
 
 ```
@@ -17,9 +17,9 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
                               │
                               ├──(HTTP síncrono, subred privada)──▶ ms-usuarios
                               │
-                              └──(AMQPS)──▶ Broker ──▶ ms-nmap
+                              └──(HTTPS)──▶ SNS ──▶ ms-nmap
                                               │
-                                   gateway.scan-outcomes (SSE hacia front)
+                                   cola SQS de resultados (SSE hacia front)
 ```
 
 ## Responsabilidades
@@ -64,41 +64,31 @@ Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
   identidad + una credencial de servicio `GATEWAY_SHARED_SECRET`). Gateway
   es quien posee y envía esa credencial de servicio — `ms-usuarios` no
   sabe nada de Google ni de JWTs.
-- **Broker: RabbitMQ real, contrato fijado por `broker/`.** Gateway es el
-  primer repo que implementa un cliente `lapin` real contra ese contrato
-  (`ms-nmap` todavía usa stubs en memoria — ver
-  `nmap-service/docs/architecture.md`). El usuario RabbitMQ `gateway` ya
-  existe en `broker/rabbitmq/definitions.json` con permisos de mínimo
-  privilegio: `write` solo sobre `scan.requests`/`scan.cancellations`,
-  `read` solo sobre `gateway.scan-outcomes`. Este repo **no** redefine esa
-  topología — la consume tal cual (AMQPS, puerto 5671, vhost
-  `security-app`).
-- **El fixture de topología usado en tests de integración se copia
-  literalmente de `broker/rabbitmq/definitions.json`** (mismos exchanges,
-  colas, bindings y permisos del usuario `gateway`) — no se re-deriva,
-  mismo principio que aplica `broker/contracts/README.md` al copiar el
-  contrato de mensajes desde `ms-nmap`. Si la topología de `broker/` cambia,
-  este fixture se actualiza explícitamente, nunca por inferencia.
+- **Broker: SNS + SQS, contrato fijado por `broker/`** (reemplaza a
+  RabbitMQ/`lapin`, ver `docs/decisions.md` D-15). Gateway publica
+  `ScanRequest`/`ScanCancellation` en dos topics SNS (atributo de mensaje
+  `routing_key`) y consume los resultados de una cola SQS con su DLQ. Este
+  repo **no** crea ni redefine topics, colas, suscripciones ni permisos: los
+  provee `broker`/Terraform y el rol de la tarea ECS (credenciales por la
+  cadena por defecto de AWS).
+- **Los tests de integración crean su propia topología en LocalStack**
+  (topics, colas con suscripción raw y DLQ con `RedrivePolicy`), siguiendo
+  los nombres y atributos del contrato de `broker/`; si ese contrato cambia,
+  el arnés de `tests/common/mod.rs` se actualiza explícitamente.
 - **Notificación en tiempo real vía SSE hacia `front` (RF-08)**, coherente
   con la decisión ya tomada en `front/docs/architecture.md`: Gateway
   consume `gateway.scan-outcomes` (bindeada a las 3 variantes de
   `ScanOutcome`: `started`/`completed`/`failed`) y relaya cada evento al
   stream SSE del `scanId` correspondiente.
-- **El Broker reconecta solo (publicador y consumidor), nunca reinicia el
-  proceso completo (incidentes confirmados en AWS).** `BrokerPublisher`
-  (feature `broker_publisher_reconnect`) y `BrokerConsumer` (feature
-  `scan_outcome_consumer_reconnect`) guardan la URL/vhost/CA del Broker y
-  repiten su propia lógica de conexión si la detectan caída, en vez de
-  depender de que alguien reinicie el proceso a mano (publicador) o de
-  dejar el relay SSE muerto en silencio (consumidor) hasta el próximo
-  reinicio externo. El publicador reconecta bajo un `RwLock` porque
-  `publish_scan_request`/`publish_scan_cancellation` pueden invocarse
-  concurrentemente desde múltiples requests HTTP; el consumidor corre en
-  una única tarea de fondo (lanzada una vez al arrancar el proceso), así
-  que reconecta con un loop simple y reintentos acotados (backoff
-  exponencial, pocos intentos) sin necesitar ningún mecanismo de
-  sincronización — ver el detalle en los doc-comments de `BrokerPublisher`/
-  `BrokerConsumer` en `src/broker.rs`.
+- **El consumidor SQS no muere en silencio y se apaga de forma ordenada.**
+  `SqsScanOutcomeConsumer::run` solo sale por shutdown: los errores de
+  recepción se loggean y se reintentan con backoff exponencial (1-30 s). Un
+  mensaje se borra solo después de que el handler retorna (entrega al menos
+  una vez, el handler tolera duplicados); un malformado va a la DLQ. El
+  publicador SNS no mantiene conexión que reconectar (cada `Publish` es una
+  llamada HTTPS independiente). `gateway::run` captura `SIGTERM`/`Ctrl-C`,
+  cancela el consumidor, drena HTTP y espera al consumidor con tiempos
+  acotados.
 - **Rate limiting por usuario (RF-12)** con un limitador en memoria propio sobre la ruta
   de encolado de escaneos, con la identidad de la sesión de Gateway como
   clave (no la IP del cliente, que puede compartirse tras un NAT/proxy).
@@ -145,8 +135,9 @@ resuelva, no antes.
 ## Capas
 
 1. **`config`** — carga de configuración desde variables de entorno
-   (credenciales OAuth de Google, secreto de firma de sesión, endpoint/
-   vhost/credencial AMQPS del Broker, URL base + credencial compartida de
+   (credenciales OAuth de Google, secreto de firma de sesión, región,
+   ARNs de topics SNS y URLs de colas SQS (sin credenciales: salen de la
+   cadena por defecto de AWS), URL base + credencial compartida de
    `ms-usuarios`, umbrales de rate limiting). Sin valores hardcodeados.
 2. **`domain`** — tipos puros: `Session` (identidad verificada + `exp`),
    `ScanSubmission` (entrada validada del usuario), `ScanOutcomeEvent`. Sin
@@ -157,9 +148,11 @@ resuelva, no antes.
 4. **`usuarios_client`** — único módulo que conoce la URL y el contrato
    HTTP de `ms-usuarios`; nadie más en este repo hace una petición HTTP
    directa hacia `ms-usuarios`.
-5. **`broker`** — cliente `lapin` sobre AMQPS: `publish_scan_request`,
-   `publish_scan_cancellation`, y el consumidor de `gateway.scan-outcomes`.
-   Único módulo que conoce el contrato de mensajes del Broker.
+5. **`broker`, `sns`, `sqs`** — `broker` define los puertos
+   (`ScanRequestPublisher`, `ScanOutcomeHandler`) y los tipos de mensaje;
+   `sns` publica `ScanRequest`/`ScanCancellation` en SNS y `sqs` consume la
+   cola de resultados de escaneo. Únicos módulos que conocen el contrato de
+   mensajes del Broker.
 6. **`realtime`** — registro de streams SSE activos por `scanId` y el
    puente entre un evento consumido del Broker y los clientes SSE
    suscritos.
@@ -167,11 +160,11 @@ resuelva, no antes.
    /api/me`, perfil, envío/histórico/cancelación de escaneos, stream SSE,
    documentación OpenAPI. Aplica el middleware de sesión y el rate
    limiter.
-8. **`wiring`** — composition root: construye el cliente OIDC, el pool/canal
-   `lapin`, el cliente HTTP hacia `ms-usuarios` y arma el router completo
+8. **`wiring`** — composition root: construye el cliente OIDC, el publicador
+   SNS y el consumidor SQS, el cliente HTTP hacia `ms-usuarios` y arma el router completo
    desde la `Config`.
 9. **`lib`** — declara `pub mod` para cada capa anterior y expone `pub
-   async fn run(...)`.
+   async fn run(...)` (consumidor SQS de fondo y apagado ordenado).
 10. **`main`** — envoltorio delgado: runtime tokio, tracing, config,
     `wiring`, `lib::run(...)`.
 
@@ -187,7 +180,7 @@ documentada en `docs/decisions.md` o en el documento de la tarea (`odd/tasks/`).
   de error apropiada — nunca en un panic ni en un proceso que muere en
   silencio.
 - El token de Google, la sesión firmada completa, la credencial compartida
-  con `ms-usuarios` y la credencial AMQPS nunca aparecen en logs ni en
+  con `ms-usuarios` y los cuerpos de mensaje del Broker nunca aparecen en logs ni en
   cuerpos de error (ver `docs/security-scope.md`).
 
 ## Despliegue
@@ -210,7 +203,7 @@ patrón que `user-service`/`nmap-service`. La imagen final incluye
 provistos por la base `gcr.io/distroless/cc-debian12:nonroot`) — necesarios
 porque este binario es, a su vez, **cliente** TLS saliente hacia tres
 destinos distintos: Google (handshake OIDC, RF-01), `ms-usuarios` (HTTP
-síncrono, subred privada) y el Broker (AMQPS, puerto 5671). Esto es
+síncrono, subred privada) y AWS SNS/SQS (HTTPS). Esto es
 independiente de la terminación TLS pública descrita arriba, que sigue
 siendo responsabilidad de un balanceador/ingress delante de Gateway, no del
 propio binario. La imagen final **no incluye** la toolchain de Rust, el
@@ -228,5 +221,5 @@ que el usuario decida una plataforma de despliegue.
 - No inventar el shape de la API de `ms-usuarios` para
   `network_user`/`ssh_credentials_ref`/`has_sudo` ni el contrato de
   `ms-analisis` — ver "Dependencias pendientes" arriba.
-- No redefinir la topología de RabbitMQ (exchanges/colas/permisos) — es
-  fuente de verdad de `broker/`.
+- No redefinir la topología de SNS/SQS (topics, colas, suscripciones,
+  permisos) — es fuente de verdad de `broker/`.

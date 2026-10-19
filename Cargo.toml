@@ -4,18 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 axum = "0.7"
 axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
 cookie = { version = "0.18.2", default-features = false }
-lapin = { version = "2", features = ["rustls"], default-features = false }
-# Adapta el executor/reactor de `lapin` al runtime `tokio` que ya usa el
-# resto de este servicio (axum), en vez de dejar que `lapin` use su propio
-# pool de hilos por defecto (`async-global-executor`) — ver
-# `docs/decisions.md` D-03. Versiones alineadas con las que
-# fija `lapin` 2.5.5 en sus propios dev-dependencies/ejemplos.
-tokio-executor-trait = "2"
-tokio-reactor-trait = "1"
 openidconnect = "4.0.1"
 jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
 tracing = "0.1"
@@ -27,14 +19,13 @@ thiserror = "2.0.20"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # `AppState` guarda el publicador del Broker como `Arc<dyn ScanRequestPublisher>`
 # (feature `scan_submission`) para que los tests de otras features no
-# necesiten una conexión AMQPS real solo para construir el router; `lapin`
-# 2.5.5 usa `async fn` en un trait sin soporte nativo para objetos `dyn`.
+# necesiten LocalStack/AWS solo para construir el router; los traits
+# `ScanRequestPublisher`/`ScanOutcomeHandler` usan `async fn` sin soporte
+# nativo para objetos `dyn`.
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
-# `.next()` sobre el `Consumer` (`Stream`) de `lapin` en el consumidor de
-# producción de `gateway.scan-outcomes` (`src/broker.rs`) y `stream::unfold`
-# para construir el `Stream<Item = Result<Event, Infallible>>` del handler
-# SSE (`src/realtime.rs`, feature `scan_outcome_relay`) — código de
+# `stream::unfold` para construir el `Stream<Item = Result<Event, Infallible>>`
+# del handler SSE (`src/realtime.rs`, feature `scan_outcome_relay`) — código de
 # producción, no solo de test (antes solo estaba en `[dev-dependencies]`,
 # ver `docs/decisions.md` D-06).
 futures-util = "0.3"
@@ -75,9 +66,6 @@ rand = "0.8"
 base64 = "0.22"
 # `url` ya está en `[dependencies]` (feature `cors_for_front`, ver arriba) y
 # por lo tanto ya disponible en `tests/`; no se repite aquí.
-# Instalación defensiva del backend criptográfico de `rustls` antes de la
-# primera conexión AMQPS en tests (ver `docs/decisions.md` D-07, gotcha de doble-proveedor `rustls`).
-rustls = "0.23"
 # `Response::bytes_stream()` en los tests de integración del stream SSE
 # (feature `scan_outcome_relay`) está tras este feature de `reqwest`, no
 # activo en `[dependencies]` (ver `docs/decisions.md` D-06).
