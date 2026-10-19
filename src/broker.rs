@@ -252,6 +252,19 @@ pub enum BrokerError {
         /// Exchange contra el que se publicó el mensaje rechazado.
         exchange: String,
     },
+    /// No se pudo publicar en el topic SNS indicado (adaptador
+    /// [`crate::sns::SnsScanPublisher`]). La causa original del SDK se
+    /// conserva en `source` (solo visible vía `Debug`/cadena de `source()`,
+    /// nunca en el `Display`); jamás incluye el cuerpo del mensaje.
+    #[error("no se pudo publicar en el topic SNS '{topic}'")]
+    SnsPublishFailed {
+        /// ARN del topic contra el que se intentó publicar.
+        topic: String,
+        /// Error original del SDK de AWS, borrado a un trait object para no
+        /// acoplar esta API pública al tipo genérico del SDK.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// No se pudo serializar el `ScanRequest` a JSON antes de publicarlo.
     #[error("no se pudo serializar la solicitud de escaneo")]
     SerializationFailed(#[source] serde_json::Error),
@@ -1020,5 +1033,23 @@ mod tests {
         }
         assert_eq!(object["correlation_id"], serde_json::json!("scan-1"));
         assert_eq!(object["requested_by"], serde_json::json!("google-sub-123"));
+    }
+
+    #[test]
+    fn sns_publish_failed_display_names_the_topic_and_keeps_the_source_chain() {
+        use std::error::Error as _;
+        let err = BrokerError::SnsPublishFailed {
+            topic: "arn:aws:sns:us-east-1:000000000000:scan-requests".to_string(),
+            source: "boom".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no se pudo publicar en el topic SNS 'arn:aws:sns:us-east-1:000000000000:scan-requests'"
+        );
+        assert_eq!(
+            err.source().expect("debe encadenar la causa").to_string(),
+            "boom"
+        );
+        assert!(!is_connection_error(&err));
     }
 }

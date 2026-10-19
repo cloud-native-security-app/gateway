@@ -61,6 +61,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 # `openidconnect`/`reqwest` (y ya era dev-dependency), se declara explícita
 # para poder nombrarla en `src/config.rs`.
 url = "2"
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-sns = "1.116.0"
 
 [dev-dependencies]
 testcontainers = "0.20"
@@ -81,3 +83,4 @@ reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 # una dependencia transitiva de `reqwest`, se declara explícita para poder
 # nombrarla en `tests/`).
 bytes = "1"
+aws-sdk-sqs = "1.114.0"

@@ -51,7 +51,7 @@ Out:
 ## Checklist
 
 - [x] MSG-GW-01 Config: parse the SQS/SNS variables (typed errors, no secrets in `Debug`), RED: config tests first. `BROKER_*` removal moves to MSG-GW-04 so the build stays green.
-- [ ] MSG-GW-02 Publisher on `aws-sdk-sns`: publish `ScanRequest` / `ScanCancellation` with the `routing_key` attribute; LocalStack test verifies the body and attribute reach the subscribed queue.
+- [x] MSG-GW-02 Publisher on `aws-sdk-sns`: publish `ScanRequest` / `ScanCancellation` with the `routing_key` attribute; LocalStack test verifies the body and attribute reach the subscribed queue.
 - [ ] MSG-GW-03 Consumer on `aws-sdk-sqs` for `gateway-scan-outcomes`: long poll, delete after success, malformed handling, redrive to DLQ after 3 receives (LocalStack test), graceful shutdown replacing the AMQP reconnect loop.
 - [ ] MSG-GW-04 Wiring and cleanup: update `src/wiring.rs`, drop `lapin` and `lapin`-related dependencies from `Cargo.toml`, LocalStack in `docker-compose` and README, `make verify` green.
 
@@ -80,3 +80,12 @@ MSG-GW-01 once broker MSG-01 is signed off (config can start with the proposed n
 - GREEN: `cargo test --lib config` -> 14 passed, 0 failed (7 new/extended tests: new fields load, optional endpoint Some/invalid, empty region, malformed topic ARNs, malformed queue URLs, all new vars in the Missing loop).
 - Full: `cargo fmt --check` ok; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` all non-ignored pass (72 unit); `cargo doc --no-deps` ok.
 - Change: `src/config.rs` adds `aws_region`, `aws_endpoint_url: Option<Url>`, `scan_requests_topic_arn`, `scan_cancellations_topic_arn`, `scan_outcomes_queue_url: Url`, `scan_outcomes_dlq_url: Url`, `ConfigError::InvalidArn { name }` (value never echoed); README env table gains the 6 vars.
+
+## MSG-GW-02 evidence
+
+- Route: delegated writer (single bounded writer, parent reviews). `lapin`/`BrokerPublisher`/wiring untouched (wiring switches in MSG-GW-04).
+- RED: `cargo test --lib sns` -> compile failure (2 errors: `BrokerError::SnsPublishFailed` and `routing_key_attribute` missing); `cargo test --test sns_publisher_localstack --no-run` -> compile failure (`gateway::sns` / `SnsScanPublisher` missing).
+- GREEN: `cargo test --lib` -> 74 passed (2 new: attribute is a `String` attribute; `SnsPublishFailed` Display + source chain + not a connection error). `cargo test --test sns_publisher_localstack -- --ignored` -> 2 passed (body/attribute reach each raw-subscribed SQS queue; missing topic yields `SnsPublishFailed`).
+- LocalStack image: `localstack/localstack:4.4` (runs without an auth token; readiness = `Ready.` log line).
+- Dependencies: `aws-config 1.12.0` (`behavior-version-latest`), `aws-sdk-sns 1.116.0`; `aws-sdk-sqs 1.114.0` as a dev-dependency only (MSG-GW-03 promotes it to a normal dependency).
+- Change: new `src/sns.rs` (`SnsScanPublisher::{from_client, connect}`, implements `ScanRequestPublisher`, `routing_key` String attribute, bodies never logged, 256 KB limit documented); `BrokerError::SnsPublishFailed { topic, source: Box<dyn Error + Send + Sync> }`; `pub mod sns` in `src/lib.rs`; `tests/sns_publisher_localstack.rs`; Makefile comment.
