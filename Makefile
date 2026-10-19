@@ -26,7 +26,8 @@ lint:
 test:
 	cargo test
 
-# Integration tests against a real RabbitMQ via testcontainers (requires Docker).
+# Integration tests against a real RabbitMQ and a real LocalStack (SNS/SQS) via
+# testcontainers (requires Docker).
 test-integration:
 	cargo test -- --ignored
 
