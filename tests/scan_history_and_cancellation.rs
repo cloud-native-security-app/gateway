@@ -420,7 +420,7 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 fn install_crypto_provider_once() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         // Instalación defensiva del backend criptográfico de `rustls`, ver
-        // `progress/explore_lapin_testcontainers.md` §4.
+        // `docs/decisions.md` D-07.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
@@ -474,7 +474,7 @@ async fn start_rabbitmq() -> ContainerAsync<GenericImage> {
 /// Conexión AMQPS "a mano" (sin pasar por `gateway::broker`, que solo expone
 /// publicar) usada por el test para preparar/leer la cola de verificación
 /// con el usuario `lab-admin` (ver
-/// `progress/explore_lapin_testcontainers.md` §3: el usuario `gateway` tiene
+/// `docs/decisions.md` D-07: el usuario `gateway` tiene
 /// `configure: "^$"`, no puede declarar nada).
 async fn connect_lapin_as(
     user: &str,

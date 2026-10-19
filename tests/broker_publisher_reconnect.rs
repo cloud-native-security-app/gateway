@@ -5,7 +5,7 @@
 //! (vía la Management HTTP API de `rabbitmq:4.3.5-management`, `DELETE
 //! /api/connections/{name}` -- el usuario `gateway` no tiene permiso
 //! `configure` para declarar nada por sí mismo, ver
-//! `progress/explore_lapin_testcontainers.md` §3, pero cerrar su propia
+//! `docs/decisions.md` D-07, pero cerrar su propia
 //! conexión desde afuera no necesita ese permiso, así que esto es más
 //! simple y determinista que reiniciar el contenedor entero) y se confirma
 //! que una publicación posterior tiene éxito **sin reiniciar el proceso**
@@ -58,7 +58,7 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 fn install_crypto_provider_once() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         // Instalación defensiva del backend criptográfico de `rustls`, ver
-        // `progress/explore_lapin_testcontainers.md` §4.
+        // `docs/decisions.md` D-07.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }

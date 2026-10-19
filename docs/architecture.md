@@ -22,6 +22,25 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
                                    gateway.scan-outcomes (SSE hacia front)
 ```
 
+## Responsabilidades
+
+Gateway es el único componente público (subred pública); todo lo demás
+(`ms-usuarios`, `ms-nmap`, `ms-analisis`, el Broker y sus bases de datos)
+vive en subred privada sin exposición directa a internet (RNF-03).
+
+- Handshake OAuth 2.0 / OIDC contra Google y sesión propia (RF-01, RNF-02,
+  RF-10); `front` nunca ve el token de Google.
+- Enrutamiento centralizado hacia los servicios internos, ocultando su
+  ubicación real (RF-09): hoy `ms-usuarios` (HTTP síncrono) y el Broker
+  (`ScanRequest`/`ScanCancellation` publicados, `ScanOutcome` consumido).
+- Validación de IP/rango (RF-02/RF-03), encolado en el Broker y respuesta
+  inmediata con un `scanId` (RF-04; RNF-04: `POST` en < 500 ms).
+- Avance de escaneos en tiempo real por SSE (RF-07/RF-08), rate limiting por
+  usuario (RF-12) y documentación OpenAPI (RNF-08).
+
+Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
+`ms-analisis`, el Broker y `front`.
+
 ## Decisiones de diseño ya tomadas
 
 - **Gateway hace el handshake OIDC, nunca `front`.** `front` solo redirige
@@ -80,7 +99,7 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
   exponencial, pocos intentos) sin necesitar ningún mecanismo de
   sincronización — ver el detalle en los doc-comments de `BrokerPublisher`/
   `BrokerConsumer` en `src/broker.rs`.
-- **Rate limiting por usuario (RF-12)** con `tower_governor` sobre la ruta
+- **Rate limiting por usuario (RF-12)** con un limitador en memoria propio sobre la ruta
   de encolado de escaneos, con la identidad de la sesión de Gateway como
   clave (no la IP del cliente, que puede compartirse tras un NAT/proxy).
 - **OpenAPI/Swagger (RNF-08)** generado desde el propio código (p. ej.
@@ -95,13 +114,12 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
 requiere además `network_user`, `ssh_credentials_ref` (credencial SSH real)
 y `has_sudo`. La decisión tomada con el usuario es que **`ms-usuarios`
 guardará esos datos por usuario/objetivo**, pero **esa API todavía no existe
-en `user-service`** (no está en su `feature_list.json` a la fecha de este
+en `user-service`** (no estaba entre sus features a la fecha de este
 documento).
 
 Mientras esa dependencia no exista:
 
-- La feature `scan_submission` de este repo (ver `feature_list.json`)
-  implementa la llamada a `ms-usuarios` para resolver esos 3 campos **contra
+- La feature `scan_submission` de este repo implementa la llamada a `ms-usuarios` para resolver esos 3 campos **contra
   el contrato que se acuerde cuando esa feature se añada en `user-service`**
   — no se inventa aquí el shape de esa respuesta.
 - Si la llamada falla porque el endpoint no existe todavía (404) o porque
@@ -121,7 +139,7 @@ La visualización del reporte final (RF-11) requiere consultar a
 ningún endpoint de reporte hasta que `ms-analisis` exista y documente su
 propio contrato — no se asume aquí su forma. `front/docs` ya tiene una
 feature de UI para esto (`report_view`); el endpoint de Gateway
-correspondiente se añade a `feature_list.json` cuando esa dependencia se
+correspondiente se añade cuando esa dependencia se
 resuelva, no antes.
 
 ## Capas
@@ -158,7 +176,7 @@ resuelva, no antes.
     `wiring`, `lib::run(...)`.
 
 No introducir capas adicionales hasta que haya una razón concreta
-documentada en `feature_list.json`.
+documentada en `docs/decisions.md` o en el documento de la tarea (`odd/tasks/`).
 
 ## Manejo de errores
 

@@ -336,7 +336,7 @@ pub struct AppState {
 /// (ver [`require_session`](crate::auth::require_session)): un logout debe
 /// poder invocarse incluso con una sesión ya ausente/inválida/expirada, sin
 /// que el middleware lo rechace con `401` antes de poder borrar la cookie
-/// del navegador. Decisión documentada en `progress/impl_session_middleware_and_me.md`.
+/// del navegador. Decisión documentada en `docs/decisions.md` D-09.
 pub fn auth_router(state: AppState) -> Router {
     Router::new()
         .route("/auth/login", get(login))
