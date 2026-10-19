@@ -265,6 +265,17 @@ pub enum BrokerError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Falló una operación contra una cola SQS (enviar a la DLQ o borrar un
+    /// mensaje; adaptador [`crate::sqs::SqsScanOutcomeConsumer`]). La causa
+    /// del SDK se conserva en `source`; jamás incluye el cuerpo del mensaje.
+    #[error("falló una operación contra la cola SQS '{queue}'")]
+    SqsFailed {
+        /// URL de la cola contra la que se intentó la operación.
+        queue: String,
+        /// Error original del SDK de AWS, borrado a un trait object.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// No se pudo serializar el `ScanRequest` a JSON antes de publicarlo.
     #[error("no se pudo serializar la solicitud de escaneo")]
     SerializationFailed(#[source] serde_json::Error),

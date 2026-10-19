@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 axum = "0.7"
 axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
 cookie = { version = "0.18.2", default-features = false }
@@ -63,6 +63,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
 aws-sdk-sns = "1.116.0"
+# `aws-sdk-sqs` (promovida de dev-dependency en MSG-GW-03) para el consumidor SQS;
+# `tokio-util` aporta `CancellationToken`, la señal de shutdown de `SqsScanOutcomeConsumer::run`.
+aws-sdk-sqs = "1.114.0"
+tokio-util = "0.7"
 
 [dev-dependencies]
 testcontainers = "0.20"
@@ -83,4 +87,3 @@ reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 # una dependencia transitiva de `reqwest`, se declara explícita para poder
 # nombrarla en `tests/`).
 bytes = "1"
-aws-sdk-sqs = "1.114.0"
