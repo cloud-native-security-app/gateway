@@ -58,6 +58,25 @@ const ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS: &str = "SCAN_SUBMISSION_RATE_
 /// ventana de tiempo sobre la que se cuenta
 /// [`ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS`] (RF-12).
 const ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS: &str = "SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS";
+/// Nombre de la variable de entorno con la región de AWS usada por los
+/// clientes SNS/SQS. Requerida y no vacía.
+const ENV_AWS_REGION: &str = "AWS_REGION";
+/// Nombre de la variable de entorno con el endpoint alternativo de AWS
+/// (solo LocalStack). Opcional: si no se define, se usa el endpoint real de
+/// AWS.
+const ENV_AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
+/// Nombre de la variable de entorno con el ARN del topic SNS de solicitudes
+/// de escaneo.
+const ENV_SCAN_REQUESTS_TOPIC_ARN: &str = "SCAN_REQUESTS_TOPIC_ARN";
+/// Nombre de la variable de entorno con el ARN del topic SNS de
+/// cancelaciones de escaneo.
+const ENV_SCAN_CANCELLATIONS_TOPIC_ARN: &str = "SCAN_CANCELLATIONS_TOPIC_ARN";
+/// Nombre de la variable de entorno con la URL de la cola SQS de resultados
+/// de escaneo que consume este Gateway.
+const ENV_SCAN_OUTCOMES_QUEUE_URL: &str = "GATEWAY_SCAN_OUTCOMES_QUEUE_URL";
+/// Nombre de la variable de entorno con la URL de la dead-letter queue SQS
+/// asociada a la cola de resultados de escaneo.
+const ENV_SCAN_OUTCOMES_DLQ_URL: &str = "GATEWAY_SCAN_OUTCOMES_DLQ_URL";
 
 /// Configuración completa del servicio, cargada desde variables de entorno.
 ///
@@ -120,6 +139,22 @@ pub struct Config {
     /// Duración, en segundos, de la ventana de tiempo sobre la que se cuenta
     /// [`Config::scan_submission_rate_limit_max_requests`].
     pub scan_submission_rate_limit_window_secs: u64,
+    /// Región de AWS usada por los clientes SNS/SQS. Las credenciales nunca
+    /// se configuran aquí: vienen de la cadena de proveedores por defecto de
+    /// AWS (rol de la tarea ECS).
+    pub aws_region: String,
+    /// Endpoint alternativo de AWS (solo LocalStack). `None` usa el endpoint
+    /// real de AWS.
+    pub aws_endpoint_url: Option<url::Url>,
+    /// ARN del topic SNS en el que se publican las solicitudes de escaneo.
+    pub scan_requests_topic_arn: String,
+    /// ARN del topic SNS en el que se publican las cancelaciones de escaneo.
+    pub scan_cancellations_topic_arn: String,
+    /// URL de la cola SQS de la que este Gateway consume los resultados de
+    /// escaneo.
+    pub scan_outcomes_queue_url: url::Url,
+    /// URL de la dead-letter queue de [`Config::scan_outcomes_queue_url`].
+    pub scan_outcomes_dlq_url: url::Url,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -152,6 +187,14 @@ pub enum ConfigError {
         #[source]
         source: url::ParseError,
     },
+    /// Una variable de entorno que debe ser el ARN de un topic SNS
+    /// (`arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>`) no
+    /// tiene esa forma. El valor no se incluye en el error.
+    #[error("la variable de entorno {name} no es un ARN de topic SNS válido")]
+    InvalidArn {
+        /// Nombre de la variable de entorno inválida.
+        name: &'static str,
+    },
 }
 
 /// Lee una variable de entorno requerida como `String`.
@@ -160,6 +203,63 @@ pub enum ConfigError {
 /// UTF-8 válido.
 fn required_string(name: &'static str) -> Result<String, ConfigError> {
     env::var(name).map_err(|_| ConfigError::Missing { name })
+}
+
+/// Lee una variable de entorno requerida que no puede estar vacía.
+///
+/// Devuelve [`ConfigError::Missing`] si la variable no está definida, no es
+/// UTF-8 válido o está vacía.
+fn required_non_empty_string(name: &'static str) -> Result<String, ConfigError> {
+    required_string(name).and_then(|value| {
+        if value.trim().is_empty() {
+            Err(ConfigError::Missing { name })
+        } else {
+            Ok(value)
+        }
+    })
+}
+
+/// Lee una variable de entorno requerida y la parsea como URL absoluta.
+fn required_url(name: &'static str) -> Result<url::Url, ConfigError> {
+    let value = required_string(name)?;
+    url::Url::parse(&value).map_err(|source| ConfigError::InvalidUrl { name, source })
+}
+
+/// Lee una variable de entorno opcional y, si está definida, la parsea como
+/// URL absoluta. Devuelve `None` si no está definida.
+fn optional_url(name: &'static str) -> Result<Option<url::Url>, ConfigError> {
+    match env::var(name) {
+        Ok(value) => url::Url::parse(&value)
+            .map(Some)
+            .map_err(|source| ConfigError::InvalidUrl { name, source }),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Lee una variable de entorno requerida que debe ser el ARN de un topic SNS.
+fn required_sns_topic_arn(name: &'static str) -> Result<String, ConfigError> {
+    let value = required_string(name)?;
+    if is_sns_topic_arn(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::InvalidArn { name })
+    }
+}
+
+/// `true` si `value` tiene la forma
+/// `arn:<partición>:sns:<región>:<cuenta de 12 dígitos>:<nombre>`.
+fn is_sns_topic_arn(value: &str) -> bool {
+    let parts: Vec<&str> = value.split(':').collect();
+    let [arn, partition, service, region, account, name] = parts.as_slice() else {
+        return false;
+    };
+    *arn == "arn"
+        && !partition.is_empty()
+        && *service == "sns"
+        && !region.is_empty()
+        && account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && !name.is_empty()
 }
 
 /// Lee una variable de entorno requerida y la envuelve en [`SecretString`].
@@ -235,6 +335,13 @@ impl Config {
                     name: ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
                     source,
                 })?;
+        let aws_region = required_non_empty_string(ENV_AWS_REGION)?;
+        let aws_endpoint_url = optional_url(ENV_AWS_ENDPOINT_URL)?;
+        let scan_requests_topic_arn = required_sns_topic_arn(ENV_SCAN_REQUESTS_TOPIC_ARN)?;
+        let scan_cancellations_topic_arn =
+            required_sns_topic_arn(ENV_SCAN_CANCELLATIONS_TOPIC_ARN)?;
+        let scan_outcomes_queue_url = required_url(ENV_SCAN_OUTCOMES_QUEUE_URL)?;
+        let scan_outcomes_dlq_url = required_url(ENV_SCAN_OUTCOMES_DLQ_URL)?;
 
         Ok(Self {
             http_host,
@@ -253,6 +360,12 @@ impl Config {
             ms_usuarios_shared_secret,
             scan_submission_rate_limit_max_requests,
             scan_submission_rate_limit_window_secs,
+            aws_region,
+            aws_endpoint_url,
+            scan_requests_topic_arn,
+            scan_cancellations_topic_arn,
+            scan_outcomes_queue_url,
+            scan_outcomes_dlq_url,
         })
     }
 }
@@ -282,7 +395,20 @@ mod tests {
         ENV_MS_USUARIOS_SHARED_SECRET,
         ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
         ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
+        ENV_AWS_REGION,
+        ENV_SCAN_REQUESTS_TOPIC_ARN,
+        ENV_SCAN_CANCELLATIONS_TOPIC_ARN,
+        ENV_SCAN_OUTCOMES_QUEUE_URL,
+        ENV_SCAN_OUTCOMES_DLQ_URL,
     ];
+
+    const VALID_REQUESTS_TOPIC_ARN: &str = "arn:aws:sns:us-east-1:123456789012:scan-requests";
+    const VALID_CANCELLATIONS_TOPIC_ARN: &str =
+        "arn:aws:sns:us-east-1:123456789012:scan-cancellations";
+    const VALID_OUTCOMES_QUEUE_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/gateway-scan-outcomes";
+    const VALID_OUTCOMES_DLQ_URL: &str =
+        "https://sqs.us-east-1.amazonaws.com/123456789012/gateway-scan-outcomes-dlq";
 
     /// Valor de laboratorio para `BROKER_AMQPS_URL`, no una credencial real
     /// (ver `docs/security-scope.md`).
@@ -293,6 +419,7 @@ mod tests {
             env::remove_var(name);
         }
         env::remove_var(ENV_GOOGLE_OIDC_ISSUER_URL);
+        env::remove_var(ENV_AWS_ENDPOINT_URL);
     }
 
     fn set_all_valid_vars() {
@@ -310,6 +437,14 @@ mod tests {
         env::set_var(ENV_MS_USUARIOS_SHARED_SECRET, "lab-only-not-a-real-secret");
         env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS, "5");
         env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS, "60");
+        env::set_var(ENV_AWS_REGION, "us-east-1");
+        env::set_var(ENV_SCAN_REQUESTS_TOPIC_ARN, VALID_REQUESTS_TOPIC_ARN);
+        env::set_var(
+            ENV_SCAN_CANCELLATIONS_TOPIC_ARN,
+            VALID_CANCELLATIONS_TOPIC_ARN,
+        );
+        env::set_var(ENV_SCAN_OUTCOMES_QUEUE_URL, VALID_OUTCOMES_QUEUE_URL);
+        env::set_var(ENV_SCAN_OUTCOMES_DLQ_URL, VALID_OUTCOMES_DLQ_URL);
     }
 
     #[test]
@@ -345,6 +480,137 @@ mod tests {
         );
         assert_eq!(config.scan_submission_rate_limit_max_requests, 5);
         assert_eq!(config.scan_submission_rate_limit_window_secs, 60);
+        assert_eq!(config.aws_region, "us-east-1");
+        assert_eq!(config.aws_endpoint_url, None);
+        assert_eq!(config.scan_requests_topic_arn, VALID_REQUESTS_TOPIC_ARN);
+        assert_eq!(
+            config.scan_cancellations_topic_arn,
+            VALID_CANCELLATIONS_TOPIC_ARN
+        );
+        assert_eq!(
+            config.scan_outcomes_queue_url.as_str(),
+            VALID_OUTCOMES_QUEUE_URL
+        );
+        assert_eq!(
+            config.scan_outcomes_dlq_url.as_str(),
+            VALID_OUTCOMES_DLQ_URL
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn aws_endpoint_url_present_and_valid_is_some() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_AWS_ENDPOINT_URL, "http://localstack:4566");
+
+        let config = Config::from_env().expect("config válida debe cargar");
+
+        assert_eq!(
+            config.aws_endpoint_url.as_ref().map(url::Url::as_str),
+            Some("http://localstack:4566/")
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn aws_endpoint_url_invalid_produces_typed_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_AWS_ENDPOINT_URL, "not-a-url");
+
+        let result = Config::from_env();
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidUrl {
+                    name: ENV_AWS_ENDPOINT_URL,
+                    ..
+                })
+            ),
+            "esperaba ConfigError::InvalidUrl para {ENV_AWS_ENDPOINT_URL}, obtuve {result:?}"
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn empty_aws_region_is_treated_as_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_AWS_REGION, "");
+
+        let result = Config::from_env();
+
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::Missing {
+                    name: ENV_AWS_REGION
+                })
+            ),
+            "esperaba ConfigError::Missing para {ENV_AWS_REGION}, obtuve {result:?}"
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn malformed_topic_arns_produce_typed_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let malformed = [
+            "not-an-arn",
+            "arn:aws:sqs:us-east-1:123456789012:scan-requests",
+            "arn:aws:sns:us-east-1:123456789012",
+            "arn:aws:sns:us-east-1:12345:scan-requests",
+            "arn:aws:sns:us-east-1:123456789012:",
+            "arn:aws:sns::123456789012:scan-requests",
+            "arn::sns:us-east-1:123456789012:scan-requests",
+        ];
+
+        for name in [
+            ENV_SCAN_REQUESTS_TOPIC_ARN,
+            ENV_SCAN_CANCELLATIONS_TOPIC_ARN,
+        ] {
+            for value in malformed {
+                clear_all_vars();
+                set_all_valid_vars();
+                env::set_var(name, value);
+
+                let result = Config::from_env();
+
+                assert!(
+                    matches!(result, Err(ConfigError::InvalidArn { name: n }) if n == name),
+                    "esperaba ConfigError::InvalidArn para {name}={value}, obtuve {result:?}"
+                );
+            }
+        }
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn malformed_queue_urls_produce_invalid_url_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        for name in [ENV_SCAN_OUTCOMES_QUEUE_URL, ENV_SCAN_OUTCOMES_DLQ_URL] {
+            clear_all_vars();
+            set_all_valid_vars();
+            env::set_var(name, "not-a-url");
+
+            let result = Config::from_env();
+
+            assert!(
+                matches!(result, Err(ConfigError::InvalidUrl { name: n, .. }) if n == name),
+                "esperaba ConfigError::InvalidUrl para {name}, obtuve {result:?}"
+            );
+        }
 
         clear_all_vars();
     }

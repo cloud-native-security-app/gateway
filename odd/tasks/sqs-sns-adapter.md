@@ -50,7 +50,7 @@ Out:
 
 ## Checklist
 
-- [ ] MSG-GW-01 Config: parse the SQS/SNS variables (typed errors, no secrets in `Debug`), remove `BROKER_*` config; RED: config tests first.
+- [x] MSG-GW-01 Config: parse the SQS/SNS variables (typed errors, no secrets in `Debug`), RED: config tests first. `BROKER_*` removal moves to MSG-GW-04 so the build stays green.
 - [ ] MSG-GW-02 Publisher on `aws-sdk-sns`: publish `ScanRequest` / `ScanCancellation` with the `routing_key` attribute; LocalStack test verifies the body and attribute reach the subscribed queue.
 - [ ] MSG-GW-03 Consumer on `aws-sdk-sqs` for `gateway-scan-outcomes`: long poll, delete after success, malformed handling, redrive to DLQ after 3 receives (LocalStack test), graceful shutdown replacing the AMQP reconnect loop.
 - [ ] MSG-GW-04 Wiring and cleanup: update `src/wiring.rs`, drop `lapin` and `lapin`-related dependencies from `Cargo.toml`, LocalStack in `docker-compose` and README, `make verify` green.
@@ -72,3 +72,11 @@ Planned. Blocked on broker MSG-01 (topology sign-off) for final names and on MSG
 ## Next step
 
 MSG-GW-01 once broker MSG-01 is signed off (config can start with the proposed names).
+
+## MSG-GW-01 evidence
+
+- Route: delegated writer (single bounded writer, parent reviews). `BROKER_*` kept until MSG-GW-04.
+- RED: `cargo test --lib config` -> compile failure (`could not compile gateway (lib test)`, 28 errors: missing `ENV_AWS_*` / `ENV_SCAN_*` constants, `Config` fields and `ConfigError::InvalidArn`).
+- GREEN: `cargo test --lib config` -> 14 passed, 0 failed (7 new/extended tests: new fields load, optional endpoint Some/invalid, empty region, malformed topic ARNs, malformed queue URLs, all new vars in the Missing loop).
+- Full: `cargo fmt --check` ok; `cargo clippy --all-targets -- -D warnings` clean; `cargo test` all non-ignored pass (72 unit); `cargo doc --no-deps` ok.
+- Change: `src/config.rs` adds `aws_region`, `aws_endpoint_url: Option<Url>`, `scan_requests_topic_arn`, `scan_cancellations_topic_arn`, `scan_outcomes_queue_url: Url`, `scan_outcomes_dlq_url: Url`, `ConfigError::InvalidArn { name }` (value never echoed); README env table gains the 6 vars.
