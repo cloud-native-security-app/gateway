@@ -9,7 +9,7 @@
 #     contiene únicamente el binario `gateway`. Sin toolchain, sin código
 #     fuente, sin shell/coreutils. Los certificados CA de la imagen base
 #     cubren el TLS saliente que este binario negocia hacia 3 destinos:
-#     Google (OIDC), `ms-usuarios` (si su URL es https) y el Broker (AMQPS).
+#     Google (OIDC), `ms-usuarios` (si su URL es https) y AWS SNS/SQS (HTTPS).
 #
 # Las imágenes base se fijan por tag concreto Y por digest (`@sha256:...`) para
 # builds reproducibles. Mismos digests que ya usa `user-service/Dockerfile`
@@ -49,7 +49,7 @@ RUN touch src/lib.rs src/main.rs \
 # Stage 2 — runtime
 # ---------------------------------------------------------------------------
 # distroless/cc-debian12: glibc + libgcc (para el binario Rust), paquete
-# ca-certificates (TLS saliente hacia Google, ms-usuarios y el Broker vía
+# ca-certificates (TLS saliente hacia Google, ms-usuarios y AWS SNS/SQS vía
 # rustls) y el usuario no-root `nonroot` (uid 65532). No trae shell ni
 # gestor de paquetes.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f

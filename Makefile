@@ -26,8 +26,8 @@ lint:
 test:
 	cargo test
 
-# Integration tests against a real RabbitMQ and a real LocalStack (SNS/SQS) via
-# testcontainers (requires Docker).
+# Integration tests against a real LocalStack (SNS/SQS, localstack/localstack:4.4)
+# via testcontainers (requires Docker); no AWS account or credentials needed.
 test-integration:
 	cargo test -- --ignored
 

@@ -1,8 +1,8 @@
 //! Adaptador SNS del puerto [`ScanRequestPublisher`] (tarea MSG-GW-02).
 //!
-//! Publica los mismos cuerpos JSON que [`crate::broker::BrokerPublisher`]
-//! (`serde_json::to_string` de [`ScanRequest`]/[`ScanCancellation`]) en dos
-//! topics SNS, y transporta la antigua routing key AMQP como atributo de
+//! Publica los cuerpos JSON del contrato (`serde_json::to_string` de
+//! [`ScanRequest`]/[`ScanCancellation`]) en dos topics SNS, y transporta la
+//! routing key (herencia del antiguo Broker AMQP) como atributo de
 //! mensaje `String` llamado `routing_key`, para que las colas SQS suscritas
 //! (con `RawMessageDelivery=true`) puedan filtrar por él.
 //!

@@ -315,7 +315,7 @@ pub struct AppState {
     /// Publicador de mensajes hacia el Broker (feature `scan_submission`).
     /// Guardado como `Arc<dyn ScanRequestPublisher>` para que los tests de
     /// otras features puedan inyectar un doble de prueba en vez de una
-    /// conexión AMQPS real (ver `crate::broker::ScanRequestPublisher`).
+    /// conexión real a SNS (ver `crate::broker::ScanRequestPublisher`).
     pub broker_publisher: Arc<dyn ScanRequestPublisher>,
     /// Registro en memoria de a qué sesión/`scan_id` de `ms-usuarios`
     /// pertenece cada `scanId` propio de este Gateway (feature
@@ -902,8 +902,8 @@ impl IntoResponse for ScanCancelError {
             ScanCancelError::Usuarios(err) => err.into_response(),
             ScanCancelError::Broker(err) => {
                 // `?err` (Debug), no `%err` (Display): `BrokerError` deriva
-                // `Debug` y sus variantes anotan el `lapin::Error` original
-                // como `#[source]` (ver `src/broker.rs`), así que el Debug
+                // `Debug` y sus variantes anotan el error original del SDK
+                // de AWS como `#[source]` (ver `src/broker.rs`), así que el Debug
                 // derivado encadena esa causa real en el log del servidor —
                 // a propósito nunca en el `Display`, que es lo único que
                 // llega a un llamante HTTP (feature `log_broker_publish_errors`,
@@ -923,7 +923,7 @@ impl IntoResponse for ScanCancelError {
 /// verifica que pertenece a la sesión activa, consulta a `ms-usuarios` el
 /// estado actual de su entrada de histórico y, si todavía no llegó a un
 /// estado terminal, publica un [`ScanCancellation`] válido en
-/// [`crate::broker::EXCHANGE_SCAN_CANCELLATIONS`].
+/// el topic SNS de cancelaciones (ver [`crate::sns::SnsScanPublisher`]).
 ///
 /// Decisión de diseño: el estado "actual" se resuelve consultando a
 /// `ms-usuarios` (vía [`UsuariosClient::list_scan_history`], buscando la

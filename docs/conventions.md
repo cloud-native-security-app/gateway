@@ -24,10 +24,10 @@
   qué puede fallar). El crate activa `#![deny(missing_docs)]` en
   `src/lib.rs` (no en `src/main.rs`).
 - **Tests de integración con IO real:** se levantan con el crate
-  `testcontainers` (contenedor `rabbitmq:management` oficial, mismo tag que
-  usa `broker/docker-compose.yml`, para `broker`; un servidor HTTP de test
-  en memoria o un stub real para `usuarios_client`). Nunca mocks del canal
-  AMQP — ver `docs/verification.md`.
+  `testcontainers` (contenedor `localstack/localstack:4.4` para SNS/SQS, ver
+  `tests/common/mod.rs`; un servidor HTTP de test en memoria o un stub real
+  para `usuarios_client`). Nunca mocks del SDK de AWS — ver
+  `docs/verification.md`.
 - **Todo test que dependa de Docker vía `testcontainers` se marca**
   `#[ignore = "requiere Docker"]`. Así `cargo test` (sin flags) corre rápido
   y sin depender de Docker, y `cargo test -- --ignored` corre específicamente
@@ -67,10 +67,9 @@ use crate::domain::ScanSubmission;
   para lógica pura (`domain`, validación de IP/rango).
 - Tests de integración: en `tests/`, un archivo por módulo que cruza un
   límite de IO real (`broker`, `usuarios_client`, `api` end-to-end).
-- Los tests de `broker` corren contra un contenedor `rabbitmq:management`
-  real con la topología copiada de `broker/rabbitmq/definitions.json` (ver
-  `docs/architecture.md`), nunca contra el Broker de producción ni con un
-  mock del protocolo AMQP.
+- Los tests de `broker` (`sns`/`sqs`) corren contra un contenedor LocalStack
+  real que crea su propia topología en cada test (ver `docs/architecture.md`),
+  nunca contra AWS real ni con un mock del SDK.
 - Los tests de `usuarios_client` corren contra un servidor HTTP de test que
   implementa el contrato documentado de `ms-usuarios` (nunca contra
   `user-service` de producción).
@@ -82,17 +81,17 @@ use crate::domain::ScanSubmission;
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
-    #[error("no se pudo conectar al Broker")]
-    ConnectionFailed,
-    #[error("fallo al publicar en {exchange}")]
-    PublishFailed { exchange: &'static str },
+    #[error("no se pudo publicar en el topic SNS '{topic}'")]
+    SnsPublishFailed { topic: String },
+    #[error("falló una operación contra la cola SQS '{queue}'")]
+    SqsFailed { queue: String },
     #[error("error inesperado de backend")]
     Backend,
 }
 ```
 
 Los mensajes de error nunca incluyen el token de Google, la sesión firmada,
-la credencial compartida con `ms-usuarios`, ni la credencial AMQPS.
+la credencial compartida con `ms-usuarios`, ni el cuerpo de un mensaje del Broker.
 
 ## Comentarios
 

@@ -25,6 +25,8 @@ que no son evidentes leyendo el código.
 
 ## D-03 — `lapin` 2.x con executor de `tokio` y conexión persistente
 
+> Reemplazada por D-15 (SNS + SQS); se conserva como historial.
+
 - **Contexto:** `broker/` usa `lapin` 4; la API de conexión difiere de la 2.5.
 - **Decisión:** `lapin = "2"` (`rustls`, sin features por defecto) más
   `tokio-executor-trait`/`tokio-reactor-trait` para correr sobre el runtime de
@@ -37,6 +39,8 @@ que no son evidentes leyendo el código.
 
 ## D-04 — Publicación: confirms y presupuesto de 500 ms
 
+> Reemplazada por D-15: el equivalente de los confirms es el `MessageId` de SNS.
+
 - **Decisión:** el canal activa `confirm_select` una vez y
   `publish_scan_request` espera el ack real del Broker (no solo el envío del
   frame); el costo es de pocos ms dentro de la subred privada, muy por debajo
@@ -44,6 +48,8 @@ que no son evidentes leyendo el código.
   credencial AMQPS en su `Display`.
 
 ## D-05 — Consumo: mensaje malformado se descarta sin requeue
+
+> Reemplazada por D-15: los malformados se reenvían a la DLQ y se borran.
 
 - **Decisión:** un `ScanOutcome` que no deserializa se rechaza con
   `reject`/`nack(requeue = false)`, no `ack` (perdería el rastro) ni requeue
@@ -59,6 +65,8 @@ que no son evidentes leyendo el código.
   (solo `dev-dependencies`). Atención a la sintaxis de ruta `{scan_id}` de `axum`.
 
 ## D-07 — Tests de integración con Docker real y AMQPS
+
+> Reemplazada por D-15: los tests usan LocalStack; se conserva la regla de `#[ignore = "requiere Docker"]`.
 
 - **Decisión:** `testcontainers` 0.20 (`GenericImage`, sin
   `testcontainers-modules`) levanta `rabbitmq:*-management` con la topología
@@ -97,6 +105,8 @@ que no son evidentes leyendo el código.
 
 ## D-11 — Reconexión al Broker (publicador y consumidor)
 
+> Reemplazada por D-15: el SDK de AWS no mantiene conexiones persistentes; el consumidor reintenta con backoff.
+
 - **Contexto:** incidentes en AWS: al reiniciarse RabbitMQ, todo
   `POST /api/scans` daba 502 hasta reiniciar gateway, y el relay SSE moría en
   silencio mientras `/health` seguía sano. `lapin` 2.5 no reconecta solo.
@@ -120,4 +130,40 @@ que no son evidentes leyendo el código.
 
 - **Decisión:** build multi-stage (`rust:1.98-bookworm` a `distroless/cc:nonroot`),
   bases fijadas por tag y digest para builds reproducibles. Los CA del sistema de
-  la imagen base cubren el TLS saliente hacia Google, `ms-usuarios` y el Broker.
+  la imagen base cubren el TLS saliente hacia Google, `ms-usuarios` y el Broker
+  (desde D-15, los endpoints HTTPS de SNS/SQS).
+
+## D-15 — SNS + SQS reemplazan a RabbitMQ/`lapin`
+
+- **Contexto:** Amazon MQ no está disponible en el Learner Lab y se eligió
+  mensajería gestionada (SNS + SQS). Reemplaza a D-03, D-04, D-05, D-07 y D-11
+  (se conservan como historial). Fecha: 2026-10-17; consumo con borrado tras
+  `handle`: 2026-10-19.
+- **Decisión:**
+  - Publicar con `aws-sdk-sns` en dos topics; la antigua routing key viaja como
+    atributo de mensaje `String` `routing_key` (`scan.request`,
+    `scan.cancellation`) y los cuerpos JSON no cambian. Un `Publish` exitoso
+    (devuelve `MessageId`) es el equivalente del confirm de D-04.
+  - Consumir con `aws-sdk-sqs` (long polling de 20 s). El mensaje se borra
+    **después** de que `ScanOutcomeHandler::handle` retorna (entrega al menos
+    una vez): un crash a mitad lo reentrega y, tras 3 recepciones, la
+    `RedrivePolicy` lo manda a la DLQ. El handler tolera duplicados (repite el
+    evento SSE y reaplica el mismo estado en `ms-usuarios`).
+  - Un mensaje malformado se reenvía a la DLQ (conservando `routing_key`) y se
+    borra de la cola; es el equivalente de `nack(requeue = false)` de D-05.
+  - Errores de recepción: backoff exponencial 1-30 s sin salir del bucle;
+    reemplaza a los intentos acotados de D-11. El SDK no mantiene conexiones
+    persistentes, así que no hay reconexión que gestionar.
+  - Shutdown ordenado en `gateway::run`: `SIGTERM`/`Ctrl-C` cancelan un
+    `CancellationToken`, axum drena (máx. 10 s) y se espera al consumidor
+    (máx. 10 s) antes de abortarlo.
+  - Credenciales de AWS solo por la cadena por defecto (rol de la tarea ECS);
+    `AWS_ENDPOINT_URL` solo para LocalStack. Se eliminan `BROKER_AMQPS_URL`,
+    `BROKER_VHOST`, `lapin`, `tokio-executor-trait`, `tokio-reactor-trait`, la
+    CA/certificados de laboratorio y el directorio `rabbitmq/`.
+  - Tests de integración con `localstack/localstack:4.4` vía `testcontainers`
+    (arnés en `tests/common/mod.rs`), sin mocks del SDK.
+- **Consecuencia:** el contrato de mensajes y los puertos
+  (`ScanRequestPublisher`, `ScanOutcomeHandler`) no cambian. La topología
+  (topics, colas, suscripciones raw, DLQ) la provee `broker`/Terraform; este
+  repo no la declara.

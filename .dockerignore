@@ -1,6 +1,6 @@
 # Contexto de build mínimo: solo lo que necesita `cargo build --release`.
 # NO excluir Cargo.toml, Cargo.lock (build reproducible) ni src/.
-# tests/ y rabbitmq/ (fixtures de testcontainers) no los necesita el binario
+# tests/ (arnés de testcontainers/LocalStack) no lo necesita el binario
 # de producción, solo `cargo test` — se excluyen del contexto de build.
 
 target/
@@ -10,7 +10,6 @@ target/
 progress/
 docs/
 tests/
-rabbitmq/
 *.md
 Dockerfile
 .dockerignore
