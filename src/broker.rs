@@ -51,9 +51,9 @@ pub struct ScanRequest {
     /// Identificador de correlación de la solicitud, generado por este
     /// Gateway antes de cualquier llamada externa (RF-04).
     pub correlation_id: String,
-    /// Dirección IP (o, si el objetivo era un rango CIDR ya validado por
-    /// [`crate::domain::ScanSubmission`], la cadena tal cual se validó)
-    /// objetivo del escaneo.
+    /// Dirección IP única objetivo del escaneo, ya normalizada por
+    /// [`crate::domain::ScanSubmission`] (siempre parseable como `IpAddr`,
+    /// nunca un CIDR).
     pub ip: String,
     /// Usuario de red resuelto por `ms-usuarios` para este objetivo.
     pub network_user: String,
