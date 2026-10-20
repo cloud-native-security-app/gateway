@@ -1161,16 +1161,16 @@ async fn default_no_store(mut response: Response) -> Response {
 /// al no coincidir con su propio origen). El criterio de aceptación de esta
 /// feature exige explícitamente que un origen no permitido no reciba la
 /// cabecera en absoluto, así que se compara contra `front_origin` a mano y
-/// solo se refleja si coincide exactamente. Permite `GET`/`POST` (los
-/// métodos que usa `front` hoy) y el header `Content-Type` (que `front`
-/// manda en toda llamada con cuerpo JSON).
+/// solo se refleja si coincide exactamente. Permite `GET`/`POST`/`DELETE`
+/// (los métodos que usa `front`; `DELETE` borra credenciales de red) y el
+/// header `Content-Type` (que `front` manda en toda llamada con cuerpo JSON).
 fn cors_layer(front_origin: HeaderValue) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _request_parts| {
             *origin == front_origin
         }))
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE])
 }
 
