@@ -18,7 +18,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
@@ -89,6 +89,80 @@ impl ScanRequestPublisher for AlwaysFailsToPublish {
     ) -> Result<(), BrokerError> {
         panic!("este escenario no debe llegar a publicar una cancelación en el Broker");
     }
+}
+
+/// Doble de prueba de [`ScanRequestPublisher`] que registra las `ip` de los
+/// `ScanRequest` publicados (bug `scan_target_single_ip`: lo publicado debe
+/// ser siempre una IP simple, nunca un CIDR).
+#[derive(Default, Clone)]
+struct RecordingPublisher {
+    published_ips: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for RecordingPublisher {
+    async fn publish_scan_request(&self, request: &ScanRequest) -> Result<(), BrokerError> {
+        self.published_ips
+            .lock()
+            .expect("lock")
+            .push(request.ip.clone());
+        Ok(())
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        panic!("este escenario no debe publicar una cancelación en el Broker");
+    }
+}
+
+/// Stub de `ms-usuarios` que registra los `target` recibidos al resolver
+/// credenciales y al registrar el histórico.
+async fn spawn_recording_usuarios_stub(seen: Arc<Mutex<Vec<String>>>) -> String {
+    #[derive(Clone)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
+
+    async fn resolve(State(seen): State<Seen>, Query(q): Query<ScanTargetQuery>) -> Json<Value> {
+        seen.0
+            .lock()
+            .expect("lock")
+            .push(format!("resolve:{}", q.target));
+        Json(json!({
+            "network_user": "netuser-lab",
+            "ssh_credentials_ref": "lab-only-not-a-real-secret",
+            "has_sudo": true,
+        }))
+    }
+
+    async fn history(State(seen): State<Seen>, Json(body): Json<Value>) -> Json<Value> {
+        let target = body["target"].clone();
+        seen.0
+            .lock()
+            .expect("lock")
+            .push(format!("history:{}", target.as_str().unwrap_or_default()));
+        Json(json!({
+            "scan_id": "ms-usuarios-history-1",
+            "user_id": "google-sub-123",
+            "target": target,
+            "status": "PENDIENTE",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+        }))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind del stub de ms-usuarios");
+    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
+    let app = Router::new()
+        .route("/users/me/scan-targets", get(resolve))
+        .route("/users/me/scans", post(history))
+        .with_state(Seen(seen));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("stub ms-usuarios");
+    });
+    format!("http://{addr}")
 }
 
 async fn serve_discovery(State(issuer_url): State<String>) -> Json<Value> {
@@ -362,6 +436,75 @@ async fn scan_submission_rejects_invalid_target_without_touching_ms_usuarios_or_
         body.contains("not-an-ip"),
         "el mensaje de error debe ser específico sobre el valor inválido: {body}"
     );
+}
+
+async fn post_target(gateway: &GatewayUnderTest, target: &str) -> reqwest::Response {
+    http_client()
+        .post(format!("http://{}/api/scans", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={}", valid_session_cookie_value()),
+        )
+        .json(&json!({ "target": target }))
+        .send()
+        .await
+        .expect("POST /api/scans debe responder")
+}
+
+#[tokio::test]
+async fn scan_submission_publishes_and_records_the_bare_ip_for_single_host_targets() {
+    let cases = [
+        ("192.0.2.10", "192.0.2.10"),
+        ("172.31.86.37/32", "172.31.86.37"),
+        ("2001:db8::1", "2001:db8::1"),
+        ("2001:db8::1/128", "2001:db8::1"),
+    ];
+    for (input, expected_ip) in cases {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let publisher = RecordingPublisher::default();
+        let usuarios_base_url = spawn_recording_usuarios_stub(seen.clone()).await;
+        let gateway = spawn_gateway(usuarios_base_url, Arc::new(publisher.clone())).await;
+
+        let response = post_target(&gateway, input).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "target {input}");
+        assert_eq!(
+            *publisher.published_ips.lock().expect("lock"),
+            vec![expected_ip.to_string()],
+            "el ScanRequest debe llevar la IP simple para {input}"
+        );
+        assert!(
+            expected_ip.parse::<std::net::IpAddr>().is_ok(),
+            "la ip publicada debe parsear como IpAddr"
+        );
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            vec![
+                format!("resolve:{expected_ip}"),
+                format!("history:{expected_ip}")
+            ],
+            "ms-usuarios debe recibir la IP simple para {input}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scan_submission_rejects_ranges_wider_than_a_single_host_with_400() {
+    for target in ["10.0.0.0/24", "2001:db8::/64"] {
+        let usuarios_base_url = unreachable_usuarios_base_url().await;
+        let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
+
+        let response = post_target(&gateway, target).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{target}"
+        );
+        let body = response.text().await.expect("cuerpo");
+        assert!(body.contains(target), "{body}");
+        assert!(body.contains("una única IP"), "{body}");
+    }
 }
 
 #[tokio::test]

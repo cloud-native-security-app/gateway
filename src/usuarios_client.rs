@@ -132,7 +132,7 @@ pub struct ScanHistoryEntry {
     pub scan_id: String,
     /// Identidad del usuario que solicitó el escaneo.
     pub user_id: String,
-    /// Objetivo del escaneo (IP o rango, tal como se envió).
+    /// Objetivo del escaneo (IP única, tal como se envió).
     pub target: String,
     /// Estado actual de la entrada.
     pub status: ScanStatus,

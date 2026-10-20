@@ -16,7 +16,7 @@ revisión, no solo un nice-to-have.
 
 ### Nivel 1 — Tests unitarios (obligatorio)
 
-Toda función pública de lógica pura (`domain`, validación de IP/rango,
+Toda función pública de lógica pura (`domain`, validación de IP única,
 construcción/validación de la sesión firmada) tiene al menos un test que:
 
 1. Cubre el camino feliz.
