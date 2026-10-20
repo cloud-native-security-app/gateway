@@ -301,6 +301,48 @@ async fn preflight_options_to_protected_route_does_not_require_session() {
     );
 }
 
+/// `front` borra credenciales de red con `DELETE /api/network-credentials/{id}`:
+/// el preflight de ese método tiene que permitirlo. Sin `DELETE` en
+/// `Access-Control-Allow-Methods`, el navegador aborta la llamada y `front`
+/// la reporta como un fallo de red (bug observado en vivo, 2026-10-20).
+#[tokio::test]
+async fn preflight_for_delete_on_network_credentials_allows_delete() {
+    let gateway = spawn_gateway().await;
+    let http = http_client_no_redirects();
+
+    let response = http
+        .request(
+            reqwest::Method::OPTIONS,
+            format!(
+                "http://{}/api/network-credentials/00000000-0000-0000-0000-000000000000",
+                gateway.addr
+            ),
+        )
+        .header(reqwest::header::ORIGIN, TEST_FRONT_ORIGIN)
+        .header("Access-Control-Request-Method", "DELETE")
+        .send()
+        .await
+        .expect("el preflight OPTIONS debe responder");
+
+    assert!(
+        response.status() == reqwest::StatusCode::OK
+            || response.status() == reqwest::StatusCode::NO_CONTENT,
+        "un preflight OPTIONS debe responder 200/204, no {}",
+        response.status()
+    );
+    let allowed = response
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("el preflight debe llevar Access-Control-Allow-Methods")
+        .to_str()
+        .expect("Access-Control-Allow-Methods debe ser ASCII")
+        .to_owned();
+    assert!(
+        allowed.split(',').any(|m| m.trim() == "DELETE"),
+        "el preflight debe permitir DELETE, permitió: {allowed}"
+    );
+}
+
 /// Criterio de aceptación 3: una request con un `Origin` distinto al
 /// configurado no recibe `Access-Control-Allow-Origin` (el navegador la
 /// bloquearía) — pero este Gateway igual la procesa normalmente del lado
