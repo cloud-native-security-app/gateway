@@ -64,7 +64,7 @@ use crate::domain::ScanSubmission;
 ## Tests
 
 - Tests unitarios: `#[cfg(test)] mod tests` al final del propio archivo,
-  para lógica pura (`domain`, validación de IP/rango).
+  para lógica pura (`domain`, validación de IP única).
 - Tests de integración: en `tests/`, un archivo por módulo que cruza un
   límite de IO real (`broker`, `usuarios_client`, `api` end-to-end).
 - Los tests de `broker` (`sns`/`sqs`) corren contra un contenedor LocalStack

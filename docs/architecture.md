@@ -33,7 +33,7 @@ vive en subred privada sin exposición directa a internet (RNF-03).
 - Enrutamiento centralizado hacia los servicios internos, ocultando su
   ubicación real (RF-09): hoy `ms-usuarios` (HTTP síncrono) y el Broker
   (`ScanRequest`/`ScanCancellation` publicados, `ScanOutcome` consumido).
-- Validación de IP/rango (RF-02/RF-03), encolado en el Broker y respuesta
+- Validación de IP única (o CIDR /32, /128) (RF-02/RF-03), encolado en el Broker y respuesta
   inmediata con un `scanId` (RF-04; RNF-04: `POST` en < 500 ms).
 - Avance de escaneos en tiempo real por SSE (RF-07/RF-08), rate limiting por
   usuario (RF-12) y documentación OpenAPI (RNF-08).
@@ -98,7 +98,7 @@ Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
 
 ## Dependencia pendiente: origen de `network_user`/`ssh_credentials_ref`/`has_sudo`
 
-`front` solo recoge una IP/rango del usuario (ver
+`front` solo recoge una única IP del usuario (ver
 `front/docs/architecture.md`), pero el `ScanRequest` que exige
 `broker/contracts/scan-request.schema.json` (copiado literal de `ms-nmap`)
 requiere además `network_user`, `ssh_credentials_ref` (credencial SSH real)

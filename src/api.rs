@@ -598,7 +598,7 @@ struct ScanHistoryEntryResponse {
     /// ausente si no hay mapeo conocido en [`ScanOwnershipRegistry`].
     #[serde(rename = "scanId", skip_serializing_if = "Option::is_none")]
     scan_id: Option<String>,
-    /// Objetivo del escaneo (IP o rango), tal como lo reporta `ms-usuarios`.
+    /// Objetivo del escaneo (IP), tal como lo reporta `ms-usuarios`.
     target: String,
     /// Estado actual de la entrada, tal como lo reporta `ms-usuarios`.
     status: ScanStatus,
@@ -655,7 +655,7 @@ async fn list_scan_history(
     Ok(Json(response))
 }
 
-/// Cuerpo de `POST /api/scans`: el objetivo (IP o rango CIDR) del escaneo
+/// Cuerpo de `POST /api/scans`: el objetivo (una única IP; se admite un CIDR /32 o /128, que se normaliza a la IP simple) del escaneo
 /// solicitado, sin validar todavía (ver [`ScanSubmission::parse`]).
 #[derive(Debug, Deserialize, ToSchema)]
 struct ScanSubmissionRequest {
@@ -677,7 +677,7 @@ struct ScanSubmissionResponse {
 /// único tipo con su propio mapeo a un status HTTP explícito.
 #[derive(Debug, thiserror::Error)]
 enum ScanSubmitError {
-    /// El `target` recibido no es una IP ni un rango CIDR válido (RF-02/
+    /// El `target` recibido no es una única IP válida (RF-02/
     /// RF-03). No se llegó a tocar `ms-usuarios` ni el Broker.
     #[error(transparent)]
     InvalidTarget(#[from] ScanSubmissionError),
@@ -719,7 +719,7 @@ enum ScanSubmitError {
     request_body = ScanSubmissionRequest,
     responses(
         (status = 200, description = "scanId de seguimiento generado, ya encolado en el Broker.", body = ScanSubmissionResponse),
-        (status = 400, description = "El objetivo (`target`) no es una IP ni un rango CIDR válido."),
+        (status = 400, description = "El objetivo (`target`) no es una única IP válida (los rangos no están soportados; solo IPv4/IPv6 o CIDR /32 o /128)."),
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
         (status = 422, description = "ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo."),
         (status = 429, description = "Se superó el límite de solicitudes de escaneo permitidas para este usuario (RF-12)."),
