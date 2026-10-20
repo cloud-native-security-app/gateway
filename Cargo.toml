@@ -1,0 +1,77 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+axum = "0.7"
+axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
+cookie = { version = "0.18.2", default-features = false }
+openidconnect = "4.0.1"
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+secrecy = "0.10.3"
+thiserror = "2.0.20"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `AppState` guarda el publicador del Broker como `Arc<dyn ScanRequestPublisher>`
+# (feature `scan_submission`) para que los tests de otras features no
+# necesiten LocalStack/AWS solo para construir el router; los traits
+# `ScanRequestPublisher`/`ScanOutcomeHandler` usan `async fn` sin soporte
+# nativo para objetos `dyn`.
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+# `stream::unfold` para construir el `Stream<Item = Result<Event, Infallible>>`
+# del handler SSE (`src/realtime.rs`, feature `scan_outcome_relay`) — código de
+# producción, no solo de test (antes solo estaba en `[dev-dependencies]`,
+# ver `docs/decisions.md` D-06).
+futures-util = "0.3"
+# Genera la especificación OpenAPI de `src/api.rs` desde las anotaciones
+# `#[utoipa::path(...)]`/`#[derive(ToSchema)]` ya puestas sobre cada
+# handler/tipo (RNF-08, feature `openapi_docs`) — nunca mantenida a mano en
+# paralelo al código. `axum_extras` habilita las conversiones de extractores
+# de `axum` (`Path`/`Query`/`State`) que usan esos handlers; no se añade
+# `utoipa-swagger-ui` porque el criterio de aceptación solo exige servir el
+# JSON generado en `GET /api/openapi.json`, no una UI interactiva.
+utoipa = { version = "5.5.0", features = ["axum_extras"] }
+# `CorsLayer` para que `front` (otro origen del navegador, ver
+# `docs/architecture.md`) pueda leer la respuesta de una ruta protegida
+# (RF-01, feature `cors_for_front`). Versión `0.6` para reutilizar la
+# resolución transitiva que ya fija `reqwest` en `Cargo.lock` (misma major
+# version que exige `http` 1.x, la que ya usa `axum` 0.7), en vez de
+# duplicar el árbol de dependencias con una `0.5` en paralelo.
+tower-http = { version = "0.6", features = ["cors"] }
+# Deriva el origen (`scheme://host[:puerto]`, sin `path`) de `FRONT_BASE_URL`
+# para la `CorsLayer` de arriba (`src/config.rs`, feature `cors_for_front`):
+# el header `Origin` de un navegador nunca lleva `path`, así que no basta
+# con reflejar el string crudo de `FRONT_BASE_URL` (que sí lo lleva, ver
+# feature `post_login_redirect`). Ya está resuelta transitivamente vía
+# `openidconnect`/`reqwest` (y ya era dev-dependency), se declara explícita
+# para poder nombrarla en `src/config.rs`.
+url = "2"
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-sns = "1.116.0"
+# `aws-sdk-sqs` (promovida de dev-dependency en MSG-GW-03) para el consumidor SQS;
+# `tokio-util` aporta `CancellationToken`, la señal de shutdown de `SqsScanOutcomeConsumer::run`.
+aws-sdk-sqs = "1.114.0"
+tokio-util = "0.7"
+
+[dev-dependencies]
+testcontainers = "0.20"
+rsa = "0.9.10"
+rand = "0.8"
+base64 = "0.22"
+# `url` ya está en `[dependencies]` (feature `cors_for_front`, ver arriba) y
+# por lo tanto ya disponible en `tests/`; no se repite aquí.
+# `Response::bytes_stream()` en los tests de integración del stream SSE
+# (feature `scan_outcome_relay`) está tras este feature de `reqwest`, no
+# activo en `[dependencies]` (ver `docs/decisions.md` D-06).
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+# `bytes::Bytes` es el `Item` de `Response::bytes_stream()`, usado para leer
+# a mano el `text/event-stream` en los tests de `scan_outcome_relay` (ya es
+# una dependencia transitiva de `reqwest`, se declara explícita para poder
+# nombrarla en `tests/`).
+bytes = "1"

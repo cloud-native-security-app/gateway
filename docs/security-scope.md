@@ -3,7 +3,7 @@
 > `gateway` es el **único componente público** de toda la plataforma y el
 > punto donde convergen todas las credenciales: el token de Google, la
 > sesión propia de cada usuario, la credencial de servicio hacia
-> `ms-usuarios`, y la credencial AMQPS del Broker (que a su vez transporta
+> `ms-usuarios`, y los permisos IAM hacia SNS/SQS (por donde viaja
 > `ssh_credentials_ref`, una credencial SSH real — ver
 > `broker/docs/security-scope.md`). Un error aquí compromete todo lo demás.
 > Este documento define los límites duros que aplican tanto al desarrollo
@@ -29,6 +29,20 @@
 - Un `logout` invalida la sesión del lado del navegador (borra la cookie);
   si en el futuro se necesita invalidación server-side (revocación antes de
   `exp`), es una feature nueva a discutir, no se asume aquí.
+- Feature `provision_user_profile_on_login` (fix de bug de producción): el
+  callback OIDC, inmediatamente después de construir la sesión propia y
+  **antes** de emitir su cookie/redirigir a `front`, llama a
+  `UsuariosClient::upsert_profile` (`PUT /users/me`) para garantizar que
+  `ms-usuarios` tenga la fila de `users` correspondiente — sin eso, cualquier
+  INSERT posterior que referencie esa fila (`network_credentials`, histórico
+  de escaneos) rompe con una violación de foreign key. El único campo que
+  viaja en ese `PUT` (`display_name`) sale siempre de `session.name`, la
+  identidad ya verificada contra el ID token de Google — **nunca** de un
+  parámetro de query/body de la request de callback (mismo principio de
+  no-input-no-verificado del resto de este documento). Si esa llamada falla
+  (red o respuesta no-2xx de `ms-usuarios`), el callback no emite la cookie
+  de sesión ni el `302`: nunca debe quedar un usuario con sesión válida pero
+  sin fila en `ms-usuarios`.
 
 ## Comunicación con `ms-usuarios`
 
@@ -46,19 +60,50 @@
 
 ## Comunicación con el Broker
 
-- La credencial AMQPS del usuario RabbitMQ `gateway` (definida en
-  `broker/rabbitmq/definitions.json`, mínimo privilegio: solo `write` en
-  `scan.requests`/`scan.cancellations`, solo `read` en
-  `gateway.scan-outcomes`) se lee de `Config` — nunca hardcodeada, nunca
-  loggeada.
-- Toda conexión al Broker usa AMQPS (TLS), nunca el puerto AMQP en claro
-  que `broker/docker-compose.yml` documenta como "solo depuración local".
+- Este Gateway no tiene credencial de Broker en `Config`: las credenciales
+  de AWS salen de la cadena de proveedores por defecto (rol de la tarea ECS,
+  `LabRole` compartido en el laboratorio) — nunca claves estáticas en código,
+  variables de entorno de producción ni logs. Mínimo privilegio deseado:
+  `sns:Publish` sobre los dos topics de salida y
+  `sqs:ReceiveMessage`/`DeleteMessage`/`ChangeMessageVisibility` sobre la cola
+  de resultados más `sqs:SendMessage` sobre su DLQ (los define `broker`/
+  Terraform, no este repo).
+- Toda conexión a SNS/SQS usa HTTPS (SDK de AWS). `AWS_ENDPOINT_URL` (HTTP a
+  LocalStack) existe solo para desarrollo y tests locales.
 - El cuerpo completo de un `ScanRequest` (que lleva `ssh_credentials_ref`,
   una credencial SSH real) **nunca** se loggea de forma persistente a
   stdout/stderr — mismo límite que ya documentan `broker/` y
   `nmap-service/` para ese mismo campo. Para depuración puntual en
   desarrollo, usar siempre valores de laboratorio, nunca una credencial
   real.
+
+## Credenciales de red (feature `network_credentials_proxy`)
+
+- Gateway expone `GET`/`POST /api/network-credentials` y `DELETE
+  /api/network-credentials/{id}` como proxy directo de `POST`/`GET
+  /users/me/network-credentials` y `DELETE
+  /users/me/network-credentials/{id}` de `ms-usuarios` (feature
+  `network_credentials_api`, ya `done` en `user-service`) — misma
+  protección de sesión y mismo reenvío de identidad + credencial de
+  servicio que el resto de llamadas a `ms-usuarios` (ver arriba).
+- `ssh_credentials_ref` (una credencial SSH real) **solo** viaja en el
+  cuerpo de `POST /api/network-credentials` hacia `ms-usuarios` — nunca en
+  una respuesta de este Gateway hacia `front`, ni en `GET
+  /api/network-credentials` (`list`) ni en la respuesta de ese mismo
+  `POST` (`create`). El tipo de respuesta de este Gateway
+  (`crate::usuarios_client::NetworkCredential`) simplemente no declara ese
+  campo, así que no podría serializarlo aunque `ms-usuarios` lo incluyera
+  algún día por error — misma garantía a nivel de tipo que ya aplica
+  `crate::usuarios_client::ScanTargetCredentials` para
+  `resolve_scan_target`. En tránsito hacia `ms-usuarios` viaja cifrado
+  (TLS de la subred privada), igual que el resto de tráfico
+  Gateway→`ms-usuarios`.
+- `DELETE /api/network-credentials/{id}` reenvía el status real de
+  `ms-usuarios` (`404` si `id` no existe o no pertenece al usuario de la
+  sesión activa, nunca `403` — mismo criterio que ya aplica
+  `user-service`) en vez de traducirlo al `502` genérico del resto de
+  fallos de `ms-usuarios`, para que `front` pueda distinguir "no existe"
+  de "el servicio falló".
 
 ## Origen de `network_user`/`ssh_credentials_ref`/`has_sudo`
 
@@ -92,13 +137,13 @@
 - Ningún test de este repo llama al endpoint real de Google ni a un
   `user-service`/Broker de producción — todos usan servidores/contenedores
   de laboratorio (ver `docs/verification.md`).
-- Ninguna identidad de Google, credencial de servicio, o credencial AMQPS
+- Ninguna identidad de Google, credencial de servicio, o credencial de AWS
   real aparece en fixtures, ejemplos o código de este repo — solo valores
   sintéticos de laboratorio.
 
 ## Si algo no está claro
 
-Si una feature de `feature_list.json` roza alguno de estos límites y no está
-claro cómo proceder, el agente **para y pregunta al usuario** en vez de
-asumir qué está autorizado — igual que cualquier otro bloqueo, se documenta
-en `progress/current.md`.
+Si una tarea roza alguno de estos límites y no está claro cómo proceder, el
+agente **para y pregunta al usuario** en vez de asumir qué está autorizado —
+igual que cualquier otro bloqueo, se documenta en el documento de la tarea
+(`odd/tasks/<feature>.md`).
