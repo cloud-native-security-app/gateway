@@ -1372,6 +1372,7 @@ impl Modify for SessionCookieSecurity {
         ScanResult,
         crate::domain::PortFinding,
         crate::domain::VulnFinding,
+        crate::domain::Confidence,
         crate::usuarios_client::ScanStatus,
         crate::usuarios_client::NetworkCredential,
         crate::usuarios_client::CreateNetworkCredentialRequest,
