@@ -245,6 +245,23 @@ pub struct VulnFinding {
     pub source: String,
     /// Referencias externas asociadas al hallazgo.
     pub references: Vec<String>,
+    /// Nivel de confianza del hallazgo. Ausente (`None`) en resultados
+    /// anteriores a este campo: se omite al serializar para relayar el
+    /// JSON verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Confidence>,
+}
+
+/// Confianza de un [`VulnFinding`]. Cerrado a propósito: un valor
+/// desconocido se rechaza igual que el resto del contrato
+/// (`deny_unknown_fields`); ampliarlo exige desplegar primero el Gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// Confirmado activamente (p. ej. por un script NSE).
+    Confirmed,
+    /// Inferido solo por coincidencia de versión del servicio.
+    VersionMatch,
 }
 
 #[cfg(test)]
@@ -402,6 +419,70 @@ mod tests {
         assert_eq!(event.correlation_id(), "scan-2");
         assert!(event.is_terminal());
         assert!(matches!(event, ScanOutcomeEvent::Completed { .. }));
+    }
+
+    fn completed_json_with_confidence(confidence: Option<&str>) -> serde_json::Value {
+        let mut vuln = serde_json::json!({
+            "id": "CVE-2024-0001",
+            "severity": "high",
+            "description": "algo",
+            "nse_script": "vulners",
+            "source": "nmap_nse",
+            "references": [],
+        });
+        if let Some(value) = confidence {
+            vuln["confidence"] = serde_json::json!(value);
+        }
+        serde_json::json!({
+            "status": "completed",
+            "correlation_id": "scan-3",
+            "result": {
+                "host": "192.0.2.10",
+                "ports": [],
+                "vulnerabilities": [vuln],
+                "scanned_at": "2024-01-01T00:00:00Z",
+            },
+        })
+    }
+
+    fn first_vuln(event: ScanOutcomeEvent) -> VulnFinding {
+        match event {
+            ScanOutcomeEvent::Completed { result, .. } => result
+                .vulnerabilities
+                .into_iter()
+                .next()
+                .expect("un hallazgo"),
+            other => panic!("se esperaba completed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vuln_finding_without_confidence_decodes_as_none_and_omits_it_on_reserialize() {
+        let json = completed_json_with_confidence(None);
+        let event: ScanOutcomeEvent = serde_json::from_value(json.clone()).expect("debe parsear");
+        let vuln = first_vuln(event.clone());
+        assert_eq!(vuln.confidence, None);
+        assert_eq!(serde_json::to_value(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn vuln_finding_confidence_values_decode_and_round_trip_verbatim() {
+        for (raw, expected) in [
+            ("confirmed", Confidence::Confirmed),
+            ("version_match", Confidence::VersionMatch),
+        ] {
+            let json = completed_json_with_confidence(Some(raw));
+            let event: ScanOutcomeEvent =
+                serde_json::from_value(json.clone()).expect("debe parsear");
+            assert_eq!(first_vuln(event.clone()).confidence, Some(expected));
+            assert_eq!(serde_json::to_value(&event).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn vuln_finding_rejects_unknown_confidence_value() {
+        let json = completed_json_with_confidence(Some("maybe"));
+        assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
     }
 
     #[test]
