@@ -73,7 +73,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::Session;
+use crate::domain::{ScanResult, Session};
 
 /// Nombre del header que transporta la identidad ya verificada de la sesión
 /// activa hacia `ms-usuarios`, en formato JSON (`{"sub", "email"}`).
@@ -116,6 +116,9 @@ pub enum ScanStatus {
     Completado,
     /// El escaneo terminó con un error y no produjo un resultado utilizable.
     Fallido,
+    /// El usuario canceló el escaneo (feature `scan-report`): estado
+    /// terminal, con el motivo en `failure_reason`.
+    Cancelado,
 }
 
 /// Entrada del histórico de escaneos de `ms-usuarios`, tal como la devuelve
@@ -140,6 +143,12 @@ pub struct ScanHistoryEntry {
     pub requested_at: String,
     /// Marca de tiempo (RFC 3339) de la última actualización de estado.
     pub updated_at: String,
+    /// Motivo del fallo o de la cancelación (`FALLIDO`/`CANCELADO`), `None`
+    /// en cualquier otro estado. Confirmado contra el contrato de
+    /// `user-service` (siempre presente, `null` si no hay); `default` tolera
+    /// un `user-service` anterior que aún no lo envía.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 /// Credenciales de red resueltas por `ms-usuarios` para un objetivo de
@@ -253,10 +262,16 @@ struct CreateScanHistoryRequest<'a> {
     target: &'a str,
 }
 
-/// Cuerpo de `PATCH /scans/{scan_id}`.
+/// Cuerpo de `PATCH /scans/{scan_id}`. `result` solo viaja con `COMPLETADO`
+/// y `failure_reason` solo con `FALLIDO`/`CANCELADO` (`user-service` rechaza
+/// otras combinaciones con `400`); los campos ausentes no se serializan.
 #[derive(Debug, Serialize)]
-struct UpdateScanStatusRequest {
+struct UpdateScanStatusRequest<'a> {
     status: ScanStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a ScanResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<&'a str>,
 }
 
 /// Errores al llamar a `ms-usuarios` desde este cliente.
@@ -307,6 +322,16 @@ pub enum UsuariosClientError {
     /// (ver `crate::api`).
     #[error("no existe una credencial de red con ese identificador para el usuario activo")]
     NetworkCredentialNotFound,
+    /// `ms-usuarios` respondió `404` a [`UsuariosClient::get_scan_report`]:
+    /// el escaneo no existe o no es del usuario (nunca `403`). Se reenvía
+    /// como `404` (ver `crate::api`).
+    #[error("no existe un escaneo con ese identificador para la sesión activa")]
+    ScanReportNotFound,
+    /// `ms-usuarios` respondió `409` a [`UsuariosClient::get_scan_report`]:
+    /// el escaneo existe pero no está `COMPLETADO` con un resultado. Se
+    /// reenvía como `409`.
+    #[error("el reporte del escaneo aún no está disponible")]
+    ScanReportNotReady,
 }
 
 /// Cuerpo del header [`FORWARDED_USER_HEADER_NAME`]: la identidad ya
@@ -456,7 +481,10 @@ impl UsuariosClient {
 
     /// Actualiza el estado de la entrada de histórico `scan_id` (el
     /// asignado por `ms-usuarios`, ver [`Self::create_scan_history`]) a
-    /// `status` (`PATCH /scans/{scan_id}`, `204 No Content` en éxito).
+    /// `status` (`PATCH /scans/{scan_id}`, `204 No Content` en éxito), sin
+    /// `result` ni `failure_reason`: para transiciones sin detalle
+    /// (`EN_PROGRESO`, o `FALLIDO` sin motivo). Ver
+    /// [`Self::update_scan_outcome`] para los estados terminales con detalle.
     ///
     /// Mismos errores que [`Self::get_profile`] (un `scan_id` inexistente o
     /// de otro usuario se refleja como
@@ -468,6 +496,27 @@ impl UsuariosClient {
         scan_id: &str,
         status: ScanStatus,
     ) -> Result<(), UsuariosClientError> {
+        self.update_scan_outcome(identity, scan_id, status, None, None)
+            .await
+    }
+
+    /// Como [`Self::update_scan_status`], pero enviando además el `result`
+    /// completo (solo válido con `COMPLETADO`) o el `failure_reason` (solo
+    /// válido con `FALLIDO`/`CANCELADO`). `user-service` reemplaza ambos
+    /// campos con lo enviado y trata los estados terminales como finales (un
+    /// `PATCH` tardío posterior es un no-op `204`).
+    ///
+    /// Mismos errores que [`Self::update_scan_status`]; un `400`/`413` de
+    /// `ms-usuarios` (combinación inválida, resultado >256 KiB) se refleja
+    /// como [`UsuariosClientError::UnexpectedResponse`].
+    pub async fn update_scan_outcome(
+        &self,
+        identity: &Session,
+        scan_id: &str,
+        status: ScanStatus,
+        result: Option<&ScanResult>,
+        failure_reason: Option<&str>,
+    ) -> Result<(), UsuariosClientError> {
         let identity_header = self.identity_header_value(identity)?;
         let request = self
             .http
@@ -477,7 +526,11 @@ impl UsuariosClient {
                 GATEWAY_SECRET_HEADER_NAME,
                 self.shared_secret.expose_secret(),
             )
-            .json(&UpdateScanStatusRequest { status });
+            .json(&UpdateScanStatusRequest {
+                status,
+                result,
+                failure_reason,
+            });
 
         let response = request
             .send()
@@ -492,6 +545,48 @@ impl UsuariosClient {
         }
 
         Ok(())
+    }
+
+    /// Obtiene el reporte (el [`ScanResult`] almacenado) del escaneo
+    /// `scan_id` (el asignado por `ms-usuarios`) de `identity`
+    /// (`GET /users/me/scans/{scan_id}/report`, feature `scan-report`).
+    ///
+    /// Un `404` (escaneo inexistente o ajeno) y un `409` (todavía no
+    /// `COMPLETADO` con resultado) se distinguen como
+    /// [`UsuariosClientError::ScanReportNotFound`] y
+    /// [`UsuariosClientError::ScanReportNotReady`]; el resto de errores son
+    /// los de [`Self::get_profile`].
+    pub async fn get_scan_report(
+        &self,
+        identity: &Session,
+        scan_id: &str,
+    ) -> Result<ScanResult, UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .get(self.scan_report_url(scan_id))
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            );
+
+        let response = request
+            .send()
+            .await
+            .map_err(|_| UsuariosClientError::Unreachable)?;
+
+        match response.status() {
+            status if status.is_success() => response
+                .json::<ScanResult>()
+                .await
+                .map_err(|_| UsuariosClientError::MalformedResponse),
+            StatusCode::NOT_FOUND => Err(UsuariosClientError::ScanReportNotFound),
+            StatusCode::CONFLICT => Err(UsuariosClientError::ScanReportNotReady),
+            other => Err(UsuariosClientError::UnexpectedResponse {
+                status: other.as_u16(),
+            }),
+        }
     }
 
     /// Intenta resolver `network_user`/`ssh_credentials_ref`/`has_sudo` para
@@ -649,6 +744,13 @@ impl UsuariosClient {
 
     fn scan_status_url(&self, scan_id: &str) -> String {
         format!("{}/scans/{scan_id}", self.base_url.trim_end_matches('/'))
+    }
+
+    fn scan_report_url(&self, scan_id: &str) -> String {
+        format!(
+            "{}/users/me/scans/{scan_id}/report",
+            self.base_url.trim_end_matches('/')
+        )
     }
 
     /// URL del endpoint especulativo que consulta

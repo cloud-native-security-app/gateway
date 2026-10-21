@@ -123,11 +123,11 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         Duration::from_secs(config.scan_submission_rate_limit_window_secs),
     ));
 
-    let scan_outcome_handler: Arc<dyn ScanOutcomeHandler> = Arc::new(ScanOutcomeRelay {
-        usuarios_client: Arc::clone(&usuarios_client),
-        scan_ownership: Arc::clone(&scan_ownership),
-        realtime: Arc::clone(&realtime),
-    });
+    let scan_outcome_handler: Arc<dyn ScanOutcomeHandler> = Arc::new(ScanOutcomeRelay::new(
+        Arc::clone(&usuarios_client),
+        Arc::clone(&scan_ownership),
+        Arc::clone(&realtime),
+    ));
 
     let state = AppState {
         oidc_client: Arc::new(oidc_client),
@@ -172,11 +172,43 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
 /// [`ScanOwnershipRegistry`](crate::api::ScanOwnershipRegistry)).
 ///
 /// SQS entrega al menos una vez: un duplicado solo repite el evento SSE y
-/// reaplica el mismo estado en `ms-usuarios` (idempotente).
-struct ScanOutcomeRelay {
+/// reaplica el mismo estado en `ms-usuarios` (idempotente; `user-service`
+/// trata los estados terminales como finales).
+///
+/// ## Detalle enviado a `ms-usuarios` (feature `scan-report`)
+///
+/// - `started` -> `EN_PROGRESO` (sin detalle).
+/// - `completed` -> `COMPLETADO` con el [`crate::domain::ScanResult`]
+///   completo en el mismo `PATCH`.
+/// - `failed` -> `FALLIDO` con el motivo de `ms-nmap` como `failure_reason`,
+///   **salvo** que el usuario haya pedido cancelar ese escaneo a través de
+///   este Gateway ([`ScanOwnershipRegistry::is_cancel_requested`]): entonces
+///   `CANCELADO` con el mismo motivo. No se interpreta el texto del motivo.
+///   La marca vive en memoria: tras un reinicio del Gateway el escaneo
+///   cancelado queda `FALLIDO` con el motivo de cancelación de `ms-nmap`
+///   (degradación aceptada).
+///
+/// El evento SSE conserva su forma (`started`/`completed`/`failed`): no
+/// distingue cancelaciones.
+pub struct ScanOutcomeRelay {
     usuarios_client: Arc<UsuariosClient>,
     scan_ownership: Arc<ScanOwnershipRegistry>,
     realtime: Arc<RealtimeRegistry>,
+}
+
+impl ScanOutcomeRelay {
+    /// Construye el relay con sus tres colaboradores.
+    pub fn new(
+        usuarios_client: Arc<UsuariosClient>,
+        scan_ownership: Arc<ScanOwnershipRegistry>,
+        realtime: Arc<RealtimeRegistry>,
+    ) -> Self {
+        Self {
+            usuarios_client,
+            scan_ownership,
+            realtime,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -195,17 +227,59 @@ impl ScanOutcomeHandler for ScanOutcomeRelay {
             return;
         };
 
-        let status = match &event {
-            ScanOutcomeEvent::Started { .. } => ScanStatus::EnProgreso,
-            ScanOutcomeEvent::Completed { .. } => ScanStatus::Completado,
-            ScanOutcomeEvent::Failed { .. } => ScanStatus::Fallido,
+        let failure_reason;
+        let (status, result, failure_reason) = match &event {
+            ScanOutcomeEvent::Started { .. } => (ScanStatus::EnProgreso, None, None),
+            ScanOutcomeEvent::Completed { result, .. } => {
+                (ScanStatus::Completado, Some(result), None)
+            }
+            ScanOutcomeEvent::Failed { reason, .. } => {
+                let status = if self.scan_ownership.is_cancel_requested(scan_id) {
+                    ScanStatus::Cancelado
+                } else {
+                    ScanStatus::Fallido
+                };
+                failure_reason = Some(sanitize_failure_reason(reason));
+                (status, None, failure_reason.as_deref())
+            }
         };
 
-        if let Err(err) = self
+        let mut outcome = self
             .usuarios_client
-            .update_scan_status(&ownership.owner, &ownership.ms_usuarios_scan_id, status)
-            .await
+            .update_scan_outcome(
+                &ownership.owner,
+                &ownership.ms_usuarios_scan_id,
+                status,
+                result,
+                failure_reason,
+            )
+            .await;
+
+        // `user-service` rechaza con 413 un resultado de más de 256 KiB. Mejor
+        // dejar el escaneo `COMPLETADO` sin reporte (el reporte responderá
+        // 409) que dejarlo en `EN_PROGRESO` para siempre.
+        if matches!(
+            outcome,
+            Err(UsuariosClientError::UnexpectedResponse { status: 413 })
+        ) && result.is_some()
         {
+            tracing::error!(
+                scan_id,
+                "el resultado excede el límite de ms-usuarios; se marca COMPLETADO sin reporte"
+            );
+            outcome = self
+                .usuarios_client
+                .update_scan_outcome(
+                    &ownership.owner,
+                    &ownership.ms_usuarios_scan_id,
+                    status,
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        if let Err(err) = outcome {
             tracing::error!(
                 error = %err,
                 scan_id,
@@ -213,5 +287,41 @@ impl ScanOutcomeHandler for ScanOutcomeRelay {
                  (best-effort, no bloquea el borrado del mensaje ni el relay SSE)"
             );
         }
+    }
+}
+
+/// Máximo de caracteres de `failure_reason` que acepta `ms-usuarios`.
+const MAX_FAILURE_REASON_CHARS: usize = 500;
+/// Motivo usado cuando `ms-nmap` envía un motivo vacío (`ms-usuarios` rechaza
+/// motivos en blanco con `400`).
+const FALLBACK_FAILURE_REASON: &str = "motivo no informado";
+
+/// Adapta el motivo reportado por `ms-nmap` a lo que acepta `ms-usuarios`:
+/// sin espacios sobrantes, no vacío y de a lo sumo
+/// [`MAX_FAILURE_REASON_CHARS`] caracteres. Sin esto, un motivo vacío o
+/// largo haría fallar el `PATCH` y el escaneo quedaría sin estado terminal.
+fn sanitize_failure_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return FALLBACK_FAILURE_REASON.to_string();
+    }
+    trimmed.chars().take(MAX_FAILURE_REASON_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_reason_gets_a_fallback() {
+        assert_eq!(sanitize_failure_reason("  \n"), FALLBACK_FAILURE_REASON);
+    }
+
+    #[test]
+    fn reason_is_trimmed_and_capped_by_characters() {
+        let long = "á".repeat(600);
+        let sanitized = sanitize_failure_reason(&format!("  {long} "));
+        assert_eq!(sanitized.chars().count(), MAX_FAILURE_REASON_CHARS);
+        assert_eq!(sanitize_failure_reason(" ok "), "ok");
     }
 }

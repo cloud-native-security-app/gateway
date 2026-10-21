@@ -15,7 +15,7 @@
 //! código — nunca mantenida a mano en paralelo (ver [`ROUTES`] para la tabla
 //! contra la que un test verifica que ninguna ruta quede sin documentar).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,7 +38,7 @@ use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use crate::domain::{ScanSubmission, ScanSubmissionError, Session};
+use crate::domain::{ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
 use crate::usuarios_client::{
     CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry, ScanStatus, UserProfile,
@@ -86,8 +86,19 @@ pub struct ScanOwnership {
 /// desplegarse con más de una instancia, o a necesitar sobrevivir un
 /// restart mientras hay escaneos en curso, esto necesitará un store
 /// compartido, a discutir como feature aparte si llega a hacer falta.
+///
+/// **Marca de cancelación (feature `scan-report`)**: además del mapeo, el
+/// registro recuerda qué `scanId` tuvieron una cancelación aceptada por
+/// `POST /api/scans/{scan_id}/cancel` ([`Self::mark_cancel_requested`]). El
+/// relay de resultados ([`crate::wiring::ScanOutcomeRelay`]) la usa para
+/// distinguir `CANCELADO` de `FALLIDO` cuando llega un evento `failed`, sin
+/// depender del texto del motivo de `ms-nmap`. También es solo memoria: si
+/// el Gateway se reinicia entre la cancelación y el evento `failed`, el
+/// escaneo queda `FALLIDO` con el motivo de cancelación de `ms-nmap`
+/// (degradación aceptada).
 pub struct ScanOwnershipRegistry {
     entries: RwLock<HashMap<String, ScanOwnership>>,
+    cancel_requested: RwLock<HashSet<String>>,
 }
 
 impl ScanOwnershipRegistry {
@@ -95,7 +106,25 @@ impl ScanOwnershipRegistry {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            cancel_requested: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Registra que el usuario pidió (y el Broker aceptó) cancelar `scan_id`
+    /// (el `scanId` propio de este Gateway). Idempotente.
+    pub fn mark_cancel_requested(&self, scan_id: &str) {
+        self.cancel_requested
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(scan_id.to_string());
+    }
+
+    /// `true` si [`Self::mark_cancel_requested`] se llamó para `scan_id`.
+    pub fn is_cancel_requested(&self, scan_id: &str) -> bool {
+        self.cancel_requested
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(scan_id)
     }
 
     /// Registra que `scan_id` (propio de este Gateway) pertenece a `owner`,
@@ -402,6 +431,7 @@ fn protected_router(state: AppState) -> Router {
         )
         .route("/api/scans/:scan_id/events", get(scan_events))
         .route("/api/scans/:scan_id/cancel", post(cancel_scan))
+        .route("/api/scans/:scan_id/report", get(scan_report))
         .route(
             "/api/network-credentials",
             get(list_network_credentials).post(create_network_credential),
@@ -606,6 +636,9 @@ struct ScanHistoryEntryResponse {
     requested_at: String,
     /// Marca de tiempo (RFC 3339) de la última actualización de estado.
     updated_at: String,
+    /// Motivo del fallo o de la cancelación (`FALLIDO`/`CANCELADO`); siempre
+    /// presente, `null` en cualquier otro estado.
+    failure_reason: Option<String>,
 }
 
 impl ScanHistoryEntryResponse {
@@ -620,6 +653,7 @@ impl ScanHistoryEntryResponse {
             status: entry.status,
             requested_at: entry.requested_at,
             updated_at: entry.updated_at,
+            failure_reason: entry.failure_reason,
         }
     }
 }
@@ -983,7 +1017,7 @@ async fn cancel_scan(
 
     if matches!(
         current_entry.status,
-        ScanStatus::Completado | ScanStatus::Fallido
+        ScanStatus::Completado | ScanStatus::Fallido | ScanStatus::Cancelado
     ) {
         return Err(ScanCancelError::AlreadyTerminal);
     }
@@ -998,7 +1032,92 @@ async fn cancel_scan(
         .publish_scan_cancellation(&cancellation)
         .await?;
 
+    // Solo tras una publicación aceptada: el relay de resultados usa esta
+    // marca para reportar `CANCELADO` en vez de `FALLIDO` (feature
+    // `scan-report`, ver `ScanOwnershipRegistry`).
+    state
+        .scan_ownership
+        .mark_cancel_requested(&cancellation.correlation_id);
+
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Errores de `GET /api/scans/{scan_id}/report`.
+#[derive(Debug, thiserror::Error)]
+enum ScanReportError {
+    /// `scan_id` sin [`ScanOwnership`] registrada, o de otra sesión: `404`
+    /// en ambos casos (mismo criterio que [`ScanEventsError::NotFound`]).
+    #[error("no existe un escaneo con ese identificador para la sesión activa")]
+    NotFound,
+    /// Fallo o respuesta de `ms-usuarios`, ya mapeado por
+    /// `UsuariosClientError::into_response` (`404`/`409`/`502`/`504`).
+    #[error(transparent)]
+    Usuarios(#[from] UsuariosClientError),
+}
+
+impl IntoResponse for ScanReportError {
+    fn into_response(self) -> Response {
+        match self {
+            ScanReportError::NotFound => {
+                tracing::debug!(error = %self, "solicitud de reporte rechazada");
+                (StatusCode::NOT_FOUND, self.to_string()).into_response()
+            }
+            ScanReportError::Usuarios(err) => err.into_response(),
+        }
+    }
+}
+
+/// Devuelve el reporte (el `ScanResult` almacenado por `ms-usuarios`) del
+/// escaneo `scan_id` (el `scanId` propio de este Gateway), feature
+/// `scan-report`. Verifica la propiedad con [`ScanOwnershipRegistry`], traduce
+/// al `scan_id` de `ms-usuarios` ([`ScanOwnership::ms_usuarios_scan_id`]) y
+/// reenvía el resultado tal cual, sin envoltorio.
+///
+/// - `scan_id` sin registro o de otra sesión: `404`.
+/// - `ms-usuarios` `404`: `404`; `409` (aún no `COMPLETADO` con resultado):
+///   `409` con un mensaje en español.
+/// - Cualquier otro fallo de `ms-usuarios`: `502`/`504`, como el resto de
+///   proxys.
+///
+/// **Limitación**: depende de [`ScanOwnershipRegistry`] (en memoria): tras un
+/// reinicio del Gateway un `scanId` anterior responde `404` aunque el
+/// reporte exista en `ms-usuarios`.
+#[utoipa::path(
+    get,
+    path = "/api/scans/{scan_id}/report",
+    tag = "scans",
+    security(("session_cookie" = [])),
+    params(
+        ("scan_id" = String, Path, description = "scanId propio de este Gateway.")
+    ),
+    responses(
+        (status = 200, description = "Resultado completo del escaneo (puertos y vulnerabilidades).", body = ScanResult),
+        (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
+        (status = 404, description = "El scan_id no existe o pertenece a otra sesión."),
+        (status = 409, description = "El escaneo aún no está COMPLETADO con un reporte disponible."),
+        (status = 502, description = "ms-usuarios respondió con un status inesperado."),
+        (status = 504, description = "No se pudo contactar a ms-usuarios.")
+    )
+)]
+async fn scan_report(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(scan_id): Path<String>,
+) -> Result<Json<ScanResult>, ScanReportError> {
+    let ownership = state
+        .scan_ownership
+        .lookup(&scan_id)
+        .ok_or(ScanReportError::NotFound)?;
+
+    if ownership.owner.sub != session.sub {
+        return Err(ScanReportError::NotFound);
+    }
+
+    let report = state
+        .usuarios_client
+        .get_scan_report(&session, &ownership.ms_usuarios_scan_id)
+        .await?;
+    Ok(Json(report))
 }
 
 /// Descripción de una ruta expuesta por [`app_router`], usada tanto para
@@ -1073,6 +1192,11 @@ pub const ROUTES: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: "/api/scans/:scan_id/cancel",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/scans/:scan_id/report",
         protected: true,
     },
     RouteSpec {
@@ -1235,6 +1359,7 @@ impl Modify for SessionCookieSecurity {
         list_scan_history,
         scan_events,
         cancel_scan,
+        scan_report,
         list_network_credentials,
         create_network_credential,
         delete_network_credential,
@@ -1244,6 +1369,9 @@ impl Modify for SessionCookieSecurity {
         ScanSubmissionRequest,
         ScanSubmissionResponse,
         ScanHistoryEntryResponse,
+        ScanResult,
+        crate::domain::PortFinding,
+        crate::domain::VulnFinding,
         crate::usuarios_client::ScanStatus,
         crate::usuarios_client::NetworkCredential,
         crate::usuarios_client::CreateNetworkCredentialRequest,
@@ -1502,6 +1630,11 @@ impl IntoResponse for UsuariosClientError {
             // activo (feature `network_credentials_proxy`) — se reenvía tal
             // cual, a diferencia de UnexpectedResponse (que siempre es 502).
             UsuariosClientError::NetworkCredentialNotFound => StatusCode::NOT_FOUND,
+            // `GET /users/me/scans/{id}/report` de ms-usuarios: 404 (escaneo
+            // inexistente o ajeno) y 409 (sin reporte todavía) se reenvían
+            // tal cual (feature `scan-report`).
+            UsuariosClientError::ScanReportNotFound => StatusCode::NOT_FOUND,
+            UsuariosClientError::ScanReportNotReady => StatusCode::CONFLICT,
         };
 
         tracing::warn!(error = %self, %status, "fallo al comunicarse con el servicio de usuarios");

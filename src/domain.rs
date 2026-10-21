@@ -188,7 +188,7 @@ impl ScanOutcomeEvent {
 /// Resultado completo de un escaneo (`ScanOutcomeEvent::Completed::result`).
 /// Shape copiado literalmente de `broker/contracts/scan-outcome.schema.json`
 /// (`$defs/scanResult`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScanResult {
     /// IP escaneada.
@@ -206,7 +206,7 @@ pub struct ScanResult {
 /// Hallazgo de un puerto individual dentro de un [`ScanResult`]. Shape
 /// copiado de `broker/contracts/scan-outcome.schema.json`
 /// (`$defs/portFinding`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PortFinding {
     /// Número de puerto (0-65535).
@@ -228,7 +228,7 @@ pub struct PortFinding {
 /// Hallazgo de una vulnerabilidad individual dentro de un [`ScanResult`].
 /// Shape copiado de `broker/contracts/scan-outcome.schema.json`
 /// (`$defs/vulnFinding`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VulnFinding {
     /// Identificador de la vulnerabilidad (p. ej. CVE), si se conoce.

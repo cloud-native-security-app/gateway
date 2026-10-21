@@ -157,7 +157,7 @@ resuelva, no antes.
    puente entre un evento consumido del Broker y los clientes SSE
    suscritos.
 7. **`api`** — handlers y router `axum`: login/callback/logout, `GET
-   /api/me`, perfil, envío/histórico/cancelación de escaneos, stream SSE,
+   /api/me`, perfil, envío/histórico/cancelación/reporte de escaneos, stream SSE,
    documentación OpenAPI. Aplica el middleware de sesión y el rate
    limiter.
 8. **`wiring`** — composition root: construye el cliente OIDC, el publicador
