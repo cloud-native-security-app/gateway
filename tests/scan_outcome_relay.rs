@@ -32,7 +32,8 @@ use gateway::broker::{
 use gateway::domain::{ScanOutcomeEvent, ScanResult, Session};
 use gateway::realtime::RealtimeRegistry;
 use gateway::sqs::SqsScanOutcomeConsumer;
-use gateway::usuarios_client::{ScanStatus, UsuariosClient};
+use gateway::usuarios_client::UsuariosClient;
+use gateway::wiring::ScanOutcomeRelay;
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -101,19 +102,19 @@ async fn spawn_discovery_only_idp() -> String {
 }
 
 /// Llamadas capturadas por [`spawn_usuarios_status_stub`]: `(scan_id,
-/// status)` en el orden en que `PATCH /scans/{scan_id}` las recibió.
-type CapturedStatusUpdates = Arc<Mutex<Vec<(String, String)>>>;
+/// cuerpo JSON completo)` en el orden en que `PATCH /scans/{scan_id}` las
+/// recibió.
+type CapturedStatusUpdates = Arc<Mutex<Vec<(String, Value)>>>;
 
 async fn serve_patch_scan_status(
     AxumPath(scan_id): AxumPath<String>,
     State(calls): State<CapturedStatusUpdates>,
     Json(body): Json<Value>,
 ) -> axum::http::StatusCode {
-    let status = body["status"].as_str().unwrap_or_default().to_string();
     calls
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .push((scan_id, status));
+        .push((scan_id, body));
     axum::http::StatusCode::NO_CONTENT
 }
 
@@ -305,36 +306,6 @@ async fn sse_events_rejects_an_unknown_scan_id() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-/// Puente entre [`BrokerConsumer`] y el resto del Gateway bajo prueba: igual
-/// lógica que `gateway::wiring::ScanOutcomeRelay` (privada a ese módulo),
-/// reconstruida aquí con la API pública ([`ScanOutcomeHandler`],
-/// [`RealtimeRegistry::publish`], [`UsuariosClient::update_scan_status`])
-/// para ejercer el mismo camino que corre en producción.
-struct TestRelayHandler {
-    usuarios_client: Arc<UsuariosClient>,
-    scan_ownership: Arc<ScanOwnershipRegistry>,
-    realtime: Arc<RealtimeRegistry>,
-}
-
-#[async_trait::async_trait]
-impl ScanOutcomeHandler for TestRelayHandler {
-    async fn handle(&self, event: ScanOutcomeEvent) {
-        self.realtime.publish(&event);
-
-        if let Some(ownership) = self.scan_ownership.lookup(event.correlation_id()) {
-            let status = match &event {
-                ScanOutcomeEvent::Started { .. } => ScanStatus::EnProgreso,
-                ScanOutcomeEvent::Completed { .. } => ScanStatus::Completado,
-                ScanOutcomeEvent::Failed { .. } => ScanStatus::Fallido,
-            };
-            let _ = self
-                .usuarios_client
-                .update_scan_status(&ownership.owner, &ownership.ms_usuarios_scan_id, status)
-                .await;
-        }
-    }
-}
-
 /// Lee del stream de bytes hasta completar el próximo evento SSE (`\n\n`) y
 /// devuelve la concatenación de sus líneas `data: `, o `None` si el stream
 /// terminó sin más eventos.
@@ -397,11 +368,11 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
         dlq_url.clone(),
     );
 
-    let handler: Arc<dyn ScanOutcomeHandler> = Arc::new(TestRelayHandler {
+    let handler: Arc<dyn ScanOutcomeHandler> = Arc::new(ScanOutcomeRelay::new(
         usuarios_client,
-        scan_ownership: gateway.scan_ownership.clone(),
-        realtime: gateway.realtime.clone(),
-    });
+        gateway.scan_ownership.clone(),
+        gateway.realtime.clone(),
+    ));
     let shutdown = CancellationToken::new();
     let consumer_task = tokio::spawn(scan_outcome_consumer.run(handler, shutdown.clone()));
 
@@ -506,10 +477,17 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
             assert_eq!(
                 captured,
                 vec![
-                    ("ms-usuarios-scan-1".to_string(), "EN_PROGRESO".to_string()),
-                    ("ms-usuarios-scan-1".to_string(), "COMPLETADO".to_string()),
+                    (
+                        "ms-usuarios-scan-1".to_string(),
+                        json!({"status": "EN_PROGRESO"})
+                    ),
+                    (
+                        "ms-usuarios-scan-1".to_string(),
+                        json!({"status": "COMPLETADO", "result": result}),
+                    ),
                 ],
-                "ms-usuarios debe recibir EN_PROGRESO y luego COMPLETADO para el scan_id correcto"
+                "ms-usuarios debe recibir EN_PROGRESO y luego COMPLETADO con el resultado completo \
+                 para el scan_id correcto"
             );
             break;
         }
@@ -529,4 +507,205 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
         .await
         .expect("el consumidor debe detenerse tras cancelar el token")
         .expect("el consumidor no debe hacer panic");
+}
+
+// ---------------------------------------------------------------------------
+// Feature `scan-report`: payload que el relay envía a `ms-usuarios`. Estos
+// tests no necesitan Docker: invocan el handler real directamente.
+// ---------------------------------------------------------------------------
+
+struct RelayUnderTest {
+    relay: ScanOutcomeRelay,
+    ownership: Arc<ScanOwnershipRegistry>,
+    calls: CapturedStatusUpdates,
+}
+
+async fn relay_with_registered_scan(scan_id: &str) -> RelayUnderTest {
+    let (usuarios_base_url, calls) = spawn_usuarios_status_stub().await;
+    let ownership = Arc::new(ScanOwnershipRegistry::new());
+    ownership.register(scan_id, "ms-1".to_string(), session_for("alice"));
+    let relay = ScanOutcomeRelay::new(
+        Arc::new(lab_usuarios_client(usuarios_base_url)),
+        ownership.clone(),
+        Arc::new(RealtimeRegistry::new()),
+    );
+    RelayUnderTest {
+        relay,
+        ownership,
+        calls,
+    }
+}
+
+fn captured(calls: &CapturedStatusUpdates) -> Vec<(String, Value)> {
+    calls
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+fn failed_event(scan_id: &str, reason: &str) -> ScanOutcomeEvent {
+    ScanOutcomeEvent::Failed {
+        correlation_id: scan_id.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn relay_sends_the_full_scan_result_with_completado() {
+    let t = relay_with_registered_scan("scan-1").await;
+    let result = ScanResult {
+        host: "192.0.2.10".to_string(),
+        ports: vec![],
+        vulnerabilities: vec![],
+        scanned_at: "2024-01-01T00:00:00Z".to_string(),
+    };
+
+    t.relay
+        .handle(ScanOutcomeEvent::Completed {
+            correlation_id: "scan-1".to_string(),
+            result: result.clone(),
+        })
+        .await;
+
+    assert_eq!(
+        captured(&t.calls),
+        vec![(
+            "ms-1".to_string(),
+            json!({"status": "COMPLETADO", "result": result})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn relay_sends_the_reason_with_fallido_when_no_cancellation_was_requested() {
+    let t = relay_with_registered_scan("scan-1").await;
+
+    t.relay
+        .handle(failed_event("scan-1", "host inalcanzable"))
+        .await;
+
+    assert_eq!(
+        captured(&t.calls),
+        vec![(
+            "ms-1".to_string(),
+            json!({"status": "FALLIDO", "failure_reason": "host inalcanzable"})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn relay_sends_cancelado_with_the_reason_when_the_user_requested_cancellation() {
+    let t = relay_with_registered_scan("scan-1").await;
+    t.ownership.mark_cancel_requested("scan-1");
+
+    t.relay
+        .handle(failed_event("scan-1", "texto cualquiera de nmap"))
+        .await;
+
+    assert_eq!(
+        captured(&t.calls),
+        vec![(
+            "ms-1".to_string(),
+            json!({"status": "CANCELADO", "failure_reason": "texto cualquiera de nmap"})
+        )]
+    );
+}
+
+#[tokio::test]
+async fn relay_cancel_marker_is_per_scan_and_does_not_affect_started_events() {
+    let t = relay_with_registered_scan("scan-1").await;
+    t.ownership
+        .register("scan-2", "ms-2".to_string(), session_for("alice"));
+    t.ownership.mark_cancel_requested("scan-2");
+
+    t.relay
+        .handle(ScanOutcomeEvent::Started {
+            correlation_id: "scan-2".to_string(),
+        })
+        .await;
+    t.relay.handle(failed_event("scan-1", "boom")).await;
+
+    assert_eq!(
+        captured(&t.calls),
+        vec![
+            ("ms-2".to_string(), json!({"status": "EN_PROGRESO"})),
+            (
+                "ms-1".to_string(),
+                json!({"status": "FALLIDO", "failure_reason": "boom"})
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn relay_adapts_blank_and_oversized_reasons_to_what_ms_usuarios_accepts() {
+    let t = relay_with_registered_scan("scan-1").await;
+    t.ownership
+        .register("scan-2", "ms-2".to_string(), session_for("alice"));
+
+    t.relay.handle(failed_event("scan-1", "   ")).await;
+    t.relay
+        .handle(failed_event("scan-2", &"x".repeat(900)))
+        .await;
+
+    let calls = captured(&t.calls);
+    assert_eq!(calls[0].1["failure_reason"], json!("motivo no informado"));
+    assert_eq!(
+        calls[1].1["failure_reason"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count(),
+        500
+    );
+}
+
+#[tokio::test]
+async fn relay_marks_completado_without_a_result_when_ms_usuarios_rejects_it_as_too_large() {
+    let calls: CapturedStatusUpdates = Arc::new(Mutex::new(Vec::new()));
+    async fn reject_results(
+        AxumPath(scan_id): AxumPath<String>,
+        State(calls): State<CapturedStatusUpdates>,
+        Json(body): Json<Value>,
+    ) -> axum::http::StatusCode {
+        let too_large = body.get("result").is_some();
+        calls.lock().unwrap().push((scan_id, body));
+        if too_large {
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            axum::http::StatusCode::NO_CONTENT
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+    let addr = listener.local_addr().expect("addr stub");
+    let app = Router::new()
+        .route("/scans/:scan_id", patch(reject_results))
+        .with_state(calls.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("servidor stub");
+    });
+    let ownership = Arc::new(ScanOwnershipRegistry::new());
+    ownership.register("scan-1", "ms-1".to_string(), session_for("alice"));
+    let relay = ScanOutcomeRelay::new(
+        Arc::new(lab_usuarios_client(format!("http://{addr}"))),
+        ownership,
+        Arc::new(RealtimeRegistry::new()),
+    );
+
+    relay
+        .handle(ScanOutcomeEvent::Completed {
+            correlation_id: "scan-1".to_string(),
+            result: ScanResult {
+                host: "192.0.2.10".to_string(),
+                ports: vec![],
+                vulnerabilities: vec![],
+                scanned_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+        })
+        .await;
+
+    let sent = captured(&calls);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].1.get("result").is_some());
+    assert_eq!(sent[1].1, json!({"status": "COMPLETADO"}));
 }

@@ -167,3 +167,27 @@ que no son evidentes leyendo el código.
   (`ScanRequestPublisher`, `ScanOutcomeHandler`) no cambian. La topología
   (topics, colas, suscripciones raw, DLQ) la provee `broker`/Terraform; este
   repo no la declara.
+
+## D-16 — Reporte de escaneo y estado `CANCELADO`
+
+- **Contexto:** `front` necesita el resultado de un escaneo terminado y el
+  motivo de un fallo o cancelación; `ms-usuarios` los almacena
+  (`user-service`, feature `scan-report`, opción A). Fecha: 2026-10-20.
+- **Decisión:**
+  - El relay de resultados envía en el mismo `PATCH /scans/{id}` el
+    `ScanResult` completo con `COMPLETADO` y el motivo con `FALLIDO`/`CANCELADO`.
+    Un motivo vacío se reemplaza por un texto fijo y uno largo se recorta a 500
+    caracteres (si no, `ms-usuarios` respondería `400` y el escaneo no llegaría
+    a un estado terminal); un `413` por resultado demasiado grande degrada a
+    `COMPLETADO` sin reporte.
+  - `CANCELADO` se decide por una marca en memoria
+    (`ScanOwnershipRegistry::mark_cancel_requested`) puesta cuando
+    `POST /api/scans/{id}/cancel` fue aceptado por el Broker; si llega `failed`
+    para ese escaneo se envía `CANCELADO`. No se interpreta el texto del motivo
+    de `ms-nmap`. **Limitación aceptada:** la marca se pierde al reiniciar el
+    Gateway (el escaneo queda `FALLIDO` con el motivo de cancelación de
+    `ms-nmap`).
+  - `GET /api/scans/{scan_id}/report` traduce el `scanId` del Gateway al de
+    `ms-usuarios` con `ScanOwnershipRegistry`, que sigue siendo en memoria: tras
+    un reinicio responde `404` aunque el reporte exista.
+  - El shape SSE no cambia (`started`/`completed`/`failed`).

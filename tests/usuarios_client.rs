@@ -349,3 +349,304 @@ async fn list_scan_history_when_ms_usuarios_is_unreachable_returns_a_typed_error
 
     assert!(matches!(result, Err(UsuariosClientError::Unreachable)));
 }
+
+// ---------------------------------------------------------------------------
+// Feature `scan-report`: payloads de `PATCH /scans/{id}`, `failure_reason` /
+// `CANCELADO` en el histórico y `GET /users/me/scans/{id}/report`.
+// ---------------------------------------------------------------------------
+
+use axum::extract::Path as AxumPath;
+use axum::routing::patch;
+use gateway::domain::ScanResult;
+use gateway::usuarios_client::ScanStatus;
+
+/// Cuerpos capturados por [`spawn_patch_recorder`], en orden de llegada.
+type RecordedPatches = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// Stub que solo implementa `PATCH /scans/{scan_id}` y registra `(scan_id,
+/// cuerpo JSON)` de cada llamada.
+async fn spawn_patch_recorder() -> (String, RecordedPatches) {
+    let recorded: RecordedPatches = Arc::new(Mutex::new(Vec::new()));
+
+    async fn record(
+        AxumPath(scan_id): AxumPath<String>,
+        State(recorded): State<RecordedPatches>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        recorded
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((scan_id, body));
+        StatusCode::NO_CONTENT
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind del stub de ms-usuarios");
+    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
+    let app = Router::new()
+        .route("/scans/:scan_id", patch(record))
+        .with_state(recorded.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("servidor del stub de ms-usuarios");
+    });
+
+    (format!("http://{addr}"), recorded)
+}
+
+fn lab_client(base_url: String) -> UsuariosClient {
+    UsuariosClient::new(base_url, SecretString::from(LAB_SHARED_SECRET.to_string()))
+        .expect("cliente de laboratorio debe construirse")
+}
+
+fn sample_scan_result() -> ScanResult {
+    serde_json::from_value(json!({
+        "host": "192.0.2.10",
+        "ports": [{
+            "port": 22, "protocol": "tcp", "state": "open",
+            "service": "ssh", "version": null, "cpes": []
+        }],
+        "vulnerabilities": [],
+        "scanned_at": "2024-01-01T00:00:00Z",
+    }))
+    .expect("resultado de prueba válido")
+}
+
+#[tokio::test]
+async fn update_scan_status_without_details_sends_only_the_status() {
+    let (base_url, recorded) = spawn_patch_recorder().await;
+
+    lab_client(base_url)
+        .update_scan_status(&lab_session(), "ms-1", ScanStatus::EnProgreso)
+        .await
+        .expect("PATCH debe aceptarse");
+
+    let calls = recorded.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![("ms-1".to_string(), json!({"status": "EN_PROGRESO"}))]
+    );
+}
+
+#[tokio::test]
+async fn update_scan_outcome_with_completado_sends_the_full_result() {
+    let (base_url, recorded) = spawn_patch_recorder().await;
+    let result = sample_scan_result();
+
+    lab_client(base_url)
+        .update_scan_outcome(
+            &lab_session(),
+            "ms-1",
+            ScanStatus::Completado,
+            Some(&result),
+            None,
+        )
+        .await
+        .expect("PATCH debe aceptarse");
+
+    let calls = recorded.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let body = &calls[0].1;
+    assert_eq!(body["status"], json!("COMPLETADO"));
+    assert_eq!(body["result"], serde_json::to_value(&result).unwrap());
+    assert!(body.get("failure_reason").is_none());
+}
+
+#[tokio::test]
+async fn update_scan_outcome_with_fallido_and_cancelado_sends_the_failure_reason() {
+    let (base_url, recorded) = spawn_patch_recorder().await;
+    let client = lab_client(base_url);
+
+    client
+        .update_scan_outcome(
+            &lab_session(),
+            "ms-1",
+            ScanStatus::Fallido,
+            None,
+            Some("host inalcanzable"),
+        )
+        .await
+        .expect("PATCH debe aceptarse");
+    client
+        .update_scan_outcome(
+            &lab_session(),
+            "ms-2",
+            ScanStatus::Cancelado,
+            None,
+            Some("cancelado por el usuario"),
+        )
+        .await
+        .expect("PATCH debe aceptarse");
+
+    let calls = recorded.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![
+            (
+                "ms-1".to_string(),
+                json!({"status": "FALLIDO", "failure_reason": "host inalcanzable"})
+            ),
+            (
+                "ms-2".to_string(),
+                json!({"status": "CANCELADO", "failure_reason": "cancelado por el usuario"})
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn list_scan_history_parses_failure_reason_and_the_cancelado_status() {
+    let history = json!([
+        {
+            "scan_id": "ms-1", "user_id": "u", "target": "192.0.2.10",
+            "status": "CANCELADO",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:01:00Z",
+            "failure_reason": "cancelado por el usuario",
+        },
+        {
+            "scan_id": "ms-2", "user_id": "u", "target": "192.0.2.20",
+            "status": "COMPLETADO",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:01:00Z",
+            "failure_reason": null,
+        },
+        {
+            "scan_id": "ms-3", "user_id": "u", "target": "192.0.2.30",
+            "status": "PENDIENTE",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:01:00Z",
+        },
+    ]);
+    let base_url = spawn_scan_history_stub(LAB_SHARED_SECRET, history).await;
+
+    let entries = lab_client(base_url)
+        .list_scan_history(&lab_session())
+        .await
+        .expect("debe devolver el histórico");
+
+    assert_eq!(entries[0].status, ScanStatus::Cancelado);
+    assert_eq!(
+        entries[0].failure_reason.as_deref(),
+        Some("cancelado por el usuario")
+    );
+    assert_eq!(entries[1].failure_reason, None);
+    assert_eq!(entries[2].failure_reason, None);
+}
+
+/// Stub de `GET /users/me/scans/{scan_id}/report` con una respuesta fija;
+/// registra los headers de autenticación recibidos.
+async fn spawn_report_stub(
+    status: StatusCode,
+    body: Value,
+) -> (String, Arc<Mutex<Vec<HeaderMap>>>) {
+    #[derive(Clone)]
+    struct ReportState {
+        status: StatusCode,
+        body: Value,
+        headers: Arc<Mutex<Vec<HeaderMap>>>,
+    }
+
+    async fn report(
+        State(state): State<ReportState>,
+        AxumPath(_scan_id): AxumPath<String>,
+        headers: HeaderMap,
+    ) -> (StatusCode, Json<Value>) {
+        state.headers.lock().unwrap().push(headers);
+        (state.status, Json(state.body))
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind del stub de ms-usuarios");
+    let addr = listener.local_addr().expect("addr del stub de ms-usuarios");
+    let app = Router::new()
+        .route("/users/me/scans/:scan_id/report", get(report))
+        .with_state(ReportState {
+            status,
+            body,
+            headers: seen.clone(),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("servidor del stub de ms-usuarios");
+    });
+
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn get_scan_report_returns_the_stored_result_and_sends_the_auth_headers() {
+    let result = sample_scan_result();
+    let (base_url, seen) =
+        spawn_report_stub(StatusCode::OK, serde_json::to_value(&result).unwrap()).await;
+
+    let report = lab_client(base_url)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await
+        .expect("200 debe devolver el reporte");
+
+    assert_eq!(report, result);
+    let headers = seen.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert!(secret_matches(&headers[0], LAB_SHARED_SECRET));
+    assert!(headers[0].get(FORWARDED_USER_HEADER_NAME).is_some());
+}
+
+#[tokio::test]
+async fn get_scan_report_maps_404_and_409_to_typed_errors() {
+    let (not_found_url, _) =
+        spawn_report_stub(StatusCode::NOT_FOUND, json!({"error": "no existe"})).await;
+    let (not_ready_url, _) = spawn_report_stub(
+        StatusCode::CONFLICT,
+        json!({"error": "el reporte del escaneo aún no está disponible"}),
+    )
+    .await;
+
+    let not_found = lab_client(not_found_url)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await;
+    let not_ready = lab_client(not_ready_url)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await;
+
+    assert!(matches!(
+        not_found,
+        Err(UsuariosClientError::ScanReportNotFound)
+    ));
+    assert!(matches!(
+        not_ready,
+        Err(UsuariosClientError::ScanReportNotReady)
+    ));
+}
+
+#[tokio::test]
+async fn get_scan_report_maps_other_statuses_and_bad_bodies_and_unreachable() {
+    let (server_error_url, _) =
+        spawn_report_stub(StatusCode::INTERNAL_SERVER_ERROR, json!({})).await;
+    let (malformed_url, _) = spawn_report_stub(StatusCode::OK, json!({"unexpected": true})).await;
+
+    let server_error = lab_client(server_error_url)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await;
+    let malformed = lab_client(malformed_url)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await;
+    let unreachable = lab_client(unreachable_base_url().await)
+        .get_scan_report(&lab_session(), "ms-1")
+        .await;
+
+    assert!(matches!(
+        server_error,
+        Err(UsuariosClientError::UnexpectedResponse { status: 500 })
+    ));
+    assert!(matches!(
+        malformed,
+        Err(UsuariosClientError::MalformedResponse)
+    ));
+    assert!(matches!(unreachable, Err(UsuariosClientError::Unreachable)));
+}

@@ -246,14 +246,16 @@ async fn scan_history_returns_the_entries_of_the_active_session_with_and_without
             "status": "EN_PROGRESO",
             "requested_at": "2024-01-01T00:00:00Z",
             "updated_at": "2024-01-01T00:05:00Z",
+            "failure_reason": null,
         },
         {
             "scan_id": "ms-usuarios-unknown",
             "user_id": "alice",
             "target": "192.0.2.20",
-            "status": "COMPLETADO",
+            "status": "CANCELADO",
             "requested_at": "2024-01-02T00:00:00Z",
             "updated_at": "2024-01-02T01:00:00Z",
+            "failure_reason": "cancelado por el usuario",
         },
     ]);
     let usuarios_base_url = spawn_usuarios_history_stub(history).await;
@@ -292,6 +294,11 @@ async fn scan_history_returns_the_entries_of_the_active_session_with_and_without
     assert_eq!(known["scanId"], json!("gateway-scan-id-known"));
     assert_eq!(known["target"], json!("192.0.2.10"));
     assert_eq!(known["status"], json!("EN_PROGRESO"));
+    assert_eq!(
+        known["failure_reason"],
+        Value::Null,
+        "failure_reason debe estar siempre presente (null si no hay)"
+    );
 
     let unknown = &entries[1];
     assert!(
@@ -299,7 +306,8 @@ async fn scan_history_returns_the_entries_of_the_active_session_with_and_without
         "una entrada sin scanId propio conocido no debe traer ese campo: {unknown}"
     );
     assert_eq!(unknown["target"], json!("192.0.2.20"));
-    assert_eq!(unknown["status"], json!("COMPLETADO"));
+    assert_eq!(unknown["status"], json!("CANCELADO"));
+    assert_eq!(unknown["failure_reason"], json!("cancelado por el usuario"));
 }
 
 #[tokio::test]
@@ -357,12 +365,18 @@ async fn cancel_scan_that_does_not_exist_returns_not_found() {
 
 #[tokio::test]
 async fn cancel_scan_already_in_a_terminal_state_is_rejected_without_publishing() {
+    for terminal in ["COMPLETADO", "FALLIDO", "CANCELADO"] {
+        assert_cancel_rejected_for_terminal_status(terminal).await;
+    }
+}
+
+async fn assert_cancel_rejected_for_terminal_status(terminal: &str) {
     let history = json!([
         {
             "scan_id": "ms-usuarios-done",
             "user_id": "alice",
             "target": "192.0.2.10",
-            "status": "COMPLETADO",
+            "status": terminal,
             "requested_at": "2024-01-01T00:00:00Z",
             "updated_at": "2024-01-01T00:05:00Z",
         },
@@ -393,7 +407,68 @@ async fn cancel_scan_already_in_a_terminal_state_is_rejected_without_publishing(
         .await
         .expect("POST /api/scans/.../cancel debe responder");
 
-    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::CONFLICT,
+        "estado terminal {terminal}"
+    );
+    assert!(!gateway
+        .scan_ownership
+        .is_cancel_requested("scan-already-done"));
+}
+
+/// Doble de [`ScanRequestPublisher`] que acepta la cancelación.
+struct AcceptsCancellation;
+
+#[async_trait::async_trait]
+impl ScanRequestPublisher for AcceptsCancellation {
+    async fn publish_scan_request(&self, _request: &ScanRequest) -> Result<(), BrokerError> {
+        panic!("este escenario no publica ScanRequest");
+    }
+
+    async fn publish_scan_cancellation(
+        &self,
+        _cancellation: &ScanCancellation,
+    ) -> Result<(), BrokerError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn accepted_cancellation_marks_the_scan_as_cancel_requested() {
+    let history = json!([{
+        "scan_id": "ms-usuarios-running", "user_id": "alice", "target": "192.0.2.10",
+        "status": "EN_PROGRESO",
+        "requested_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:05:00Z",
+        "failure_reason": null,
+    }]);
+    let usuarios_base_url = spawn_usuarios_history_stub(history).await;
+    let gateway = spawn_gateway(usuarios_base_url, Arc::new(AcceptsCancellation)).await;
+    gateway.scan_ownership.register(
+        "scan-running",
+        "ms-usuarios-running".to_string(),
+        session_for("alice"),
+    );
+    assert!(!gateway.scan_ownership.is_cancel_requested("scan-running"));
+
+    let response = http_client()
+        .post(format!(
+            "http://{}/api/scans/scan-running/cancel",
+            gateway.addr
+        ))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("POST /api/scans/.../cancel debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(gateway.scan_ownership.is_cancel_requested("scan-running"));
 }
 
 #[tokio::test]

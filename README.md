@@ -17,6 +17,27 @@ de mensajes fijado por `broker/`), OIDC contra Google con `openidconnect`,
 sesión propia firmada con `jsonwebtoken`, tests de integración con
 `testcontainers` + LocalStack.
 
+## API de escaneos
+
+Todas las rutas requieren la cookie de sesión (`401` sin ella). El contrato
+completo está en `GET /api/openapi.json`.
+
+| Método y ruta | Respuesta |
+|---|---|
+| `POST /api/scans` | Alta de escaneo; devuelve `{"scanId"}` |
+| `GET /api/scans` | Histórico: `scanId` (si se conoce), `target`, `status` (`PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO`), `requested_at`, `updated_at`, `failure_reason` (`null` si no hay) |
+| `GET /api/scans/{scan_id}/events` | Stream SSE `started`/`completed`/`failed` |
+| `POST /api/scans/{scan_id}/cancel` | `202`; `404` ajeno; `409` si ya es terminal (`COMPLETADO`/`FALLIDO`/`CANCELADO`) |
+| `GET /api/scans/{scan_id}/report` | `200` con el `ScanResult` (`host`, `ports`, `vulnerabilities`, `scanned_at`); `404` inexistente o ajeno; `409` si aún no hay reporte; `502`/`504` fallo de `ms-usuarios` |
+
+Al terminar un escaneo, el Gateway guarda en `ms-usuarios` el resultado completo
+(`COMPLETADO`) o el motivo (`FALLIDO`/`CANCELADO`). Si el usuario pidió cancelar
+el escaneo por este Gateway, el evento `failed` de `ms-nmap` se registra como
+`CANCELADO`. Esa marca vive en memoria: tras un reinicio del Gateway el escaneo
+queda `FALLIDO` con el motivo de cancelación de `ms-nmap`. El `scanId` también
+es solo memoria, así que tras un reinicio el reporte de escaneos anteriores
+responde `404`.
+
 ## Desarrollo
 
 Documentación de referencia, en este orden: `docs/architecture.md`
