@@ -250,6 +250,11 @@ pub struct VulnFinding {
     /// JSON verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<Confidence>,
+    /// Estado de parche del hallazgo. Ausente (`None`) en resultados
+    /// anteriores a este campo: se omite al serializar para relayar el
+    /// JSON verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_state: Option<PatchState>,
 }
 
 /// Confianza de un [`VulnFinding`]. Cerrado a propósito: un valor
@@ -262,6 +267,18 @@ pub enum Confidence {
     Confirmed,
     /// Inferido solo por coincidencia de versión del servicio.
     VersionMatch,
+}
+
+/// Estado de parche de un [`VulnFinding`]. Cerrado a propósito: un valor
+/// desconocido se rechaza (`deny_unknown_fields`); ampliarlo exige desplegar
+/// primero el Gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchState {
+    /// La versión detectada sigue afectada (sin parche).
+    Unpatched,
+    /// La versión detectada ya incluye la corrección.
+    Fixed,
 }
 
 #[cfg(test)]
@@ -445,6 +462,14 @@ mod tests {
         })
     }
 
+    fn completed_json_with_patch_state(patch_state: Option<&str>) -> serde_json::Value {
+        let mut json = completed_json_with_confidence(None);
+        if let Some(value) = patch_state {
+            json["result"]["vulnerabilities"][0]["patch_state"] = serde_json::json!(value);
+        }
+        json
+    }
+
     fn first_vuln(event: ScanOutcomeEvent) -> VulnFinding {
         match event {
             ScanOutcomeEvent::Completed { result, .. } => result
@@ -482,6 +507,34 @@ mod tests {
     #[test]
     fn vuln_finding_rejects_unknown_confidence_value() {
         let json = completed_json_with_confidence(Some("maybe"));
+        assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
+    }
+
+    #[test]
+    fn vuln_finding_without_patch_state_decodes_as_none_and_omits_it_on_reserialize() {
+        let json = completed_json_with_patch_state(None);
+        let event: ScanOutcomeEvent = serde_json::from_value(json.clone()).expect("debe parsear");
+        assert_eq!(first_vuln(event.clone()).patch_state, None);
+        assert_eq!(serde_json::to_value(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn vuln_finding_patch_state_values_decode_and_round_trip_verbatim() {
+        for (raw, expected) in [
+            ("unpatched", PatchState::Unpatched),
+            ("fixed", PatchState::Fixed),
+        ] {
+            let json = completed_json_with_patch_state(Some(raw));
+            let event: ScanOutcomeEvent =
+                serde_json::from_value(json.clone()).expect("debe parsear");
+            assert_eq!(first_vuln(event.clone()).patch_state, Some(expected));
+            assert_eq!(serde_json::to_value(&event).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn vuln_finding_rejects_unknown_patch_state_value() {
+        let json = completed_json_with_patch_state(Some("maybe"));
         assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
     }
 
