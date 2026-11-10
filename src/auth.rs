@@ -116,6 +116,10 @@ pub enum AuthError {
     /// exacto solo se loggea en el servidor (ver `docs/security-scope.md`).
     #[error("sesión inválida o ausente")]
     SessionInvalid,
+    /// La sesión es válida pero su rol no es `admin` (ver [`require_admin`]).
+    /// Mensaje deliberadamente genérico: no revela el rol ni los claims.
+    #[error("acceso denegado")]
+    AdminRequired,
 }
 
 impl From<ClaimsVerificationError> for AuthError {
@@ -540,6 +544,29 @@ pub async fn require_session(
     let session = validator.validate(&token)?;
     request.extensions_mut().insert(session);
     Ok(next.run(request).await)
+}
+
+/// Middleware `axum` que exige que la sesión ya validada sea de un
+/// administrador (`role == admin`).
+///
+/// Debe aplicarse **dentro** de [`require_session`] (capa más interna): este
+/// último valida firma/`exp`/`aud`/`iss` e inserta la [`Session`] cuyo `role`
+/// salió del JWT firmado por este Gateway (y, en origen, de `ms-usuarios` en
+/// el login). Responde `403` ([`AuthError::AdminRequired`]) si el rol no es
+/// `admin`. Si no encuentra ninguna [`Session`] (router mal compuesto, sin
+/// `require_session`) responde `401` en vez de dejar pasar: falla cerrado.
+pub async fn require_admin(request: Request, next: Next) -> Result<Response, AuthError> {
+    match request.extensions().get::<Session>() {
+        None => {
+            tracing::error!("require_admin montado sin require_session: se rechaza la solicitud");
+            Err(AuthError::SessionInvalid)
+        }
+        Some(session) if session.role != Role::Admin => {
+            tracing::warn!("acceso a ruta de administración denegado a una sesión sin rol admin");
+            Err(AuthError::AdminRequired)
+        }
+        Some(_) => Ok(next.run(request).await),
+    }
 }
 
 #[cfg(test)]
