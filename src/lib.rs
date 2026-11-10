@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod admin;
+pub mod admin_routes;
 pub mod api;
 pub mod auth;
 pub mod broker;

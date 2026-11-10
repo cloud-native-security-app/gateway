@@ -37,6 +37,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::admin::AdminFeed;
+use crate::admin_routes;
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
@@ -485,6 +486,9 @@ fn protected_router(state: AppState) -> Router {
             "/api/network-credentials/:id",
             delete(delete_network_credential),
         )
+        // Rutas de administración: `require_admin` va dentro de su propio
+        // router y `require_session` (capa de abajo) las envuelve por fuera.
+        .merge(admin_routes::admin_router(state.usuarios_client.clone()))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -1280,6 +1284,16 @@ pub const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/admin/metrics",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/admin/events",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/openapi.json",
         protected: false,
     },
@@ -1427,8 +1441,20 @@ impl Modify for SessionCookieSecurity {
         list_network_credentials,
         create_network_credential,
         delete_network_credential,
+        crate::admin_routes::admin_metrics,
+        crate::admin_routes::admin_events,
     ),
     components(schemas(
+        crate::admin::AdminSnapshot,
+        crate::admin::AdminDelta,
+        crate::admin::Kpis,
+        crate::admin::InFlightScan,
+        crate::admin::CriticalFinding,
+        crate::admin::EventEntry,
+        crate::admin::ScanChange,
+        crate::admin::ScanFlightStatus,
+        crate::admin::ScanChangeStatus,
+        crate::admin_routes::AdminStreamClosed,
         MeResponse,
         ScanSubmissionRequest,
         ScanSubmissionResponse,
@@ -1449,7 +1475,8 @@ impl Modify for SessionCookieSecurity {
         (name = "docs", description = "Documentación OpenAPI de este Gateway (RNF-08)."),
         (name = "session", description = "Identidad y perfil de la sesión activa."),
         (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos."),
-        (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios.")
+        (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios."),
+        (name = "admin", description = "Métricas y eventos de seguridad en tiempo real, solo para administradores.")
     ),
     modifiers(&SessionCookieSecurity)
 )]
