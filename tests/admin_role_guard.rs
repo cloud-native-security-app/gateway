@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -21,7 +21,9 @@ use gateway::auth::{
     issue_session_token, require_admin, require_session, SessionValidator, SESSION_COOKIE_NAME,
 };
 use gateway::domain::{Role, Session};
-use gateway::usuarios_client::{UsuariosClient, GATEWAY_SECRET_HEADER_NAME};
+use gateway::usuarios_client::{
+    UsuariosClient, UsuariosClientError, FORWARDED_USER_HEADER_NAME, GATEWAY_SECRET_HEADER_NAME,
+};
 use secrecy::SecretString;
 use tokio::net::TcpListener;
 
@@ -66,6 +68,10 @@ async fn serve(app: Router) -> SocketAddr {
 enum UsuariosBehavior {
     /// `200` con el perfil indicado.
     Profile(serde_json::Value),
+    /// `200` con el rol que corresponda a la identidad reenviada en
+    /// `X-Forwarded-User`; una identidad desconocida recibe `404` (usuario
+    /// inexistente). Prueba que el guard reconsulta al sujeto correcto.
+    PerIdentity(Vec<(&'static str, serde_json::Value)>),
     /// Responde con ese status de error.
     Status(StatusCode),
     /// Nunca responde (simula un servicio colgado).
@@ -76,6 +82,15 @@ enum UsuariosBehavior {
 struct UsuariosStub {
     behavior: UsuariosBehavior,
     calls: Arc<AtomicUsize>,
+    /// `sub` de la identidad reenviada en cada llamada, en orden de llegada.
+    forwarded_subs: Arc<Mutex<Vec<String>>>,
+}
+
+/// Extrae el `sub` del JSON `{"sub", "email"}` de `X-Forwarded-User`.
+fn forwarded_sub(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(FORWARDED_USER_HEADER_NAME)?.to_str().ok()?;
+    let identity: serde_json::Value = serde_json::from_str(raw).ok()?;
+    identity.get("sub")?.as_str().map(str::to_string)
 }
 
 async fn get_users_me(
@@ -83,6 +98,9 @@ async fn get_users_me(
     headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
     stub.calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(sub) = forwarded_sub(&headers) {
+        stub.forwarded_subs.lock().unwrap().push(sub);
+    }
     let secret_ok = headers
         .get(GATEWAY_SECRET_HEADER_NAME)
         .and_then(|v| v.to_str().ok())
@@ -92,6 +110,14 @@ async fn get_users_me(
     }
     match &stub.behavior {
         UsuariosBehavior::Profile(profile) => (StatusCode::OK, Json(profile.clone())),
+        UsuariosBehavior::PerIdentity(roles) => {
+            let profile = forwarded_sub(&headers)
+                .and_then(|sub| roles.iter().find(|(known, _)| *known == sub).cloned());
+            match profile {
+                Some((_, profile)) => (StatusCode::OK, Json(profile)),
+                None => (StatusCode::NOT_FOUND, Json(serde_json::json!({}))),
+            }
+        }
         UsuariosBehavior::Status(status) => (*status, Json(serde_json::json!({}))),
         UsuariosBehavior::Hang => std::future::pending().await,
     }
@@ -100,15 +126,26 @@ async fn get_users_me(
 /// Levanta el stub de `ms-usuarios`; devuelve su URL base y el contador de
 /// llamadas recibidas.
 async fn spawn_usuarios_stub(behavior: UsuariosBehavior) -> (String, Arc<AtomicUsize>) {
+    let (url, calls, _subs) = spawn_usuarios_stub_with_subs(behavior).await;
+    (url, calls)
+}
+
+/// Como [`spawn_usuarios_stub`], y además devuelve los `sub` reenviados en
+/// `X-Forwarded-User` en cada llamada.
+async fn spawn_usuarios_stub_with_subs(
+    behavior: UsuariosBehavior,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let calls = Arc::new(AtomicUsize::new(0));
+    let forwarded_subs = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
         .route("/users/me", get(get_users_me))
         .with_state(UsuariosStub {
             behavior,
             calls: calls.clone(),
+            forwarded_subs: forwarded_subs.clone(),
         });
     let addr = serve(app).await;
-    (format!("http://{addr}"), calls)
+    (format!("http://{addr}"), calls, forwarded_subs)
 }
 
 /// URL de un `ms-usuarios` caído: un puerto que se cerró de inmediato.
@@ -143,8 +180,12 @@ async fn spawn_admin_router(usuarios_base_url: &str) -> SocketAddr {
 }
 
 fn session_with(role: Role) -> Session {
+    session_for("google-sub-123", role)
+}
+
+fn session_for(sub: &str, role: Role) -> Session {
     Session {
-        sub: "google-sub-123".to_string(),
+        sub: sub.to_string(),
         email: "user@example.com".to_string(),
         name: "Test User".to_string(),
         exp: SystemTime::now()
@@ -157,8 +198,12 @@ fn session_with(role: Role) -> Session {
 }
 
 fn token_for(role: Role, signing_key: &str) -> String {
+    token_for_session(&session_with(role), signing_key)
+}
+
+fn token_for_session(session: &Session, signing_key: &str) -> String {
     issue_session_token(
-        &session_with(role),
+        session,
         &SecretString::from(signing_key.to_string()),
         SESSION_AUDIENCE,
         SESSION_ISSUER,
@@ -431,4 +476,109 @@ async fn require_admin_without_a_session_layer_fails_closed() {
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert_generic_body(response, BODY_UNAUTHENTICATED).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// Follow-up (a): el guard reenvía la identidad de la propia sesión y el rol
+/// que decide es el de ESE sujeto. Con dos admins (según el claim) y roles
+/// distintos en `ms-usuarios`, cada uno recibe el veredicto de su identidad.
+#[tokio::test]
+async fn guard_forwards_the_session_subject_and_decides_per_identity() {
+    let (url, calls, forwarded) =
+        spawn_usuarios_stub_with_subs(UsuariosBehavior::PerIdentity(vec![
+            ("sub-still-admin", serde_json::json!({"role": "admin"})),
+            ("sub-demoted", serde_json::json!({"role": "user"})),
+        ]))
+        .await;
+    let addr = spawn_admin_router(&url).await;
+    let still_admin = token_for_session(
+        &session_for("sub-still-admin", Role::Admin),
+        SESSION_SIGNING_KEY,
+    );
+    let demoted = token_for_session(
+        &session_for("sub-demoted", Role::Admin),
+        SESSION_SIGNING_KEY,
+    );
+
+    let ok = get_probe(addr, Some(&still_admin)).await;
+    let denied = get_probe(addr, Some(&demoted)).await;
+
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *forwarded.lock().unwrap(),
+        vec!["sub-still-admin".to_string(), "sub-demoted".to_string()],
+        "cada llamada debe reenviar el sub de la sesión que la causó"
+    );
+}
+
+/// Follow-up (b): un `404` definitivo de `ms-usuarios` (el usuario ya no
+/// existe) no es "no se pudo verificar": es "no es admin", `403`.
+#[tokio::test]
+async fn user_gone_in_ms_usuarios_gets_403_not_503() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Status(StatusCode::NOT_FOUND)).await;
+    let addr = spawn_admin_router(&url).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = get_probe(addr, Some(&token)).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_generic_body(response, BODY_FORBIDDEN).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Follow-up (b): un `401` de `ms-usuarios` (secreto compartido mal
+/// configurado) sigue siendo `503` fail-closed, nunca `403`.
+#[tokio::test]
+async fn rejected_shared_secret_stays_503() {
+    let (url, _calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let wrong_secret_client = Arc::new(
+        UsuariosClient::new(url, SecretString::from("otro-secreto".to_string()))
+            .expect("cliente de ms-usuarios")
+            .with_role_check_timeout(TEST_ROLE_CHECK_TIMEOUT),
+    );
+    let app = Router::new()
+        .route("/probe", get(probe))
+        .layer(middleware::from_fn_with_state(
+            wrong_secret_client,
+            require_admin,
+        ))
+        .layer(middleware::from_fn_with_state(validator(), require_session));
+    let addr = serve(app).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = get_probe(addr, Some(&token)).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_generic_body(response, BODY_UNAVAILABLE).await;
+}
+
+/// El tipo de error que sale de `current_role` distingue cada causa (y su
+/// `kind()` es lo único que se loggea, sin datos personales).
+#[tokio::test]
+async fn current_role_classifies_the_user_service_failures() {
+    let session = session_with(Role::Admin);
+    let cases = [
+        (StatusCode::NOT_FOUND, "user_not_found"),
+        (StatusCode::UNAUTHORIZED, "misconfigured"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "unexpected_status"),
+        (StatusCode::BAD_GATEWAY, "unexpected_status"),
+    ];
+    for (status, expected_kind) in cases {
+        let (url, _calls) = spawn_usuarios_stub(UsuariosBehavior::Status(status)).await;
+        let error = usuarios_client(&url)
+            .current_role(&session)
+            .await
+            .expect_err("un status de error no confirma el rol");
+        assert_eq!(error.kind(), expected_kind, "status {status}");
+    }
+    let error = usuarios_client(&unreachable_usuarios_url().await)
+        .current_role(&session)
+        .await
+        .expect_err("un servicio caído no confirma el rol");
+    assert!(matches!(error, UsuariosClientError::Unreachable));
+    assert_eq!(error.kind(), "unreachable");
 }

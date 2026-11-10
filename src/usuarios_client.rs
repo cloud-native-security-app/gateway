@@ -344,6 +344,17 @@ pub enum UsuariosClientError {
     /// para este usuario/objetivo (`422`).
     #[error("no hay credenciales de red configuradas para este usuario y objetivo")]
     ScanTargetNotConfigured,
+    /// `ms-usuarios` respondió `404` a [`UsuariosClient::current_role`]: el
+    /// usuario de la sesión ya no existe. Es una respuesta definitiva ("no es
+    /// admin"), no un fallo transitorio.
+    #[error("el usuario de la sesión ya no existe en el servicio de usuarios")]
+    UserNotFound,
+    /// `ms-usuarios` respondió `401` a [`UsuariosClient::current_role`]: no
+    /// aceptó la credencial de servicio compartida (configuración errónea de
+    /// este despliegue). No dice nada del usuario, así que no se trata como
+    /// "no es admin".
+    #[error("el servicio de usuarios rechazó la credencial de servicio de este gateway")]
+    ServiceMisconfigured,
     /// `ms-usuarios` respondió `404` a
     /// [`UsuariosClient::delete_network_credential`]: la entrada no existe o
     /// no pertenece al usuario de la sesión activa (mismo criterio de
@@ -363,6 +374,27 @@ pub enum UsuariosClientError {
     /// reenvía como `409`.
     #[error("el reporte del escaneo aún no está disponible")]
     ScanReportNotReady,
+}
+
+impl UsuariosClientError {
+    /// Clasificación estable y sin datos personales del error, pensada para
+    /// loggear la causa de un fallo (p. ej. de la reconsulta del rol) sin
+    /// volcar el error completo.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Unreachable => "unreachable",
+            Self::UnexpectedResponse { .. } => "unexpected_status",
+            Self::MalformedResponse => "malformed_response",
+            Self::RequestBuild => "request_build",
+            Self::UserNotFound => "user_not_found",
+            Self::ServiceMisconfigured => "misconfigured",
+            Self::ScanTargetResolutionNotImplemented
+            | Self::ScanTargetNotConfigured
+            | Self::NetworkCredentialNotFound
+            | Self::ScanReportNotFound
+            | Self::ScanReportNotReady => "other",
+        }
+    }
 }
 
 /// Cuerpo del header [`FORWARDED_USER_HEADER_NAME`]: la identidad ya
@@ -418,9 +450,11 @@ impl UsuariosClient {
     /// /users/me`) con un timeout corto ([`DEFAULT_ROLE_CHECK_TIMEOUT`]).
     ///
     /// Un perfil sin `role` o con un valor desconocido resuelve a
-    /// [`Role::User`] (ver [`role_from_profile`]). Los fallos de red,
-    /// timeout o status no-2xx se propagan como error: quien llama debe
-    /// tratarlos como "no confirmado" (fail closed).
+    /// [`Role::User`] (ver [`role_from_profile`]). Un `404` se devuelve como
+    /// [`UsuariosClientError::UserNotFound`] (definitivo: el usuario ya no
+    /// existe) y un `401` como [`UsuariosClientError::ServiceMisconfigured`].
+    /// Los demás fallos de red, timeout o status no-2xx se propagan tal cual:
+    /// quien llama debe tratarlos como "no confirmado" (fail closed).
     pub async fn current_role(&self, identity: &Session) -> Result<Role, UsuariosClientError> {
         let identity_header = self.identity_header_value(identity)?;
         let request = self
@@ -433,8 +467,19 @@ impl UsuariosClient {
                 self.shared_secret.expose_secret(),
             );
 
-        let profile: UserProfile = self.send_and_decode(request).await?;
-        Ok(role_from_profile(&profile))
+        match self.send_and_decode::<UserProfile>(request).await {
+            Ok(profile) => Ok(role_from_profile(&profile)),
+            // `404` definitivo: el usuario ya no existe, por lo tanto no es
+            // admin. `401`: el secreto compartido no coincide (despliegue mal
+            // configurado), que no es un veredicto sobre el usuario.
+            Err(UsuariosClientError::UnexpectedResponse { status: 404 }) => {
+                Err(UsuariosClientError::UserNotFound)
+            }
+            Err(UsuariosClientError::UnexpectedResponse { status: 401 }) => {
+                Err(UsuariosClientError::ServiceMisconfigured)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// Obtiene el perfil de `identity` desde `ms-usuarios` (`GET /users/me`).

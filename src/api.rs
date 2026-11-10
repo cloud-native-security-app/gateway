@@ -1707,8 +1707,13 @@ impl IntoResponse for UsuariosClientError {
             // ms-usuarios respondió, pero con un status inesperado (incluye
             // 5xx propio y un 401 por credencial de servicio rechazada) o un
             // cuerpo 2xx que no se pudo interpretar.
+            // `UserNotFound`/`ServiceMisconfigured` solo salen de `current_role`
+            // (que usa `auth::require_admin`, no estos handlers); si llegaran
+            // aquí son una falla del servicio de usuarios, no del cliente.
             UsuariosClientError::UnexpectedResponse { .. }
-            | UsuariosClientError::MalformedResponse => StatusCode::BAD_GATEWAY,
+            | UsuariosClientError::MalformedResponse
+            | UsuariosClientError::UserNotFound
+            | UsuariosClientError::ServiceMisconfigured => StatusCode::BAD_GATEWAY,
             // Fallo al construir la propia solicitud: un bug de este
             // Gateway, no de ms-usuarios.
             UsuariosClientError::RequestBuild => StatusCode::INTERNAL_SERVER_ERROR,
