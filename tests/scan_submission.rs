@@ -30,7 +30,7 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{
     BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher, ROUTING_KEY_SCAN_REQUEST,
 };
-use gateway::domain::{Role, Session};
+use gateway::domain::Session;
 use gateway::realtime::RealtimeRegistry;
 use gateway::sns::SnsScanPublisher;
 use gateway::usuarios_client::UsuariosClient;
@@ -390,7 +390,6 @@ fn valid_session_cookie_value() -> String {
         email: "user@example.com".to_string(),
         name: "Test User".to_string(),
         exp: now_epoch_secs() + 3600,
-        role: Role::User,
     };
 
     issue_session_token(

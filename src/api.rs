@@ -38,11 +38,11 @@ use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
+use crate::domain::{ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
 use crate::usuarios_client::{
-    role_from_profile, CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry,
-    ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
+    CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry, ScanStatus, UserProfile,
+    UsuariosClient, UsuariosClientError,
 };
 
 /// Entrada de [`ScanOwnershipRegistry`]: qué `scan_id` le asignó
@@ -457,10 +457,6 @@ struct MeResponse {
     sub: String,
     email: String,
     name: String,
-    /// Rol del usuario (`user`/`admin`), solo para que `front` muestre u
-    /// oculte el acceso de administración; la autorización real la aplica
-    /// este Gateway con `require_admin`.
-    role: Role,
 }
 
 impl From<Session> for MeResponse {
@@ -469,12 +465,11 @@ impl From<Session> for MeResponse {
             sub: session.sub,
             email: session.email,
             name: session.name,
-            role: session.role,
         }
     }
 }
 
-/// Devuelve la identidad (`sub`/`email`/`name`/`role`) de la sesión activa, ya
+/// Devuelve la identidad (`sub`/`email`/`name`) de la sesión activa, ya
 /// validada por el middleware de sesión. No consulta `ms-usuarios`: el
 /// perfil completo del usuario es responsabilidad de una feature posterior
 /// (`usuarios_profile_proxy`).
@@ -1379,7 +1374,6 @@ impl Modify for SessionCookieSecurity {
         crate::domain::VulnFinding,
         crate::domain::Confidence,
         crate::domain::PatchState,
-        crate::domain::Role,
         crate::usuarios_client::ScanStatus,
         crate::usuarios_client::NetworkCredential,
         crate::usuarios_client::CreateNetworkCredentialRequest,
@@ -1506,14 +1500,11 @@ async fn callback(
         .await?;
 
     let exp = current_epoch_secs().saturating_add(state.session_ttl_secs);
-    // El rol es `user` hasta que `ms-usuarios` diga otra cosa: nada de esta
-    // request (query, headers, cookies) puede fijarlo.
-    let mut session = Session {
+    let session = Session {
         sub: identity.sub,
         email: identity.email,
         name: identity.name,
         exp,
-        role: Role::User,
     };
 
     // Feature `provision_user_profile_on_login`: garantiza la fila de
@@ -1522,18 +1513,13 @@ async fn callback(
     // de Google) — nunca un valor derivado de esta request (ver
     // `docs/security-scope.md`). Un fallo aquí se propaga (`?`) sin llegar a
     // issuar cookie ni 302.
-    let profile = state
+    state
         .usuarios_client
         .upsert_profile(
             &session,
             &serde_json::json!({ "display_name": session.name }),
         )
         .await?;
-
-    // Feature `admin-role-guard`: el rol sale únicamente de la respuesta de
-    // `ms-usuarios` (ausente o desconocido => `user`) y viaja firmado en el
-    // JWT de sesión.
-    session.role = role_from_profile(&profile);
 
     let token = auth::issue_session_token(
         &session,
@@ -1610,7 +1596,6 @@ impl IntoResponse for AuthError {
             | AuthError::IdTokenInvalidNonce
             | AuthError::IdTokenRejected
             | AuthError::SessionInvalid => StatusCode::UNAUTHORIZED,
-            AuthError::AdminRequired => StatusCode::FORBIDDEN,
             AuthError::Discovery | AuthError::SessionIssue => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

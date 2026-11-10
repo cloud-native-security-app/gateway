@@ -73,7 +73,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Role, ScanResult, Session};
+use crate::domain::{ScanResult, Session};
 
 /// Nombre del header que transporta la identidad ya verificada de la sesión
 /// activa hacia `ms-usuarios`, en formato JSON (`{"sub", "email"}`).
@@ -94,30 +94,6 @@ pub const GATEWAY_SECRET_HEADER_NAME: &str = "X-Gateway-Secret";
 /// opaco: ver la nota de diseño al inicio de este módulo sobre por qué este
 /// cliente no tipa su contenido campo a campo.
 pub type UserProfile = serde_json::Value;
-
-/// Extrae el rol del perfil que devuelve `ms-usuarios` (`PUT`/`GET
-/// /users/me`, campo `role`).
-///
-/// Decisión de diseño (siempre al menor privilegio, nunca `admin` por
-/// omisión): un campo `role` **ausente** (un `ms-usuarios` anterior a la
-/// feature `user-role`) es [`Role::User`] sin ruido; un valor **presente pero
-/// no reconocido** (tipo equivocado, mayúsculas, un rol futuro) también es
-/// [`Role::User`], pero emite un `warn` porque delata una ruptura de
-/// contrato. El `warn` no incluye el valor recibido ni datos personales.
-pub fn role_from_profile(profile: &UserProfile) -> Role {
-    match profile.get("role") {
-        None => Role::User,
-        Some(value) => match value.as_str().and_then(Role::parse) {
-            Some(role) => role,
-            None => {
-                tracing::warn!(
-                    "ms-usuarios devolvió un `role` no reconocido; se usa `user` (revisar contrato)"
-                );
-                Role::User
-            }
-        },
-    }
-}
 
 /// Estado de una solicitud de escaneo en el histórico de `ms-usuarios`.
 ///
@@ -836,47 +812,6 @@ impl UsuariosClient {
 mod tests {
     use super::*;
 
-    #[test]
-    fn role_from_profile_reads_admin_and_user() {
-        assert_eq!(
-            role_from_profile(&serde_json::json!({"role": "admin"})),
-            Role::Admin
-        );
-        assert_eq!(
-            role_from_profile(&serde_json::json!({"role": "user"})),
-            Role::User
-        );
-    }
-
-    #[test]
-    fn role_from_profile_defaults_to_user_when_the_field_is_missing() {
-        assert_eq!(
-            role_from_profile(&serde_json::json!({"display_name": "x"})),
-            Role::User
-        );
-        assert_eq!(role_from_profile(&serde_json::json!(null)), Role::User);
-    }
-
-    #[test]
-    fn role_from_profile_never_promotes_unknown_or_malformed_values() {
-        for value in [
-            serde_json::json!("superuser"),
-            serde_json::json!("ADMIN"),
-            serde_json::json!(" admin"),
-            serde_json::json!(true),
-            serde_json::json!(1),
-            serde_json::json!(["admin"]),
-            serde_json::json!({"name": "admin"}),
-            serde_json::json!(null),
-        ] {
-            assert_eq!(
-                role_from_profile(&serde_json::json!({ "role": value })),
-                Role::User,
-                "un rol no reconocido debe resolverse a `user`: {value}"
-            );
-        }
-    }
-
     fn lab_client() -> UsuariosClient {
         UsuariosClient::new(
             "http://ms-usuarios.internal".to_string(),
@@ -904,7 +839,6 @@ mod tests {
             email: "user@example.com".to_string(),
             name: "Test User".to_string(),
             exp: 9_999_999_999,
-            role: Role::User,
         };
 
         let value = client

@@ -57,16 +57,6 @@ Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
   Google en cada request (solo una vez, durante el login) — se valida la
   sesión propia de Gateway, más barata y sin dependencia de red hacia
   Google en el camino caliente.
-- **El rol viaja en esa misma sesión** (claim `role`, `"user"`/`"admin"`):
-  Gateway lo lee de la respuesta de `PUT /users/me` de `ms-usuarios` al
-  provisionar el perfil en el login (`usuarios_client::role_from_profile`)
-  y lo firma dentro del JWT. Un rol ausente o desconocido se resuelve a
-  `user`; un JWT anterior sin claim `role` también decodifica como `user`.
-  El guard `auth::require_admin` (capa más interna, dentro de
-  `require_session`) responde `401` sin sesión válida y `403` si el rol no
-  es `admin`. `GET /api/me` devuelve `role` solo para que `front` muestre u
-  oculte el acceso de administración. Un cambio de rol en `ms-usuarios`
-  aplica en el siguiente login (ver `docs/security-scope.md`).
 - **`ms-usuarios` nunca ve la sesión de Gateway tal cual.** Cada llamada
   síncrona de Gateway hacia `ms-usuarios` reenvía la identidad ya verificada
   en un header propio (mismo contrato que ya documenta
@@ -149,14 +139,12 @@ resuelva, no antes.
    ARNs de topics SNS y URLs de colas SQS (sin credenciales: salen de la
    cadena por defecto de AWS), URL base + credencial compartida de
    `ms-usuarios`, umbrales de rate limiting). Sin valores hardcodeados.
-2. **`domain`** — tipos puros: `Session` (identidad verificada + `exp` +
-   `role`), `Role`,
+2. **`domain`** — tipos puros: `Session` (identidad verificada + `exp`),
    `ScanSubmission` (entrada validada del usuario), `ScanOutcomeEvent`. Sin
    IO.
 3. **`auth`** — el handshake OIDC contra Google (`openidconnect`), emisión/
    validación de la sesión propia (`jsonwebtoken`), y el middleware `axum`
-   que exige sesión válida en toda ruta protegida (`require_session`) y el
-   que exige rol `admin` (`require_admin`).
+   que exige sesión válida en toda ruta protegida.
 4. **`usuarios_client`** — único módulo que conoce la URL y el contrato
    HTTP de `ms-usuarios`; nadie más en este repo hace una petición HTTP
    directa hacia `ms-usuarios`.
