@@ -24,12 +24,12 @@ pub enum Role {
 impl Role {
     /// Decodifica el valor textual exacto (`"user"`/`"admin"`, en minúsculas)
     /// que reporta `ms-usuarios`; `None` para cualquier otro valor.
+    ///
+    /// Delega en `serde` (la misma codificación `rename_all = "lowercase"`
+    /// con la que se firma el claim `role`), de modo que hay una sola fuente
+    /// de verdad para el mapeo texto <-> variante.
     pub fn parse(value: &str) -> Option<Role> {
-        match value {
-            "user" => Some(Role::User),
-            "admin" => Some(Role::Admin),
-            _ => None,
-        }
+        serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
     }
 }
 
@@ -322,6 +322,22 @@ mod tests {
     fn role_serializes_as_lowercase_strings() {
         assert_eq!(serde_json::to_value(Role::User).unwrap(), "user");
         assert_eq!(serde_json::to_value(Role::Admin).unwrap(), "admin");
+    }
+
+    /// `Role::parse` y la codificación `serde` deben coincidir en cada
+    /// variante: este test fija esa equivalencia si se añade un rol nuevo.
+    #[test]
+    fn role_parse_and_serde_agree_on_every_variant() {
+        for role in [Role::User, Role::Admin] {
+            // Un `match` exhaustivo obliga a revisar este test al añadir variantes.
+            match role {
+                Role::User | Role::Admin => {}
+            }
+            let wire = serde_json::to_value(role).unwrap();
+            let text = wire.as_str().expect("el rol serializa como texto");
+            assert_eq!(Role::parse(text), Some(role));
+            assert_eq!(serde_json::from_value::<Role>(wire).unwrap(), role);
+        }
     }
 
     #[test]

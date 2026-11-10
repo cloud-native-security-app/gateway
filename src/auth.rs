@@ -619,6 +619,9 @@ mod tests {
 
     use super::*;
 
+    /// Clave de firma de sesión de laboratorio, única para todos los tests.
+    const TEST_SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
+
     fn lab_session() -> Session {
         Session {
             sub: "google-sub-123".to_string(),
@@ -630,14 +633,14 @@ mod tests {
     }
 
     fn lab_signing_key() -> SecretString {
-        SecretString::from("lab-only-not-a-real-secret".to_string())
+        SecretString::from(TEST_SESSION_SIGNING_KEY.to_string())
     }
 
     fn sign_raw_claims(claims: &serde_json::Value) -> String {
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             claims,
-            &EncodingKey::from_secret(b"lab-only-not-a-real-secret"),
+            &EncodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes()),
         )
         .expect("debe poder firmar claims de laboratorio")
     }
@@ -654,7 +657,7 @@ mod tests {
         validation.set_issuer(&["gateway-issuer"]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
-            &DecodingKey::from_secret(b"lab-only-not-a-real-secret"),
+            &DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes()),
             &validation,
         )
         .expect("debe decodificar");
@@ -715,13 +718,14 @@ mod tests {
 
     #[test]
     fn issues_session_token_with_expected_claims() {
-        let signing_key = SecretString::from("lab-only-not-a-real-secret".to_string());
+        let signing_key = SecretString::from(TEST_SESSION_SIGNING_KEY.to_string());
         let session = lab_session();
 
         let token = issue_session_token(&session, &signing_key, "gateway", "gateway-issuer")
             .expect("debe poder firmar una sesión válida");
 
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes());
         let mut validation = jsonwebtoken::Validation::new(Algorithm::HS256);
         validation.set_audience(&["gateway"]);
         validation.set_issuer(&["gateway-issuer"]);
@@ -823,7 +827,7 @@ mod tests {
 
     fn lab_validator() -> SessionValidator {
         SessionValidator::new(
-            SecretString::from("lab-only-not-a-real-secret".to_string()),
+            SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway".to_string(),
             "gateway-issuer".to_string(),
         )
@@ -836,7 +840,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway",
             "gateway-issuer",
         )
@@ -876,7 +880,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway",
             "gateway-issuer",
         )
@@ -895,7 +899,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "some-other-audience",
             "gateway-issuer",
         )
