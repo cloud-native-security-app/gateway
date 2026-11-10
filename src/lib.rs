@@ -13,6 +13,7 @@ pub mod auth;
 pub mod broker;
 pub mod config;
 pub mod domain;
+pub mod event_contract;
 pub mod kinesis;
 pub mod realtime;
 pub mod security_events;
