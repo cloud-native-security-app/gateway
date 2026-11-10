@@ -1688,6 +1688,7 @@ impl IntoResponse for AuthError {
             | AuthError::IdTokenRejected
             | AuthError::SessionInvalid => StatusCode::UNAUTHORIZED,
             AuthError::AdminRequired => StatusCode::FORBIDDEN,
+            AuthError::RoleCheckUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             AuthError::Discovery | AuthError::SessionIssue => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

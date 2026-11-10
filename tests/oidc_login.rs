@@ -42,6 +42,8 @@ use tokio::net::TcpListener;
 
 const TEST_CLIENT_ID: &str = "test-client-id";
 const TEST_REDIRECT_URI: &str = "http://gateway.lab/auth/callback";
+/// Clave con la que el Gateway de prueba firma y los tests verifican la sesión.
+const TEST_SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 /// URL de `front` de laboratorio a la que debe redirigir (`302`) un
@@ -372,7 +374,7 @@ async fn spawn_gateway_with_events(
     .await
     .expect("discovery contra el IdP de prueba debe funcionar");
 
-    let session_signing_key = SecretString::from("lab-only-not-a-real-secret".to_string());
+    let session_signing_key = SecretString::from(TEST_SESSION_SIGNING_KEY.to_string());
 
     // Feature `provision_user_profile_on_login`: el callback ahora llama a
     // `PUT /users/me` antes de emitir la cookie de sesión, así que cada test
@@ -577,7 +579,7 @@ async fn callback_with_valid_id_token_creates_session() {
         .map(|(_, v)| v.to_string())
         .expect("la cookie debe tener un valor");
 
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.set_audience(&[SESSION_AUDIENCE]);
     validation.set_issuer(&[SESSION_ISSUER]);
@@ -1081,10 +1083,15 @@ async fn callback_when_usuarios_upsert_fails_does_not_create_session_or_redirect
     );
 }
 
-/// Completa un login contra `usuarios_base_url` y devuelve el claim `role`
-/// del JWT de sesión emitido (`None` si el token no lo lleva), decodificado
-/// con la clave/aud/iss de este Gateway (feature `admin-role-guard`).
-async fn login_and_read_role_claim(usuarios_base_url: &str) -> Option<String> {
+/// Completa un login contra `usuarios_base_url` (con `callback_extra_query`
+/// añadido a la query del callback y `extra_headers` en esa request) y
+/// devuelve los claims del JWT de sesión emitido, decodificados con la
+/// clave/aud/iss de este Gateway (feature `admin-role-guard`). Afirma `302`.
+async fn login_and_read_session_claims(
+    usuarios_base_url: &str,
+    callback_extra_query: &str,
+    extra_headers: &[(&str, &str)],
+) -> serde_json::Value {
     let key = generate_test_key("test-kid-1");
     let idp = spawn_test_idp(JwkSet {
         keys: vec![key.jwk.clone()],
@@ -1106,11 +1113,14 @@ async fn login_and_read_role_claim(usuarios_base_url: &str) -> Option<String> {
     };
     idp.set_next_id_token(sign_id_token(&key, &claims));
 
-    let response = http
-        .get(format!(
-            "http://{}/auth/callback?code=irrelevant-code&state={state_value}",
-            gateway.addr
-        ))
+    let mut request = http.get(format!(
+        "http://{}/auth/callback?code=irrelevant-code&state={state_value}{callback_extra_query}",
+        gateway.addr
+    ));
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let response = request
         .send()
         .await
         .expect("GET /auth/callback debe responder");
@@ -1129,19 +1139,21 @@ async fn login_and_read_role_claim(usuarios_base_url: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
         .expect("la cookie debe tener un valor");
 
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes());
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.set_audience(&[SESSION_AUDIENCE]);
     validation.set_issuer(&[SESSION_ISSUER]);
-
-    #[derive(serde::Deserialize)]
-    struct RoleClaim {
-        role: Option<String>,
-    }
-    jsonwebtoken::decode::<RoleClaim>(&token, &decoding_key, &validation)
+    jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
         .expect("la sesión emitida debe decodificar")
         .claims
-        .role
+}
+
+/// Igual que [`login_and_read_session_claims`] sin datos extra del cliente;
+/// devuelve el claim `role` (`None` si el token no lo lleva).
+async fn login_and_read_role_claim(usuarios_base_url: &str) -> Option<String> {
+    login_and_read_session_claims(usuarios_base_url, "", &[]).await["role"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// El rol sale de la respuesta de `ms-usuarios` y viaja firmado en el JWT.
@@ -1188,58 +1200,12 @@ async fn callback_defaults_to_user_when_ms_usuarios_returns_an_unknown_role() {
 /// en la query string se ignora.
 #[tokio::test]
 async fn callback_ignores_a_role_supplied_by_the_client_request() {
-    let key = generate_test_key("test-kid-1");
-    let idp = spawn_test_idp(JwkSet {
-        keys: vec![key.jwk.clone()],
-    })
-    .await;
     let (base_url, _captured) = spawn_usuarios_upsert_stub(false).await;
-    let gateway = spawn_gateway(&idp.issuer_url, &base_url).await;
-    let http = http_client_no_redirects();
 
-    let (state_value, nonce_value) = start_login(&http, &gateway).await;
-    let claims = TestIdTokenClaims {
-        iss: &idp.issuer_url,
-        aud: TEST_CLIENT_ID,
-        sub: "google-sub-123",
-        email: "user@example.com",
-        name: "Test User",
-        exp: now_epoch_secs() + 300,
-        iat: now_epoch_secs(),
-        nonce: &nonce_value,
-    };
-    idp.set_next_id_token(sign_id_token(&key, &claims));
+    let claims =
+        login_and_read_session_claims(&base_url, "&role=admin", &[("X-Role", "admin")]).await;
 
-    let response = http
-        .get(format!(
-            "http://{}/auth/callback?code=irrelevant-code&state={state_value}&role=admin",
-            gateway.addr
-        ))
-        .header("X-Role", "admin")
-        .send()
-        .await
-        .expect("GET /auth/callback debe responder");
-    let set_cookie = response
-        .headers()
-        .get(reqwest::header::SET_COOKIE)
-        .expect("debe emitir Set-Cookie")
-        .to_str()
-        .expect("Set-Cookie ASCII")
-        .to_string();
-    let token = set_cookie
-        .split(';')
-        .next()
-        .and_then(|kv| kv.split_once('='))
-        .map(|(_, v)| v.to_string())
-        .expect("la cookie debe tener un valor");
-
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.set_audience(&[SESSION_AUDIENCE]);
-    validation.set_issuer(&[SESSION_ISSUER]);
-    let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
-        .expect("la sesión emitida debe decodificar");
-    assert_eq!(decoded.claims["role"], "user");
+    assert_eq!(claims["role"], "user");
 }
 
 // --- Feature `security_event_publisher` (KAP-06): eventos `auth.*` ---

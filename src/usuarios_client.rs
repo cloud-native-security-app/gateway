@@ -68,6 +68,8 @@
 //! **nunca** incluye `ssh_credentials_ref` — ver la nota de diseño de ese
 //! tipo y `docs/security-scope.md`.
 
+use std::time::Duration;
+
 use reqwest::{Client, RequestBuilder, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
@@ -89,6 +91,11 @@ pub const FORWARDED_USER_HEADER_NAME: &str = "X-Forwarded-User";
 /// Confirmado contra el contrato real de `user-service`
 /// (`user-service/src/api.rs::GATEWAY_SECRET_HEADER`).
 pub const GATEWAY_SECRET_HEADER_NAME: &str = "X-Gateway-Secret";
+
+/// Timeout por defecto de la reconsulta del rol (`require_admin`): corto a
+/// propósito, porque esa llamada está en el camino de cada request a una ruta
+/// de administración y, ante cualquier demora, se deniega (fail closed).
+pub const DEFAULT_ROLE_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Perfil de usuario devuelto o enviado a `ms-usuarios`, tratado como JSON
 /// opaco: ver la nota de diseño al inicio de este módulo sobre por qué este
@@ -376,6 +383,7 @@ pub struct UsuariosClient {
     http: Client,
     base_url: String,
     shared_secret: SecretString,
+    role_check_timeout: Duration,
 }
 
 impl UsuariosClient {
@@ -395,7 +403,38 @@ impl UsuariosClient {
             http,
             base_url,
             shared_secret,
+            role_check_timeout: DEFAULT_ROLE_CHECK_TIMEOUT,
         })
+    }
+
+    /// Reemplaza el timeout de [`Self::current_role`] (por defecto
+    /// [`DEFAULT_ROLE_CHECK_TIMEOUT`]); pensado para pruebas.
+    pub fn with_role_check_timeout(mut self, timeout: Duration) -> Self {
+        self.role_check_timeout = timeout;
+        self
+    }
+
+    /// Reconsulta el rol vigente de `identity` en `ms-usuarios` (`GET
+    /// /users/me`) con un timeout corto ([`DEFAULT_ROLE_CHECK_TIMEOUT`]).
+    ///
+    /// Un perfil sin `role` o con un valor desconocido resuelve a
+    /// [`Role::User`] (ver [`role_from_profile`]). Los fallos de red,
+    /// timeout o status no-2xx se propagan como error: quien llama debe
+    /// tratarlos como "no confirmado" (fail closed).
+    pub async fn current_role(&self, identity: &Session) -> Result<Role, UsuariosClientError> {
+        let identity_header = self.identity_header_value(identity)?;
+        let request = self
+            .http
+            .get(self.profile_url())
+            .timeout(self.role_check_timeout)
+            .header(FORWARDED_USER_HEADER_NAME, identity_header)
+            .header(
+                GATEWAY_SECRET_HEADER_NAME,
+                self.shared_secret.expose_secret(),
+            );
+
+        let profile: UserProfile = self.send_and_decode(request).await?;
+        Ok(role_from_profile(&profile))
     }
 
     /// Obtiene el perfil de `identity` desde `ms-usuarios` (`GET /users/me`).

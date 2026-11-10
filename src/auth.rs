@@ -13,7 +13,7 @@
 //! [`require_session`].
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -32,6 +32,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{Role, Session};
+use crate::usuarios_client::UsuariosClient;
 
 /// Nombre de la cookie que transporta la sesión propia firmada de este
 /// Gateway.
@@ -120,6 +121,10 @@ pub enum AuthError {
     /// Mensaje deliberadamente genérico: no revela el rol ni los claims.
     #[error("acceso denegado")]
     AdminRequired,
+    /// No se pudo confirmar el rol vigente contra `ms-usuarios` (caído,
+    /// timeout o error): se deniega (fail closed). Mensaje genérico.
+    #[error("no se pudo verificar el rol")]
+    RoleCheckUnavailable,
 }
 
 impl From<ClaimsVerificationError> for AuthError {
@@ -386,9 +391,24 @@ struct SessionClaims {
     iss: String,
     /// Rol firmado en el login. Un token emitido antes de esta feature no lo
     /// lleva y se decodifica como `user` (nunca `admin`); un valor
-    /// desconocido hace fallar la decodificación (sesión rechazada).
-    #[serde(default)]
+    /// desconocido también degrada a `user` (ver [`lenient_role`]).
+    #[serde(default, deserialize_with = "lenient_role")]
     role: Role,
+}
+
+/// Decodifica el claim `role` sin rechazar la sesión: cualquier valor que no
+/// sea un rol conocido (otro rol futuro, tipo equivocado, `null`) degrada a
+/// [`Role::User`] y emite un `warn` que no incluye el valor recibido ni datos
+/// personales. Nunca produce `admin` salvo por el valor exacto `"admin"`.
+fn lenient_role<'de, D>(deserializer: D) -> Result<Role, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().and_then(Role::parse).unwrap_or_else(|| {
+        tracing::warn!("claim `role` no reconocido en la sesión; se usa `user`");
+        Role::User
+    }))
 }
 
 /// Emite la sesión propia de este Gateway (JWT firmado con `jsonwebtoken`)
@@ -547,25 +567,49 @@ pub async fn require_session(
 }
 
 /// Middleware `axum` que exige que la sesión ya validada sea de un
-/// administrador (`role == admin`).
+/// administrador **vigente**.
 ///
 /// Debe aplicarse **dentro** de [`require_session`] (capa más interna): este
 /// último valida firma/`exp`/`aud`/`iss` e inserta la [`Session`] cuyo `role`
-/// salió del JWT firmado por este Gateway (y, en origen, de `ms-usuarios` en
-/// el login). Responde `403` ([`AuthError::AdminRequired`]) si el rol no es
-/// `admin`. Si no encuentra ninguna [`Session`] (router mal compuesto, sin
-/// `require_session`) responde `401` en vez de dejar pasar: falla cerrado.
-pub async fn require_admin(request: Request, next: Next) -> Result<Response, AuthError> {
-    match request.extensions().get::<Session>() {
-        None => {
-            tracing::error!("require_admin montado sin require_session: se rechaza la solicitud");
-            Err(AuthError::SessionInvalid)
-        }
-        Some(session) if session.role != Role::Admin => {
-            tracing::warn!("acceso a ruta de administración denegado a una sesión sin rol admin");
+/// es una instantánea tomada en el login. Como esa instantánea puede estar
+/// desactualizada (un admin degradado conserva su JWT hasta que expire), este
+/// middleware no se fía solo del claim:
+///
+/// 1. sin [`Session`] (router mal compuesto) responde `401`;
+/// 2. claim distinto de `admin` => `403` sin consultar a `ms-usuarios`;
+/// 3. claim `admin` => reconsulta el rol vigente en `ms-usuarios`
+///    ([`UsuariosClient::current_role`], timeout corto) y solo deja pasar si
+///    sigue siendo `admin`; si ya no lo es => `403`.
+///
+/// Falla cerrado: si `ms-usuarios` no responde, tarda más que el timeout o
+/// devuelve un error, responde `503` ([`AuthError::RoleCheckUnavailable`]) y
+/// nunca deja pasar. No hay caché: las rutas de administración tienen poco
+/// tráfico y el costo es una llamada interna por request.
+pub async fn require_admin(
+    State(usuarios): State<Arc<UsuariosClient>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let Some(session) = request.extensions().get::<Session>() else {
+        tracing::error!("require_admin montado sin require_session: se rechaza la solicitud");
+        return Err(AuthError::SessionInvalid);
+    };
+
+    if session.role != Role::Admin {
+        tracing::warn!("acceso a ruta de administración denegado a una sesión sin rol admin");
+        return Err(AuthError::AdminRequired);
+    }
+
+    match usuarios.current_role(session).await {
+        Ok(Role::Admin) => Ok(next.run(request).await),
+        Ok(Role::User) => {
+            tracing::warn!("acceso a ruta de administración denegado: el rol ya no es admin");
             Err(AuthError::AdminRequired)
         }
-        Some(_) => Ok(next.run(request).await),
+        Err(error) => {
+            tracing::error!(%error, "no se pudo confirmar el rol en ms-usuarios; se deniega");
+            Err(AuthError::RoleCheckUnavailable)
+        }
     }
 }
 
@@ -574,6 +618,9 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
+
+    /// Clave de firma de sesión de laboratorio, única para todos los tests.
+    const TEST_SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 
     fn lab_session() -> Session {
         Session {
@@ -586,14 +633,14 @@ mod tests {
     }
 
     fn lab_signing_key() -> SecretString {
-        SecretString::from("lab-only-not-a-real-secret".to_string())
+        SecretString::from(TEST_SESSION_SIGNING_KEY.to_string())
     }
 
     fn sign_raw_claims(claims: &serde_json::Value) -> String {
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             claims,
-            &EncodingKey::from_secret(b"lab-only-not-a-real-secret"),
+            &EncodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes()),
         )
         .expect("debe poder firmar claims de laboratorio")
     }
@@ -610,7 +657,7 @@ mod tests {
         validation.set_issuer(&["gateway-issuer"]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
-            &DecodingKey::from_secret(b"lab-only-not-a-real-secret"),
+            &DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes()),
             &validation,
         )
         .expect("debe decodificar");
@@ -642,30 +689,43 @@ mod tests {
         assert_eq!(validated.role, Role::User);
     }
 
+    /// Un valor de `role` desconocido (otro rol futuro, tipo equivocado) no
+    /// invalida la sesión: degrada a `user`, nunca a `admin`.
     #[test]
-    fn token_with_unknown_role_claim_is_rejected() {
-        let token = sign_raw_claims(&serde_json::json!({
-            "sub": "s", "email": "e@example.com", "name": "n", "role": "superuser",
-            "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
-        }));
-        let result = SessionValidator::new(
-            lab_signing_key(),
-            "gateway".to_string(),
-            "gateway-issuer".to_string(),
-        )
-        .validate(&token);
-        assert!(matches!(result, Err(AuthError::SessionInvalid)));
+    fn token_with_unknown_role_claim_decodes_as_user_not_401() {
+        for unknown in [
+            serde_json::json!("superuser"),
+            serde_json::json!("ADMIN"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({"role": "admin"}),
+        ] {
+            let token = sign_raw_claims(&serde_json::json!({
+                "sub": "s", "email": "e@example.com", "name": "n", "role": unknown,
+                "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
+            }));
+            let validated = SessionValidator::new(
+                lab_signing_key(),
+                "gateway".to_string(),
+                "gateway-issuer".to_string(),
+            )
+            .validate(&token)
+            .expect("un rol desconocido no debe rechazar la sesión");
+            assert_eq!(validated.role, Role::User, "claim: {unknown}");
+        }
     }
 
     #[test]
     fn issues_session_token_with_expected_claims() {
-        let signing_key = SecretString::from("lab-only-not-a-real-secret".to_string());
+        let signing_key = SecretString::from(TEST_SESSION_SIGNING_KEY.to_string());
         let session = lab_session();
 
         let token = issue_session_token(&session, &signing_key, "gateway", "gateway-issuer")
             .expect("debe poder firmar una sesión válida");
 
-        let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+        let decoding_key =
+            jsonwebtoken::DecodingKey::from_secret(TEST_SESSION_SIGNING_KEY.as_bytes());
         let mut validation = jsonwebtoken::Validation::new(Algorithm::HS256);
         validation.set_audience(&["gateway"]);
         validation.set_issuer(&["gateway-issuer"]);
@@ -767,7 +827,7 @@ mod tests {
 
     fn lab_validator() -> SessionValidator {
         SessionValidator::new(
-            SecretString::from("lab-only-not-a-real-secret".to_string()),
+            SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway".to_string(),
             "gateway-issuer".to_string(),
         )
@@ -780,7 +840,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway",
             "gateway-issuer",
         )
@@ -820,7 +880,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "gateway",
             "gateway-issuer",
         )
@@ -839,7 +899,7 @@ mod tests {
 
         let token = issue_session_token(
             &session,
-            &SecretString::from("lab-only-not-a-real-secret".to_string()),
+            &SecretString::from(TEST_SESSION_SIGNING_KEY.to_string()),
             "some-other-audience",
             "gateway-issuer",
         )
