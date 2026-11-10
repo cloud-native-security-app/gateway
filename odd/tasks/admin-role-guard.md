@@ -60,7 +60,8 @@ The gateway learns the user's role from `ms-usuarios` at login, carries it in it
 - GREEN ARG-03: `cargo test --lib` 91 passed; `oidc_login` 17, `session_middleware_and_me` 9, `openapi_docs` 3 passed.
 - RED ARG-04: `tests/admin_role_guard.rs` failed to compile: `unresolved import gateway::auth::require_admin`.
 - GREEN ARG-04: `admin_role_guard` 8 passed (admin 200; validly signed user 403 with body `acceso denegado`; no cookie 401; wrong-key forged admin 401; payload edited to admin 401; `alg: none` 401; header/query/cookie role hints 403; no session layer 401).
-- Final: see the verification section of the task report (`make verify`).
+- Final: `make verify` exit 0 (fmt, clippy `-D warnings`, unit and integration tests, ignored LocalStack suites, `cargo doc`); `cargo test --lib` 91 passed on three consecutive runs.
+- Review: no pre-commit hook is installed in this checkout (only samples); no `gentle-ai review` run by the writer. KAP-05 touches authorization, so the parent should decide whether to assess/review.
 
 ## Next step
 
