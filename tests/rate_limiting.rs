@@ -17,6 +17,7 @@ use axum::extract::Query;
 use axum::http::HeaderValue;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use gateway::admin::AdminFeed;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
@@ -265,6 +266,7 @@ async fn spawn_gateway_with_events(
             window,
         )),
         security_events,
+        admin_feed: Arc::new(AdminFeed::default()),
     };
 
     let app = app_router(state);

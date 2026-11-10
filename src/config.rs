@@ -75,6 +75,13 @@ const ENV_SCAN_OUTCOMES_DLQ_URL: &str = "GATEWAY_SCAN_OUTCOMES_DLQ_URL";
 /// eventos de seguridad (feature `security_event_publisher`). Opcional: si no
 /// se define o está vacía, el Gateway no publica eventos (adaptador no-op).
 const ENV_SECURITY_EVENTS_STREAM_NAME: &str = "SECURITY_EVENTS_STREAM_NAME";
+/// Nombre de la variable de entorno con cada cuántos segundos un stream SSE de
+/// administración reconsulta el rol vigente del usuario (feature
+/// `admin_realtime_feed`). Opcional, por defecto
+/// [`DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS`]; debe ser mayor que cero.
+const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS";
+/// Valor por defecto de `ADMIN_EVENTS_ROLE_RECHECK_SECS`.
+const DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS: u64 = 60;
 /// Largo máximo de un nombre de stream de Kinesis.
 const MAX_STREAM_NAME_CHARS: usize = 128;
 
@@ -154,6 +161,10 @@ pub struct Config {
     /// ausente o vacía) deja el Gateway sin publicar eventos, de modo que las
     /// instalaciones locales anteriores a la feature siguen funcionando.
     pub security_events_stream_name: Option<String>,
+    /// Cada cuántos segundos un stream SSE de `GET /api/admin/events`
+    /// reconsulta el rol vigente del usuario y, si ya no es admin (o no se
+    /// puede verificar), lo cierra (feature `admin_realtime_feed`).
+    pub admin_events_role_recheck_secs: u64,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -199,6 +210,12 @@ pub enum ConfigError {
     /// El valor no se incluye en el error.
     #[error("la variable de entorno {name} no es un nombre de stream de Kinesis válido")]
     InvalidStreamName {
+        /// Nombre de la variable de entorno inválida.
+        name: &'static str,
+    },
+    /// Una variable de entorno numérica debe ser mayor que cero.
+    #[error("la variable de entorno {name} debe ser mayor que cero")]
+    NotPositive {
         /// Nombre de la variable de entorno inválida.
         name: &'static str,
     },
@@ -288,6 +305,22 @@ fn parse_stream_name(name: &'static str, raw: Option<&str>) -> Result<Option<Str
     }
 }
 
+/// Interpreta el valor de `ADMIN_EVENTS_ROLE_RECHECK_SECS`: ausente o en
+/// blanco usa [`DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS`]; si no, un entero
+/// mayor que cero. Función pura para probarla sin tocar el entorno.
+fn parse_role_recheck_secs(name: &'static str, raw: Option<&str>) -> Result<u64, ConfigError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS);
+    };
+    let secs = value
+        .parse::<u64>()
+        .map_err(|source| ConfigError::InvalidNumber { name, source })?;
+    if secs == 0 {
+        return Err(ConfigError::NotPositive { name });
+    }
+    Ok(secs)
+}
+
 /// Lee una variable de entorno requerida y la envuelve en [`SecretString`].
 ///
 /// Devuelve [`ConfigError::Missing`] si la variable no está definida o no es
@@ -370,6 +403,10 @@ impl Config {
             ENV_SECURITY_EVENTS_STREAM_NAME,
             env::var(ENV_SECURITY_EVENTS_STREAM_NAME).ok().as_deref(),
         )?;
+        let admin_events_role_recheck_secs = parse_role_recheck_secs(
+            ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS,
+            env::var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS).ok().as_deref(),
+        )?;
 
         Ok(Self {
             http_host,
@@ -393,6 +430,7 @@ impl Config {
             scan_outcomes_queue_url,
             scan_outcomes_dlq_url,
             security_events_stream_name,
+            admin_events_role_recheck_secs,
         })
     }
 }
@@ -442,6 +480,7 @@ mod tests {
         env::remove_var(ENV_GOOGLE_OIDC_ISSUER_URL);
         env::remove_var(ENV_AWS_ENDPOINT_URL);
         env::remove_var(ENV_SECURITY_EVENTS_STREAM_NAME);
+        env::remove_var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS);
     }
 
     fn set_all_valid_vars() {
@@ -799,6 +838,30 @@ mod tests {
             assert!(
                 !err.to_string().contains(invalid),
                 "no debe incluir el valor"
+            );
+        }
+    }
+
+    #[test]
+    fn role_recheck_secs_defaults_to_sixty_and_accepts_positive_numbers() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_role_recheck_secs(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS, unset).unwrap(),
+                60
+            );
+        }
+        assert_eq!(
+            parse_role_recheck_secs(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS, Some(" 15 ")).unwrap(),
+            15
+        );
+    }
+
+    #[test]
+    fn role_recheck_secs_rejects_zero_and_garbage() {
+        for bad in ["0", "-3", "soon", "1.5"] {
+            assert!(
+                parse_role_recheck_secs(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS, Some(bad)).is_err(),
+                "{bad:?} debe rechazarse"
             );
         }
     }

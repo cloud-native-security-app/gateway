@@ -36,6 +36,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
+use crate::admin::AdminFeed;
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
@@ -392,6 +393,11 @@ pub struct AppState {
     /// handlers lo usan solo a través de [`crate::security_events::emit`]:
     /// un fallo de publicación nunca altera la respuesta HTTP.
     pub security_events: Arc<dyn SecurityEventPublisher>,
+    /// Agregador de métricas de administración y su intervalo de
+    /// revalidación de rol (feature `admin_realtime_feed`, ver
+    /// [`crate::admin`]); lo alimenta el consumidor de Kinesis de
+    /// [`crate::kinesis_consumer`].
+    pub admin_feed: Arc<AdminFeed>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:

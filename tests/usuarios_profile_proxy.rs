@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
+use gateway::admin::AdminFeed;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
@@ -164,6 +165,7 @@ async fn spawn_gateway(usuarios_base_url: String) -> GatewayUnderTest {
             Duration::from_secs(60),
         )),
         security_events: Arc::new(NoopSecurityEventPublisher),
+        admin_feed: Arc::new(AdminFeed::default()),
     };
 
     let app = app_router(state);
