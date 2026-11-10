@@ -35,14 +35,26 @@
   campo `role` ausente (un `ms-usuarios` anterior) => `user`; valor
   desconocido => `user` más un `warn` sin datos personales ni el valor
   recibido; JWT anterior sin claim `role` => `user`; claim con un valor
-  desconocido => sesión rechazada (`401`). Toda ruta de administración
+  desconocido => `user` más un `warn` sin el valor ni datos personales (la
+  sesión sigue siendo válida, no se rechaza). Toda ruta de administración
   (`/api/admin/*`, KAP-09) debe montar `auth::require_admin` dentro de
-  `require_session`: `401` sin sesión válida, `403` (`acceso denegado`, sin
-  revelar rol ni claims) si no es `admin`; sin capa `Session` previa también
-  responde `401`. **Limitación conocida:** como el rol está en el JWT, un
-  cambio de rol en `ms-usuarios` (otorgar o revocar admin) aplica en el
-  siguiente login, no antes de que expire la sesión (`session_ttl_secs`);
-  no hay revocación server-side (misma limitación que el `logout`).
+  `require_session`: `401` sin sesión válida (o sin capa `Session` previa),
+  `403` (`acceso denegado`, sin revelar rol ni claims) si el claim no es
+  `admin`, sin consultar a `ms-usuarios`. **Revalidación del rol:** el claim
+  es solo una instantánea del login, así que con claim `admin`
+  `require_admin` reconsulta el rol vigente en `ms-usuarios` (`GET
+  /users/me`, con la identidad reenviada y la credencial compartida) y solo
+  deja pasar si sigue siendo `admin`; un admin degradado recibe `403`
+  aunque su JWT siga vigente. Falla cerrado: si `ms-usuarios` no responde,
+  tarda más que el timeout corto (2 s), devuelve un error o un rol
+  desconocido/ausente, nunca se permite; la respuesta es `503` (`no se pudo
+  verificar el rol`) ante fallo o demora, y `403` ante un rol distinto de
+  `admin`. Se eligió `503` porque distingue "no se pudo verificar" (reintentar)
+  de "no autorizado". No hay caché: las rutas de administración tienen poco
+  tráfico y el costo es una llamada interna por request. **Limitación
+  residual:** las rutas que solo usan `require_session` siguen viendo el rol
+  del JWT (`GET /api/me`, solo informativo); no hay revocación server-side
+  de la sesión en sí (misma limitación que el `logout`).
 - Un `logout` invalida la sesión del lado del navegador (borra la cookie);
   si en el futuro se necesita invalidación server-side (revocación antes de
   `exp`), es una feature nueva a discutir, no se asume aquí.
