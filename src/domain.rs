@@ -5,6 +5,34 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+/// Rol de un usuario, tal como lo asigna `ms-usuarios` (`users.role`).
+///
+/// Codificación `lowercase` (`"user"`/`"admin"`), la misma del contrato de
+/// `user-service`. El valor por defecto es el de menor privilegio
+/// ([`Role::User`]): cualquier rol ausente o desconocido se resuelve a él,
+/// nunca a [`Role::Admin`] (ver `docs/security-scope.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Usuario común (sin acceso a rutas de administración).
+    #[default]
+    User,
+    /// Administrador (acceso a las rutas protegidas por `require_admin`).
+    Admin,
+}
+
+impl Role {
+    /// Decodifica el valor textual exacto (`"user"`/`"admin"`, en minúsculas)
+    /// que reporta `ms-usuarios`; `None` para cualquier otro valor.
+    pub fn parse(value: &str) -> Option<Role> {
+        match value {
+            "user" => Some(Role::User),
+            "admin" => Some(Role::Admin),
+            _ => None,
+        }
+    }
+}
+
 /// Identidad de un usuario ya autenticado por Google y verificada por este
 /// Gateway (firma/`aud`/`iss`/`exp` del ID token, ver `docs/security-scope.md`),
 /// junto con la validez temporal de la sesión propia que la encapsula
@@ -26,6 +54,11 @@ pub struct Session {
     /// Momento de expiración de la sesión propia, en segundos desde el
     /// epoch Unix.
     pub exp: u64,
+    /// Rol del usuario, leído de `ms-usuarios` en el login (única fuente
+    /// autoritativa) y firmado dentro del JWT de sesión. Un cambio de rol en
+    /// `ms-usuarios` se refleja en el siguiente login.
+    #[serde(default)]
+    pub role: Role,
 }
 
 /// Errores al validar el objetivo (`target`) de una solicitud de escaneo
@@ -284,6 +317,26 @@ pub enum PatchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_serializes_as_lowercase_strings() {
+        assert_eq!(serde_json::to_value(Role::User).unwrap(), "user");
+        assert_eq!(serde_json::to_value(Role::Admin).unwrap(), "admin");
+    }
+
+    #[test]
+    fn role_parses_only_exact_lowercase_known_values() {
+        assert_eq!(Role::parse("user"), Some(Role::User));
+        assert_eq!(Role::parse("admin"), Some(Role::Admin));
+        assert_eq!(Role::parse("ADMIN"), None);
+        assert_eq!(Role::parse("root"), None);
+        assert_eq!(Role::parse(""), None);
+    }
+
+    #[test]
+    fn role_defaults_to_the_least_privileged_value() {
+        assert_eq!(Role::default(), Role::User);
+    }
 
     #[test]
     fn parses_a_valid_ipv4_address() {

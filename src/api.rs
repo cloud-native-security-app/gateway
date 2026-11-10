@@ -38,7 +38,7 @@ use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use crate::domain::{ScanResult, ScanSubmission, ScanSubmissionError, Session};
+use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
 use crate::usuarios_client::{
     CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry, ScanStatus, UserProfile,
@@ -1505,6 +1505,7 @@ async fn callback(
         email: identity.email,
         name: identity.name,
         exp,
+        role: Role::User,
     };
 
     // Feature `provision_user_profile_on_login`: garantiza la fila de

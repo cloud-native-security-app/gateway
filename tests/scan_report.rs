@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use gateway::domain::Session;
+use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
@@ -177,6 +177,7 @@ fn session_for(sub: &str) -> Session {
             .expect("reloj")
             .as_secs()
             + 3600,
+        role: Role::User,
     }
 }
 
