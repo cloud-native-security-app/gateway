@@ -31,7 +31,7 @@ use openidconnect::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::Session;
+use crate::domain::{Role, Session};
 
 /// Nombre de la cookie que transporta la sesión propia firmada de este
 /// Gateway.
@@ -498,6 +498,7 @@ impl SessionValidator {
             email: decoded.claims.email,
             name: decoded.claims.name,
             exp: decoded.claims.exp,
+            role: Role::User,
         })
     }
 }
@@ -547,6 +548,7 @@ mod tests {
             email: "user@example.com".to_string(),
             name: "Test User".to_string(),
             exp: 9_999_999_999,
+            role: Role::User,
         }
     }
 

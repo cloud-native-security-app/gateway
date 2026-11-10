@@ -30,7 +30,7 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{
     BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher, ROUTING_KEY_SCAN_CANCELLATION,
 };
-use gateway::domain::Session;
+use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
 use gateway::sns::SnsScanPublisher;
 use gateway::usuarios_client::UsuariosClient;
@@ -216,6 +216,7 @@ fn session_for(sub: &str) -> Session {
         email: format!("{sub}@example.com"),
         name: "Test User".to_string(),
         exp: now_epoch_secs() + 3600,
+        role: Role::User,
     }
 }
 
