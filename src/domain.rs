@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// `user-service`. El valor por defecto es el de menor privilegio
 /// ([`Role::User`]): cualquier rol ausente o desconocido se resuelve a él,
 /// nunca a [`Role::Admin`] (ver `docs/security-scope.md`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// Usuario común (sin acceso a rutas de administración).

@@ -380,6 +380,11 @@ struct SessionClaims {
     exp: u64,
     aud: String,
     iss: String,
+    /// Rol firmado en el login. Un token emitido antes de esta feature no lo
+    /// lleva y se decodifica como `user` (nunca `admin`); un valor
+    /// desconocido hace fallar la decodificación (sesión rechazada).
+    #[serde(default)]
+    role: Role,
 }
 
 /// Emite la sesión propia de este Gateway (JWT firmado con `jsonwebtoken`)
@@ -402,6 +407,7 @@ pub fn issue_session_token(
         exp: session.exp,
         aud: audience.to_string(),
         iss: issuer.to_string(),
+        role: session.role,
     };
 
     let encoding_key = EncodingKey::from_secret(signing_key.expose_secret().as_bytes());
@@ -498,7 +504,7 @@ impl SessionValidator {
             email: decoded.claims.email,
             name: decoded.claims.name,
             exp: decoded.claims.exp,
-            role: Role::User,
+            role: decoded.claims.role,
         })
     }
 }
@@ -550,6 +556,78 @@ mod tests {
             exp: 9_999_999_999,
             role: Role::User,
         }
+    }
+
+    fn lab_signing_key() -> SecretString {
+        SecretString::from("lab-only-not-a-real-secret".to_string())
+    }
+
+    fn sign_raw_claims(claims: &serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            claims,
+            &EncodingKey::from_secret(b"lab-only-not-a-real-secret"),
+        )
+        .expect("debe poder firmar claims de laboratorio")
+    }
+
+    #[test]
+    fn session_token_carries_the_role_claim_in_lowercase() {
+        let mut session = lab_session();
+        session.role = Role::Admin;
+        let token = issue_session_token(&session, &lab_signing_key(), "gateway", "gateway-issuer")
+            .expect("debe firmar");
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&["gateway"]);
+        validation.set_issuer(&["gateway-issuer"]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &token,
+            &DecodingKey::from_secret(b"lab-only-not-a-real-secret"),
+            &validation,
+        )
+        .expect("debe decodificar");
+        assert_eq!(decoded.claims["role"], "admin");
+
+        let validated = SessionValidator::new(
+            lab_signing_key(),
+            "gateway".to_string(),
+            "gateway-issuer".to_string(),
+        )
+        .validate(&token)
+        .expect("debe validar");
+        assert_eq!(validated.role, Role::Admin);
+    }
+
+    #[test]
+    fn token_without_role_claim_decodes_as_user_never_admin() {
+        let token = sign_raw_claims(&serde_json::json!({
+            "sub": "s", "email": "e@example.com", "name": "n",
+            "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
+        }));
+        let validated = SessionValidator::new(
+            lab_signing_key(),
+            "gateway".to_string(),
+            "gateway-issuer".to_string(),
+        )
+        .validate(&token)
+        .expect("un token anterior a `role` sigue siendo válido");
+        assert_eq!(validated.role, Role::User);
+    }
+
+    #[test]
+    fn token_with_unknown_role_claim_is_rejected() {
+        let token = sign_raw_claims(&serde_json::json!({
+            "sub": "s", "email": "e@example.com", "name": "n", "role": "superuser",
+            "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
+        }));
+        let result = SessionValidator::new(
+            lab_signing_key(),
+            "gateway".to_string(),
+            "gateway-issuer".to_string(),
+        )
+        .validate(&token);
+        assert!(matches!(result, Err(AuthError::SessionInvalid)));
     }
 
     #[test]
