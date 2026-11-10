@@ -42,10 +42,10 @@ The gateway learns the user's role from `ms-usuarios` at login, carries it in it
 ## Checklist
 
 - [x] ARG-01 Feature doc.
-- [ ] ARG-02 `domain::Role`, `usuarios_client::role_from_profile` (missing and unknown handling), tests first.
-- [ ] ARG-03 `Session.role`, `role` claim, login wiring, `GET /api/me` `role`, OpenAPI.
-- [ ] ARG-04 `auth::require_admin`, `AuthError::AdminRequired` (`403`), forged-token and non-admin tests.
-- [ ] ARG-05 `docs/security-scope.md`, `docs/architecture.md`, this doc closed.
+- [x] ARG-02 `domain::Role`, `usuarios_client::role_from_profile` (missing and unknown handling), tests first (a9f8f7d).
+- [x] ARG-03 `Session.role`, `role` claim, login wiring, `GET /api/me` `role`, OpenAPI (19b9526).
+- [x] ARG-04 `auth::require_admin`, `AuthError::AdminRequired` (`403`), forged-token and non-admin tests (49e50fb).
+- [x] ARG-05 `docs/security-scope.md`, `docs/architecture.md`, this doc closed (docs commit on top of 49e50fb).
 
 ## Known limitations
 
@@ -54,7 +54,13 @@ The gateway learns the user's role from `ms-usuarios` at login, carries it in it
 
 ## Evidence
 
-(filled per task)
+- RED ARG-02: `cargo test --lib --no-run` failed: `cannot find type Role in this scope` (domain and `role_from_profile` tests).
+- GREEN ARG-02: `cargo test --lib` 88 passed; clippy `-D warnings` clean. `Session.role` added with mechanical updates of every `Session` literal.
+- RED ARG-03: `cargo test --lib` 2 failed (`session_token_carries_the_role_claim_in_lowercase`, `token_with_unknown_role_claim_is_rejected`); `cargo test --test oidc_login` 5 failed (admin/user/missing/unknown role, client-supplied role).
+- GREEN ARG-03: `cargo test --lib` 91 passed; `oidc_login` 17, `session_middleware_and_me` 9, `openapi_docs` 3 passed.
+- RED ARG-04: `tests/admin_role_guard.rs` failed to compile: `unresolved import gateway::auth::require_admin`.
+- GREEN ARG-04: `admin_role_guard` 8 passed (admin 200; validly signed user 403 with body `acceso denegado`; no cookie 401; wrong-key forged admin 401; payload edited to admin 401; `alg: none` 401; header/query/cookie role hints 403; no session layer 401).
+- Final: see the verification section of the task report (`make verify`).
 
 ## Next step
 
