@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use gateway::domain::Session;
+use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
@@ -200,6 +200,7 @@ fn valid_session_cookie_value() -> String {
         email: "user@example.com".to_string(),
         name: "Test User".to_string(),
         exp: now_epoch_secs() + 3600,
+        role: Role::User,
     };
 
     issue_session_token(
