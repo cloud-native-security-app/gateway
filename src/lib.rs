@@ -13,6 +13,7 @@ pub mod broker;
 pub mod config;
 pub mod domain;
 pub mod realtime;
+pub mod security_events;
 pub mod sns;
 pub mod sqs;
 pub mod usuarios_client;

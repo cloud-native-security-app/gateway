@@ -58,9 +58,16 @@ aws-sdk-sns = "1.116.0"
 # `tokio-util` aporta `CancellationToken`, la señal de shutdown de `SqsScanOutcomeConsumer::run`.
 aws-sdk-sqs = "1.114.0"
 tokio-util = "0.7"
+# Marca de tiempo RFC 3339 en UTC del campo `occurred_at` de `SecurityEvent`
+# (`src/security_events.rs`, feature `security_event_publisher`); ya está
+# resuelta transitivamente, se declara explícita para poder nombrarla.
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 testcontainers = "0.20"
+# `start_paused`/`advance` para probar el tope de tiempo de `emit` sin esperas
+# de reloj (`src/security_events.rs`).
+tokio = { version = "1", features = ["test-util"] }
 rsa = "0.9.10"
 rand = "0.8"
 base64 = "0.22"
@@ -75,3 +82,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 # una dependencia transitiva de `reqwest`, se declara explícita para poder
 # nombrarla en `tests/`).
 bytes = "1"
+# Valida cada evento emitido contra `../broker/contracts/security-event.schema.json`
+# (`tests/security_event_contract.rs`). Misma versión y features que `broker`
+# (sin resolución de referencias remotas: el schema es autocontenido).
+jsonschema = { version = "0.56", default-features = false }
