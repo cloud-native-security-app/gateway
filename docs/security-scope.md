@@ -54,7 +54,30 @@
   tráfico y el costo es una llamada interna por request. **Limitación
   residual:** las rutas que solo usan `require_session` siguen viendo el rol
   del JWT (`GET /api/me`, solo informativo); no hay revocación server-side
-  de la sesión en sí (misma limitación que el `logout`).
+  de la sesión en sí (misma limitación que el `logout`). **Usuario
+  inexistente y secreto mal configurado:** un `404` definitivo de
+  `ms-usuarios` (el usuario ya no existe) significa "no es admin" y responde
+  `403`; un `401` de `ms-usuarios` (credencial compartida rechazada) sigue
+  siendo `503` pero se loggea con el tipo distinto `misconfigured`. En todos
+  los casos el log lleva solo el tipo de error, nunca datos personales.
+- **Rutas de administración y su feed en tiempo real** (feature
+  `admin_realtime_feed`, KAP-09): `GET /api/admin/metrics` y el SSE `GET
+  /api/admin/events` son las primeras rutas detrás de `require_session` +
+  `require_admin` (`401` sin sesión, `403` a un no admin o a un admin
+  degradado, `503` si el rol no se puede verificar). **Revalidación en
+  conexiones largas:** un stream SSE puede durar horas, así que cada
+  `ADMIN_EVENTS_ROLE_RECHECK_SECS` (60 s por defecto) reconsulta el rol vigente
+  con la misma política fail-closed que `require_admin`; si ya no es `admin`,
+  el usuario no existe o no se puede verificar, envía un evento `closed`
+  (motivo genérico `role_revalidation_failed`, sin revelar el rol) y cierra el
+  stream. **Sin PII en el feed:** el contrato de eventos nunca lleva
+  credenciales, tokens, correos, nombres ni cuerpos de mensaje; el registro del
+  panel conserva solo los campos del sobre y el `payload`, y el único
+  identificador de persona es `actor_sub` (el `sub` seudónimo de OIDC). Los
+  usuarios activos se exponen como un conteo, no como lista. Un registro de
+  Kinesis que no cumple el contrato se descarta (se loggea la regla incumplida
+  y el largo, jamás el cuerpo) y solo incrementa un contador. Los datos viven
+  en memoria del proceso (sin persistencia) y el feed es de solo lectura.
 - Un `logout` invalida la sesión del lado del navegador (borra la cookie);
   si en el futuro se necesita invalidación server-side (revocación antes de
   `exp`), es una feature nueva a discutir, no se asume aquí.

@@ -60,18 +60,40 @@ The gateway reads the Kinesis stream `security-events`, aggregates admin metrics
 
 ## Checklist
 
-- [x] ARF-01 Feature doc.
-- [ ] ARF-02 Guard follow-ups: identity-aware stub (a), 404 to 403 and `misconfigured` logging (b).
-- [ ] ARF-03 Aggregator `src/admin.rs` with clock injection, caps, broadcast, tests first.
-- [ ] ARF-04 Contract validation `src/event_contract.rs` plus differential test against the broker schema and examples.
-- [ ] ARF-05 Consumer `src/kinesis_consumer.rs` (port, fake source tests), AWS adapter, wiring, config.
-- [ ] ARF-06 Routes `GET /api/admin/metrics` and SSE `GET /api/admin/events`, OpenAPI, `ROUTES`, re-validation.
-- [ ] ARF-07 LocalStack end-to-end test.
-- [ ] ARF-08 Docs (`docs/architecture.md`, `docs/security-scope.md`, README env table) and this doc closed.
+- [x] ARF-01 Feature doc (650cc85).
+- [x] ARF-02 Guard follow-ups: identity-aware stub (a), 404 to 403 and `misconfigured` logging (b) (d1f932a).
+- [x] ARF-03 Aggregator `src/admin.rs` with clock injection, caps, broadcast, tests first (b558763).
+- [x] ARF-04 Contract validation `src/event_contract.rs` plus differential test against the broker schema and examples (79aea8c).
+- [x] ARF-05 Consumer `src/kinesis_consumer.rs` (port, fake source tests), AWS adapter, wiring, config `ADMIN_EVENTS_ROLE_RECHECK_SECS` (9a60602).
+- [x] ARF-06 Routes `GET /api/admin/metrics` and SSE `GET /api/admin/events`, OpenAPI, `ROUTES`, re-validation (7d07d02).
+- [x] ARF-07 LocalStack end-to-end test `tests/admin_feed_localstack.rs` (e9683c8).
+- [x] ARF-08 Docs (`docs/architecture.md`, `docs/security-scope.md`, README env table) and this doc closed (docs commit on top of e9683c8).
+
+## Routes and status codes
+
+| Route | 200 | 401 | 403 | 503 |
+|---|---|---|---|---|
+| `GET /api/admin/metrics` | JSON `AdminSnapshot` | no valid session | not admin, demoted, or user gone | role not verifiable |
+| `GET /api/admin/events` | `text/event-stream`: `snapshot`, `delta`, `closed`, `: ping` every 15 s | same | same | same |
 
 ## Evidence
 
-Filled per task as work lands (RED, GREEN, commit hashes).
+- RED ARF-02: `tests/admin_role_guard.rs` did not compile (`no method named kind found for enum UsuariosClientError`); the new tests then drove the `404 -> 403` mapping.
+- GREEN ARF-02: `admin_role_guard` 17 passed (13 before). `require_admin` logic moved to `auth::verify_admin`, shared with the SSE re-validation.
+- RED ARF-03: `cargo test --lib admin` failed to compile (30 errors, `AdminAggregator`, `ManualClock` and constants missing). GREEN: 20 passed.
+- RED ARF-04: `tests/admin_event_contract.rs` failed to compile (`event_contract` module missing). GREEN: 3 passed; the differential test compared the consumer verdict with the real schema on 411 mutations of the 11 broker examples with zero divergences.
+- RED ARF-05: `cargo test --lib kinesis_consumer` and `config` (role recheck) failed to compile (types missing). GREEN: 10 consumer tests (LATEST start, next-iterator follow, 1 s poll, malformed skip and count, expired iterator re-acquires LATEST, exponential backoff 1/2/4/8 then reset, backoff cap, closed shard, new shard on refresh, list failure backoff, prompt shutdown), 2 config tests.
+- RED ARF-06: `tests/admin_routes.rs` failed to compile (`admin_routes` module missing). GREEN: 10 route tests (401, 403 non-admin, 403 demoted, 503 unverifiable, JSON snapshot, SSE snapshot then delta, periodic snapshot on re-validation, close after revocation, close when unverifiable, close when the user disappears), 1 lag unit test (`a_lagging_client_gets_a_fresh_snapshot_instead_of_an_error`; written together with the implementation, no separate RED), OpenAPI test.
+- ARF-07: `admin_feed_localstack` passed on its first run (no separate RED: it composes units already proven RED/GREEN above). It publishes through the KAP-06 publisher plus raw nmap-style records and one garbage record, and reads `/api/admin/metrics` from the real router.
+- Final: `make verify` exit 0 (fmt, clippy `-D warnings`, unit and integration tests, ignored LocalStack suites, `cargo doc`; the one rustdoc warning in `src/wiring.rs` predates this feature). `cargo test --lib` 143 passed on three consecutive runs. `cargo test --test admin_feed_localstack -- --ignored` 1 passed. No native review run (user policy: decline except authorization/secret tasks; the guard follow-ups were not submitted).
+
+## Known limitations
+
+- Events published while an instance is down, or in the gap after an expired iterator, are not shown (`LATEST` start, no checkpoint).
+- No persistence: a restart empties the panel.
+- A scan whose terminal event is lost stays "in flight" for up to 1 hour.
+- `malformed_records` is not windowed (it counts since process start).
+- The re-validation tick is per connection; a revoked admin can keep an open stream for up to `ADMIN_EVENTS_ROLE_RECHECK_SECS` (60 s) plus the 2 s role-check timeout.
 
 ## Next step
 

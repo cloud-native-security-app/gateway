@@ -175,7 +175,8 @@ un error tipado explícito, nunca con un panic:
 | `SESSION_TTL_SECS` | Sí | Tiempo de vida, en segundos, de la sesión propia de Gateway |
 | `AWS_REGION` | Sí | Región de AWS de los clientes SNS/SQS. Las credenciales vienen de la cadena de proveedores por defecto de AWS (rol de la tarea ECS), nunca de claves estáticas |
 | `AWS_ENDPOINT_URL` | No | Endpoint alternativo de AWS, solo LocalStack. Si se define debe ser una URL válida |
-| `SECURITY_EVENTS_STREAM_NAME` | No | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`). Si no se define o está vacía, Gateway no publica eventos (un aviso informativo al arrancar). Solo admite `[a-zA-Z0-9_.-]`, hasta 128 caracteres. Usa `AWS_REGION`/`AWS_ENDPOINT_URL` y las credenciales por defecto de AWS; un fallo de Kinesis solo se loggea y nunca altera una respuesta |
+| `SECURITY_EVENTS_STREAM_NAME` | No | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`). Si no se define o está vacía, Gateway no publica eventos ni consume el stream para el panel de administración (un aviso informativo al arrancar; las rutas `/api/admin/*` responden con métricas vacías). Solo admite `[a-zA-Z0-9_.-]`, hasta 128 caracteres. Usa `AWS_REGION`/`AWS_ENDPOINT_URL` y las credenciales por defecto de AWS; un fallo de Kinesis solo se loggea y nunca altera una respuesta |
+| `ADMIN_EVENTS_ROLE_RECHECK_SECS` | No (por defecto `60`) | Cada cuántos segundos un stream SSE de `GET /api/admin/events` reconsulta el rol vigente del usuario en `ms-usuarios` y lo cierra si ya no es admin o no se puede verificar. Entero mayor que cero |
 | `SCAN_REQUESTS_TOPIC_ARN` | Sí | ARN del topic SNS de solicitudes de escaneo (`arn:<partición>:sns:<región>:<cuenta>:<nombre>`) |
 | `SCAN_CANCELLATIONS_TOPIC_ARN` | Sí | ARN del topic SNS de cancelaciones de escaneo |
 | `GATEWAY_SCAN_OUTCOMES_QUEUE_URL` | Sí | URL de la cola SQS de la que Gateway consume los resultados de escaneo |
