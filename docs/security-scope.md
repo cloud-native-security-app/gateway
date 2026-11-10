@@ -26,6 +26,23 @@
   `aud`, `iss` — RNF-02) antes de ejecutar cualquier lógica de negocio. Una
   sesión inválida/expirada es `401`, nunca un intento de "renovar
   silenciosamente" sin un flujo explícito.
+- **Rol y autorización de administración** (feature `admin-role-guard`):
+  el rol (`user`/`admin`) lo decide únicamente `ms-usuarios` (`users.role`)
+  y Gateway lo lee de la respuesta de `PUT /users/me` en el callback de
+  login; viaja como claim `role` dentro del JWT firmado. Ningún header,
+  query, cookie ni cuerpo de la request puede fijarlo, y `GET /api/me` solo
+  lo expone para que `front` decida qué mostrar. Reglas de falla cerrada:
+  campo `role` ausente (un `ms-usuarios` anterior) => `user`; valor
+  desconocido => `user` más un `warn` sin datos personales ni el valor
+  recibido; JWT anterior sin claim `role` => `user`; claim con un valor
+  desconocido => sesión rechazada (`401`). Toda ruta de administración
+  (`/api/admin/*`, KAP-09) debe montar `auth::require_admin` dentro de
+  `require_session`: `401` sin sesión válida, `403` (`acceso denegado`, sin
+  revelar rol ni claims) si no es `admin`; sin capa `Session` previa también
+  responde `401`. **Limitación conocida:** como el rol está en el JWT, un
+  cambio de rol en `ms-usuarios` (otorgar o revocar admin) aplica en el
+  siguiente login, no antes de que expire la sesión (`session_ttl_secs`);
+  no hay revocación server-side (misma limitación que el `logout`).
 - Un `logout` invalida la sesión del lado del navegador (borra la cookie);
   si en el futuro se necesita invalidación server-side (revocación antes de
   `exp`), es una feature nueva a discutir, no se asume aquí.
