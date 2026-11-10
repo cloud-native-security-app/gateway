@@ -22,7 +22,7 @@ use gateway::api::{
 };
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use gateway::domain::Session;
+use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::JwkSet;
@@ -179,6 +179,7 @@ fn lab_session() -> Session {
         email: "user@example.com".to_string(),
         name: "Test User".to_string(),
         exp: now_epoch_secs() + 3600,
+        role: Role::User,
     }
 }
 
@@ -275,6 +276,34 @@ async fn me_with_valid_session_returns_the_session_identity() {
     assert_eq!(body["sub"], "google-sub-123");
     assert_eq!(body["email"], "user@example.com");
     assert_eq!(body["name"], "Test User");
+    assert_eq!(body["role"], "user");
+}
+
+#[tokio::test]
+async fn me_reports_the_admin_role_of_an_admin_session() {
+    let gateway = spawn_gateway().await;
+    let mut session = lab_session();
+    session.role = Role::Admin;
+    let token = issue_session_token(
+        &session,
+        &SecretString::from(SESSION_SIGNING_KEY.to_string()),
+        SESSION_AUDIENCE,
+        SESSION_ISSUER,
+    )
+    .expect("debe poder firmar una sesión de laboratorio válida");
+
+    let response = http_client_no_redirects()
+        .get(format!("http://{}/api/me", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={token}"),
+        )
+        .send()
+        .await
+        .expect("GET /api/me debe responder");
+
+    let body: serde_json::Value = response.json().await.expect("cuerpo JSON válido");
+    assert_eq!(body["role"], "admin");
 }
 
 #[tokio::test]

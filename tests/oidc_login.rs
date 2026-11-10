@@ -251,6 +251,9 @@ struct CapturedUpsertCall {
 struct UsuariosUpsertStubState {
     captured: Arc<Mutex<Option<CapturedUpsertCall>>>,
     fail: bool,
+    /// Valor de `role` que el stub añade al perfil devuelto (`None` = el
+    /// perfil no incluye `role`, como un `ms-usuarios` anterior a `user-role`).
+    role: Option<serde_json::Value>,
 }
 
 async fn put_users_me(
@@ -281,7 +284,11 @@ async fn put_users_me(
             Json(json!({"error": "fallo simulado de ms-usuarios"})),
         )
     } else {
-        (StatusCode::OK, Json(body))
+        let mut profile = body;
+        if let (Some(role), Some(object)) = (&state.role, profile.as_object_mut()) {
+            object.insert("role".to_string(), role.clone());
+        }
+        (StatusCode::OK, Json(profile))
     }
 }
 
@@ -293,6 +300,19 @@ async fn put_users_me(
 async fn spawn_usuarios_upsert_stub(
     fail: bool,
 ) -> (String, Arc<Mutex<Option<CapturedUpsertCall>>>) {
+    spawn_usuarios_stub(fail, None).await
+}
+
+/// Igual que [`spawn_usuarios_upsert_stub`] (camino feliz) pero el perfil
+/// devuelto incluye `role` con el valor indicado (feature `admin-role-guard`).
+async fn spawn_usuarios_stub_with_role(role: serde_json::Value) -> String {
+    spawn_usuarios_stub(false, Some(role)).await.0
+}
+
+async fn spawn_usuarios_stub(
+    fail: bool,
+    role: Option<serde_json::Value>,
+) -> (String, Arc<Mutex<Option<CapturedUpsertCall>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind del stub de ms-usuarios");
@@ -302,6 +322,7 @@ async fn spawn_usuarios_upsert_stub(
     let state = UsuariosUpsertStubState {
         captured: captured.clone(),
         fail,
+        role,
     };
 
     let app = Router::new()
@@ -1040,4 +1061,165 @@ async fn callback_when_usuarios_upsert_fails_does_not_create_session_or_redirect
             .is_some(),
         "el stub debe haber recibido el intento de PUT /users/me"
     );
+}
+
+/// Completa un login contra `usuarios_base_url` y devuelve el claim `role`
+/// del JWT de sesión emitido (`None` si el token no lo lleva), decodificado
+/// con la clave/aud/iss de este Gateway (feature `admin-role-guard`).
+async fn login_and_read_role_claim(usuarios_base_url: &str) -> Option<String> {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let gateway = spawn_gateway(&idp.issuer_url, usuarios_base_url).await;
+    let http = http_client_no_redirects();
+
+    let (state_value, nonce_value) = start_login(&http, &gateway).await;
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(&key, &claims));
+
+    let response = http
+        .get(format!(
+            "http://{}/auth/callback?code=irrelevant-code&state={state_value}",
+            gateway.addr
+        ))
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+    let set_cookie = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("debe emitir Set-Cookie")
+        .to_str()
+        .expect("Set-Cookie ASCII");
+    let token = set_cookie
+        .split(';')
+        .next()
+        .and_then(|kv| kv.split_once('='))
+        .map(|(_, v)| v.to_string())
+        .expect("la cookie debe tener un valor");
+
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.set_audience(&[SESSION_AUDIENCE]);
+    validation.set_issuer(&[SESSION_ISSUER]);
+
+    #[derive(serde::Deserialize)]
+    struct RoleClaim {
+        role: Option<String>,
+    }
+    jsonwebtoken::decode::<RoleClaim>(&token, &decoding_key, &validation)
+        .expect("la sesión emitida debe decodificar")
+        .claims
+        .role
+}
+
+/// El rol sale de la respuesta de `ms-usuarios` y viaja firmado en el JWT.
+#[tokio::test]
+async fn callback_puts_the_admin_role_from_ms_usuarios_in_the_session_jwt() {
+    let base_url = spawn_usuarios_stub_with_role(json!("admin")).await;
+    assert_eq!(
+        login_and_read_role_claim(&base_url).await.as_deref(),
+        Some("admin")
+    );
+}
+
+#[tokio::test]
+async fn callback_puts_the_user_role_from_ms_usuarios_in_the_session_jwt() {
+    let base_url = spawn_usuarios_stub_with_role(json!("user")).await;
+    assert_eq!(
+        login_and_read_role_claim(&base_url).await.as_deref(),
+        Some("user")
+    );
+}
+
+/// Fail closed: un `ms-usuarios` sin campo `role` (anterior a `user-role`)
+/// produce una sesión `user`, nunca `admin`.
+#[tokio::test]
+async fn callback_defaults_to_user_when_ms_usuarios_omits_the_role() {
+    let (base_url, _captured) = spawn_usuarios_upsert_stub(false).await;
+    assert_eq!(
+        login_and_read_role_claim(&base_url).await.as_deref(),
+        Some("user")
+    );
+}
+
+/// Fail closed: un rol desconocido (ruptura de contrato) produce `user`.
+#[tokio::test]
+async fn callback_defaults_to_user_when_ms_usuarios_returns_an_unknown_role() {
+    let base_url = spawn_usuarios_stub_with_role(json!("superuser")).await;
+    assert_eq!(
+        login_and_read_role_claim(&base_url).await.as_deref(),
+        Some("user")
+    );
+}
+
+/// Ningún dato del request de callback puede fijar el rol: un `role=admin`
+/// en la query string se ignora.
+#[tokio::test]
+async fn callback_ignores_a_role_supplied_by_the_client_request() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let (base_url, _captured) = spawn_usuarios_upsert_stub(false).await;
+    let gateway = spawn_gateway(&idp.issuer_url, &base_url).await;
+    let http = http_client_no_redirects();
+
+    let (state_value, nonce_value) = start_login(&http, &gateway).await;
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(&key, &claims));
+
+    let response = http
+        .get(format!(
+            "http://{}/auth/callback?code=irrelevant-code&state={state_value}&role=admin",
+            gateway.addr
+        ))
+        .header("X-Role", "admin")
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+    let set_cookie = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("debe emitir Set-Cookie")
+        .to_str()
+        .expect("Set-Cookie ASCII")
+        .to_string();
+    let token = set_cookie
+        .split(';')
+        .next()
+        .and_then(|kv| kv.split_once('='))
+        .map(|(_, v)| v.to_string())
+        .expect("la cookie debe tener un valor");
+
+    let decoding_key = jsonwebtoken::DecodingKey::from_secret(b"lab-only-not-a-real-secret");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.set_audience(&[SESSION_AUDIENCE]);
+    validation.set_issuer(&[SESSION_ISSUER]);
+    let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
+        .expect("la sesión emitida debe decodificar");
+    assert_eq!(decoded.claims["role"], "user");
 }

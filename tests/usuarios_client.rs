@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
-use gateway::domain::Session;
+use gateway::domain::{Role, Session};
 use gateway::usuarios_client::{
     UsuariosClient, UsuariosClientError, FORWARDED_USER_HEADER_NAME, GATEWAY_SECRET_HEADER_NAME,
 };
@@ -31,6 +31,7 @@ fn lab_session() -> Session {
         email: "user@example.com".to_string(),
         name: "Test User".to_string(),
         exp: 9_999_999_999,
+        role: Role::User,
     }
 }
 
