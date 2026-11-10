@@ -17,9 +17,11 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
                               │
                               ├──(HTTP síncrono, subred privada)──▶ ms-usuarios
                               │
-                              └──(HTTPS)──▶ SNS ──▶ ms-nmap
-                                              │
-                                   cola SQS de resultados (SSE hacia front)
+                              ├──(HTTPS)──▶ SNS ──▶ ms-nmap
+                              │                │
+                              │     cola SQS de resultados (SSE hacia front)
+                              │
+                              └──(HTTPS, best-effort)──▶ Kinesis `security-events`
 ```
 
 ## Responsabilidades
@@ -99,6 +101,22 @@ Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
   llamada HTTPS independiente). `gateway::run` captura `SIGTERM`/`Ctrl-C`,
   cancela el consumidor, drena HTTP y espera al consumidor con tiempos
   acotados.
+- **Eventos de seguridad hacia Kinesis (KAP-06).** Gateway publica hechos
+  inmutables en el stream `security-events` a través del puerto
+  `SecurityEventPublisher` (`security_events`), con un adaptador Kinesis
+  (`kinesis`), uno en memoria para tests y uno no-op cuando
+  `SECURITY_EVENTS_STREAM_NAME` no está definida. Emite `scan.requested`
+  (tras aceptar el Broker la solicitud), `scan.cancelled`, `auth.login`
+  (tras emitir la sesión), `auth.logout` (solo con cookie de sesión válida),
+  `ratelimit.hit` y `message.deadlettered` (tras copiar el mensaje a la DLQ;
+  solo cola y código de motivo, nunca el cuerpo). El contrato es
+  `broker/contracts/security-event.schema.json`; los tests validan cada
+  evento contra él. Un fallo de Kinesis **nunca** cambia la respuesta ni el
+  resultado de la operación: `emit` publica en una tarea desacoplada con
+  tope de 5 s y solo loggea el tipo de evento. Clave de partición:
+  `scan_id`, si no `actor_sub`, si no `event_id`. Un evento puede perderse si
+  el proceso muere antes de publicarlo (el estado de negocio es la fuente de
+  verdad).
 - **Rate limiting por usuario (RF-12)** con un limitador en memoria propio sobre la ruta
   de encolado de escaneos, con la identidad de la sesión de Gateway como
   clave (no la IP del cliente, que puede compartirse tras un NAT/proxy).
@@ -146,7 +164,8 @@ resuelva, no antes.
 
 1. **`config`** — carga de configuración desde variables de entorno
    (credenciales OAuth de Google, secreto de firma de sesión, región,
-   ARNs de topics SNS y URLs de colas SQS (sin credenciales: salen de la
+   ARNs de topics SNS, URLs de colas SQS y nombre opcional del stream de
+   eventos de seguridad (sin credenciales: salen de la
    cadena por defecto de AWS), URL base + credencial compartida de
    `ms-usuarios`, umbrales de rate limiting). Sin valores hardcodeados.
 2. **`domain`** — tipos puros: `Session` (identidad verificada + `exp` +
@@ -160,11 +179,15 @@ resuelva, no antes.
 4. **`usuarios_client`** — único módulo que conoce la URL y el contrato
    HTTP de `ms-usuarios`; nadie más en este repo hace una petición HTTP
    directa hacia `ms-usuarios`.
-5. **`broker`, `sns`, `sqs`** — `broker` define los puertos
+5. **`broker`, `sns`, `sqs`, `security_events`, `kinesis`** — `broker` define los puertos
    (`ScanRequestPublisher`, `ScanOutcomeHandler`) y los tipos de mensaje;
    `sns` publica `ScanRequest`/`ScanCancellation` en SNS y `sqs` consume la
    cola de resultados de escaneo. Únicos módulos que conocen el contrato de
    mensajes del Broker.
+   `security_events` define el puerto `SecurityEventPublisher`, el sobre
+   `SecurityEvent` (un constructor tipado por evento, validado contra el
+   schema) y `emit`, el único punto de emisión de los handlers; `kinesis`
+   es su adaptador real.
 6. **`realtime`** — registro de streams SSE activos por `scanId` y el
    puente entre un evento consumido del Broker y los clientes SSE
    suscritos.
@@ -173,7 +196,7 @@ resuelva, no antes.
    documentación OpenAPI. Aplica el middleware de sesión y el rate
    limiter.
 8. **`wiring`** — composition root: construye el cliente OIDC, el publicador
-   SNS y el consumidor SQS, el cliente HTTP hacia `ms-usuarios` y arma el router completo
+   SNS, el publicador de eventos de seguridad (Kinesis o no-op) y el consumidor SQS, el cliente HTTP hacia `ms-usuarios` y arma el router completo
    desde la `Config`.
 9. **`lib`** — declara `pub mod` para cada capa anterior y expone `pub
    async fn run(...)` (consumidor SQS de fondo y apagado ordenado).

@@ -32,6 +32,10 @@ use gateway::broker::{
 };
 use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::{
+    NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError,
+    SecurityEventPublisher,
+};
 use gateway::sns::SnsScanPublisher;
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
@@ -325,6 +329,19 @@ async fn spawn_gateway(
     usuarios_base_url: String,
     broker_publisher: Arc<dyn ScanRequestPublisher>,
 ) -> GatewayUnderTest {
+    spawn_gateway_with_events(
+        usuarios_base_url,
+        broker_publisher,
+        Arc::new(NoopSecurityEventPublisher),
+    )
+    .await
+}
+
+async fn spawn_gateway_with_events(
+    usuarios_base_url: String,
+    broker_publisher: Arc<dyn ScanRequestPublisher>,
+    security_events: Arc<dyn SecurityEventPublisher>,
+) -> GatewayUnderTest {
     let issuer_url = spawn_discovery_only_idp().await;
 
     let oidc_client = OidcClient::discover(
@@ -359,6 +376,7 @@ async fn spawn_gateway(
             1000,
             Duration::from_secs(60),
         )),
+        security_events,
     };
 
     let app = app_router(state);
@@ -487,6 +505,89 @@ async fn scan_submission_publishes_and_records_the_bare_ip_for_single_host_targe
             "ms-usuarios debe recibir la IP simple para {input}"
         );
     }
+}
+
+// --- Feature `security_event_publisher` (KAP-06): `scan.requested` ---
+
+/// Publicador de eventos que siempre falla: la solicitud no debe notarlo.
+struct AlwaysFailingEvents;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for AlwaysFailingEvents {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+/// Cede el turno: las tareas de `emit` comparten el runtime de un hilo del
+/// test, y una ausencia de evento solo es concluyente tras dejarlas correr.
+async fn let_background_tasks_run() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn accepted_scan_emits_scan_requested_with_the_scan_id_actor_and_target() {
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let usuarios_base_url = spawn_happy_usuarios_stub().await;
+    let gateway = spawn_gateway_with_events(
+        usuarios_base_url,
+        Arc::new(RecordingPublisher::default()),
+        events.clone(),
+    )
+    .await;
+
+    let response = post_target(&gateway, "192.0.2.10").await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("cuerpo JSON");
+    let emitted = events.wait_for(1).await;
+    assert_eq!(emitted.len(), 1);
+    let json = serde_json::to_value(&emitted[0]).expect("serializa");
+    assert_eq!(json["event_type"], "scan.requested");
+    assert_eq!(json["source"], "gateway");
+    assert_eq!(json["actor_sub"], "google-sub-123");
+    assert_eq!(json["scan_id"], body["scanId"]);
+    assert_eq!(json["payload"], json!({ "target": "192.0.2.10" }));
+    let text = json.to_string();
+    assert!(!text.contains("user@example.com"), "sin correo: {text}");
+}
+
+#[tokio::test]
+async fn scan_response_is_unchanged_when_the_event_publisher_fails() {
+    let usuarios_base_url = spawn_happy_usuarios_stub().await;
+    let gateway = spawn_gateway_with_events(
+        usuarios_base_url,
+        Arc::new(RecordingPublisher::default()),
+        Arc::new(AlwaysFailingEvents),
+    )
+    .await;
+
+    let response = post_target(&gateway, "192.0.2.10").await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("cuerpo JSON");
+    assert!(body["scanId"].as_str().is_some_and(|id| !id.is_empty()));
+    let_background_tasks_run().await;
+}
+
+#[tokio::test]
+async fn scan_rejected_by_the_broker_emits_no_scan_requested() {
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let usuarios_base_url = spawn_happy_usuarios_stub().await;
+    let gateway = spawn_gateway_with_events(
+        usuarios_base_url,
+        Arc::new(AlwaysFailsToPublish),
+        events.clone(),
+    )
+    .await;
+
+    let response = post_target(&gateway, "192.0.2.10").await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let_background_tasks_run().await;
+    assert!(events.events().is_empty());
 }
 
 #[tokio::test]

@@ -24,6 +24,7 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::NoopSecurityEventPublisher;
 use gateway::usuarios_client::UsuariosClient;
 use jsonwebtoken::jwk::JwkSet;
 use secrecy::SecretString;
@@ -141,6 +142,7 @@ async fn spawn_gateway() -> GatewayUnderTest {
             1000,
             Duration::from_secs(60),
         )),
+        security_events: Arc::new(NoopSecurityEventPublisher),
     };
 
     let app = app_router(state);

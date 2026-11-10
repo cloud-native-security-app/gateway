@@ -13,7 +13,9 @@ use crate::auth::{LoginStateStore, OidcClient};
 use crate::broker::{BrokerError, ScanOutcomeHandler, ScanRequestPublisher};
 use crate::config::Config;
 use crate::domain::ScanOutcomeEvent;
+use crate::kinesis::KinesisSecurityEventPublisher;
 use crate::realtime::RealtimeRegistry;
+use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 use crate::sns::SnsScanPublisher;
 use crate::sqs::SqsScanOutcomeConsumer;
 use crate::usuarios_client::{ScanStatus, UsuariosClient, UsuariosClientError};
@@ -105,13 +107,40 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         .await,
     );
 
+    // Sin `SECURITY_EVENTS_STREAM_NAME` no se publican eventos (no-op): las
+    // instalaciones locales anteriores a esta feature siguen funcionando.
+    let security_events: Arc<dyn SecurityEventPublisher> =
+        match config.security_events_stream_name.as_deref() {
+            Some(stream_name) => {
+                tracing::info!(
+                    stream_name,
+                    "publicando eventos de seguridad en el stream de Kinesis"
+                );
+                Arc::new(
+                    KinesisSecurityEventPublisher::connect(
+                        &config.aws_region,
+                        endpoint,
+                        stream_name.to_string(),
+                    )
+                    .await,
+                )
+            }
+            None => {
+                tracing::info!(
+                "SECURITY_EVENTS_STREAM_NAME no está definida: no se publican eventos de seguridad"
+            );
+                Arc::new(NoopSecurityEventPublisher)
+            }
+        };
+
     let scan_outcome_consumer = SqsScanOutcomeConsumer::connect(
         &config.aws_region,
         endpoint,
         config.scan_outcomes_queue_url.to_string(),
         config.scan_outcomes_dlq_url.to_string(),
     )
-    .await;
+    .await
+    .with_security_events(Arc::clone(&security_events));
 
     let front_origin =
         HeaderValue::from_str(&config.front_origin).map_err(WiringError::InvalidCorsOrigin)?;
@@ -143,6 +172,7 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         scan_ownership,
         realtime,
         scan_submission_rate_limiter,
+        security_events,
     };
 
     Ok(Wiring {

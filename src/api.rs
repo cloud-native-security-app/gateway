@@ -40,6 +40,7 @@ use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
+use crate::security_events::{emit, SecurityEvent, SecurityEventPublisher};
 use crate::usuarios_client::{
     role_from_profile, CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry,
     ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
@@ -231,6 +232,16 @@ impl ScanSubmissionRateLimiter {
         }
     }
 
+    /// Máximo de solicitudes por usuario dentro de cada ventana.
+    pub fn max_requests(&self) -> u32 {
+        self.max_requests
+    }
+
+    /// Duración de la ventana sobre la que se cuenta [`Self::max_requests`].
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+
     /// Registra un intento de `sub` contra el límite de tasa.
     ///
     /// Si la ventana en curso de `sub` ya expiró (transcurrió `window` desde
@@ -297,16 +308,36 @@ impl IntoResponse for RateLimitError {
 /// un mensaje explícito, antes de ejecutar `submit_scan` — nunca llega a
 /// tocar `ms-usuarios` ni el Broker para la solicitud que lo supera.
 async fn rate_limit_scan_submission(
-    State(limiter): State<Arc<ScanSubmissionRateLimiter>>,
+    State(layer): State<RateLimitLayerState>,
     Extension(session): Extension<Session>,
     request: Request,
     next: Next,
 ) -> Result<Response, RateLimitError> {
-    if limiter.check_and_record(&session.sub) {
+    if layer.limiter.check_and_record(&session.sub) {
         Ok(next.run(request).await)
     } else {
+        // Feature `security_event_publisher`: un evento por solicitud
+        // rechazada, sin esperar ni alterar el `429`. `uri().path()` ya
+        // excluye la query string.
+        emit(
+            &layer.security_events,
+            SecurityEvent::ratelimit_hit(
+                &session.sub,
+                request.uri().path(),
+                layer.limiter.max_requests(),
+                layer.limiter.window().as_secs().max(1),
+            ),
+        );
         Err(RateLimitError::Exceeded)
     }
+}
+
+/// Estado de la capa [`rate_limit_scan_submission`]: el limitador y el
+/// publicador de eventos de seguridad (feature `security_event_publisher`).
+#[derive(Clone)]
+struct RateLimitLayerState {
+    limiter: Arc<ScanSubmissionRateLimiter>,
+    security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 /// Estado compartido por los handlers de autenticación de este router.
@@ -356,6 +387,11 @@ pub struct AppState {
     /// Limitador de tasa por usuario aplicado a `POST /api/scans` (RF-12,
     /// feature `rate_limiting`, ver [`ScanSubmissionRateLimiter`]).
     pub scan_submission_rate_limiter: Arc<ScanSubmissionRateLimiter>,
+    /// Publicador de eventos de seguridad hacia Kinesis (feature
+    /// `security_event_publisher`, ver [`crate::security_events`]). Los
+    /// handlers lo usan solo a través de [`crate::security_events::emit`]:
+    /// un fallo de publicación nunca altera la respuesta HTTP.
+    pub security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -418,7 +454,10 @@ fn protected_router(state: AppState) -> Router {
     );
 
     let submit_scan_method_router = post(submit_scan).layer(middleware::from_fn_with_state(
-        state.scan_submission_rate_limiter.clone(),
+        RateLimitLayerState {
+            limiter: state.scan_submission_rate_limiter.clone(),
+            security_events: state.security_events.clone(),
+        },
         rate_limit_scan_submission,
     ));
 
@@ -824,6 +863,13 @@ async fn submit_scan(
         return Err(broker_err.into());
     }
 
+    // Feature `security_event_publisher`: solo cuando el Broker aceptó la
+    // solicitud, y sin esperar ni propagar nada.
+    emit(
+        &state.security_events,
+        SecurityEvent::scan_requested(&session.sub, &scan_id, &scan_request.ip),
+    );
+
     Ok(Json(ScanSubmissionResponse { scan_id }))
 }
 
@@ -1043,6 +1089,13 @@ async fn cancel_scan(
     state
         .scan_ownership
         .mark_cancel_requested(&cancellation.correlation_id);
+
+    // Feature `security_event_publisher`: solo cuando el Broker aceptó la
+    // cancelación, y sin esperar ni propagar nada.
+    emit(
+        &state.security_events,
+        SecurityEvent::scan_cancelled(&cancellation.requested_by, &cancellation.correlation_id),
+    );
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -1543,6 +1596,12 @@ async fn callback(
     )?;
 
     let cookie = auth::session_cookie(token, state.session_ttl_secs);
+    // Feature `security_event_publisher`: solo tras emitir la sesión con
+    // éxito, y sin esperar ni propagar nada (ver `crate::security_events::emit`).
+    emit(
+        &state.security_events,
+        SecurityEvent::auth_login(&session.sub),
+    );
     Ok((jar.add(cookie), redirect_found(&state.front_base_url)))
 }
 
@@ -1565,7 +1624,25 @@ const CLEAR_SITE_DATA: HeaderName = HeaderName::from_static("clear-site-data");
             (`Set-Cookie` ya expirado, `Clear-Site-Data: \"cookies\"`).")
     )
 )]
-async fn logout(jar: CookieJar) -> impl IntoResponse {
+async fn logout(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+    // Feature `security_event_publisher`: el logout sigue fuera del middleware
+    // de sesión (D-09), así que la identidad se lee aquí, solo para el
+    // evento: con una cookie válida se emite `auth.logout`; sin cookie, o con
+    // una inválida/expirada, no hay `actor_sub` que reportar y no se emite
+    // nada. Nunca altera la respuesta.
+    if let Some(cookie) = jar.get(auth::SESSION_COOKIE_NAME) {
+        let validator = SessionValidator::new(
+            state.session_signing_key.clone(),
+            state.session_audience.clone(),
+            state.session_issuer.clone(),
+        );
+        if let Ok(session) = validator.validate(cookie.value()) {
+            emit(
+                &state.security_events,
+                SecurityEvent::auth_logout(&session.sub),
+            );
+        }
+    }
     (
         jar.add(auth::removal_cookie()),
         [(CLEAR_SITE_DATA, HeaderValue::from_static("\"cookies\""))],

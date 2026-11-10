@@ -73,7 +73,9 @@ El `docker-compose` de desarrollo (con LocalStack) vive en el repo `infra`,
 no aquí. Con un LocalStack ya corriendo en `http://localhost:4566`, y los
 topics/colas creados, basta exportar `AWS_ENDPOINT_URL=http://localhost:4566`,
 `AWS_REGION=us-east-1`, `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`
-y las variables `SCAN_*`/`GATEWAY_SCAN_OUTCOMES_*` de la tabla de abajo.
+y las variables `SCAN_*`/`GATEWAY_SCAN_OUTCOMES_*` de la tabla de abajo. Para
+ver los eventos de seguridad localmente, añadir `SECURITY_EVENTS_STREAM_NAME=security-events`
+(el stream lo crea el init de LocalStack de `infra`).
 
 #### Apagado ordenado
 
@@ -173,6 +175,7 @@ un error tipado explícito, nunca con un panic:
 | `SESSION_TTL_SECS` | Sí | Tiempo de vida, en segundos, de la sesión propia de Gateway |
 | `AWS_REGION` | Sí | Región de AWS de los clientes SNS/SQS. Las credenciales vienen de la cadena de proveedores por defecto de AWS (rol de la tarea ECS), nunca de claves estáticas |
 | `AWS_ENDPOINT_URL` | No | Endpoint alternativo de AWS, solo LocalStack. Si se define debe ser una URL válida |
+| `SECURITY_EVENTS_STREAM_NAME` | No | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`). Si no se define o está vacía, Gateway no publica eventos (un aviso informativo al arrancar). Solo admite `[a-zA-Z0-9_.-]`, hasta 128 caracteres. Usa `AWS_REGION`/`AWS_ENDPOINT_URL` y las credenciales por defecto de AWS; un fallo de Kinesis solo se loggea y nunca altera una respuesta |
 | `SCAN_REQUESTS_TOPIC_ARN` | Sí | ARN del topic SNS de solicitudes de escaneo (`arn:<partición>:sns:<región>:<cuenta>:<nombre>`) |
 | `SCAN_CANCELLATIONS_TOPIC_ARN` | Sí | ARN del topic SNS de cancelaciones de escaneo |
 | `GATEWAY_SCAN_OUTCOMES_QUEUE_URL` | Sí | URL de la cola SQS de la que Gateway consume los resultados de escaneo |

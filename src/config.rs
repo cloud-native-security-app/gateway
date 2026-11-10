@@ -71,6 +71,12 @@ const ENV_SCAN_OUTCOMES_QUEUE_URL: &str = "GATEWAY_SCAN_OUTCOMES_QUEUE_URL";
 /// Nombre de la variable de entorno con la URL de la dead-letter queue SQS
 /// asociada a la cola de resultados de escaneo.
 const ENV_SCAN_OUTCOMES_DLQ_URL: &str = "GATEWAY_SCAN_OUTCOMES_DLQ_URL";
+/// Nombre de la variable de entorno con el nombre del Kinesis Data Stream de
+/// eventos de seguridad (feature `security_event_publisher`). Opcional: si no
+/// se define o está vacía, el Gateway no publica eventos (adaptador no-op).
+const ENV_SECURITY_EVENTS_STREAM_NAME: &str = "SECURITY_EVENTS_STREAM_NAME";
+/// Largo máximo de un nombre de stream de Kinesis.
+const MAX_STREAM_NAME_CHARS: usize = 128;
 
 /// Configuración completa del servicio, cargada desde variables de entorno.
 ///
@@ -144,6 +150,10 @@ pub struct Config {
     pub scan_outcomes_queue_url: url::Url,
     /// URL de la dead-letter queue de [`Config::scan_outcomes_queue_url`].
     pub scan_outcomes_dlq_url: url::Url,
+    /// Nombre del Kinesis Data Stream de eventos de seguridad. `None` (variable
+    /// ausente o vacía) deja el Gateway sin publicar eventos, de modo que las
+    /// instalaciones locales anteriores a la feature siguen funcionando.
+    pub security_events_stream_name: Option<String>,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -181,6 +191,14 @@ pub enum ConfigError {
     /// tiene esa forma. El valor no se incluye en el error.
     #[error("la variable de entorno {name} no es un ARN de topic SNS válido")]
     InvalidArn {
+        /// Nombre de la variable de entorno inválida.
+        name: &'static str,
+    },
+    /// Una variable de entorno que debe ser el nombre de un stream de
+    /// Kinesis (`[a-zA-Z0-9_.-]`, hasta 128 caracteres) no tiene esa forma.
+    /// El valor no se incluye en el error.
+    #[error("la variable de entorno {name} no es un nombre de stream de Kinesis válido")]
+    InvalidStreamName {
         /// Nombre de la variable de entorno inválida.
         name: &'static str,
     },
@@ -249,6 +267,25 @@ fn is_sns_topic_arn(value: &str) -> bool {
         && account.len() == 12
         && account.bytes().all(|b| b.is_ascii_digit())
         && !name.is_empty()
+}
+
+/// Interpreta el valor crudo de una variable opcional con el nombre de un
+/// stream de Kinesis: ausente o en blanco es `None` (feature desactivada); si
+/// no, se recorta y debe cumplir `[a-zA-Z0-9_.-]{1,128}`. Función pura (el
+/// valor entra por parámetro) para probarla sin tocar el entorno del proceso.
+fn parse_stream_name(name: &'static str, raw: Option<&str>) -> Result<Option<String>, ConfigError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let valid = value.chars().count() <= MAX_STREAM_NAME_CHARS
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    if valid {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(ConfigError::InvalidStreamName { name })
+    }
 }
 
 /// Lee una variable de entorno requerida y la envuelve en [`SecretString`].
@@ -329,6 +366,10 @@ impl Config {
             required_sns_topic_arn(ENV_SCAN_CANCELLATIONS_TOPIC_ARN)?;
         let scan_outcomes_queue_url = required_url(ENV_SCAN_OUTCOMES_QUEUE_URL)?;
         let scan_outcomes_dlq_url = required_url(ENV_SCAN_OUTCOMES_DLQ_URL)?;
+        let security_events_stream_name = parse_stream_name(
+            ENV_SECURITY_EVENTS_STREAM_NAME,
+            env::var(ENV_SECURITY_EVENTS_STREAM_NAME).ok().as_deref(),
+        )?;
 
         Ok(Self {
             http_host,
@@ -351,6 +392,7 @@ impl Config {
             scan_cancellations_topic_arn,
             scan_outcomes_queue_url,
             scan_outcomes_dlq_url,
+            security_events_stream_name,
         })
     }
 }
@@ -399,6 +441,7 @@ mod tests {
         }
         env::remove_var(ENV_GOOGLE_OIDC_ISSUER_URL);
         env::remove_var(ENV_AWS_ENDPOINT_URL);
+        env::remove_var(ENV_SECURITY_EVENTS_STREAM_NAME);
     }
 
     fn set_all_valid_vars() {
@@ -454,6 +497,10 @@ mod tests {
         assert_eq!(config.scan_submission_rate_limit_window_secs, 60);
         assert_eq!(config.aws_region, "us-east-1");
         assert_eq!(config.aws_endpoint_url, None);
+        assert_eq!(
+            config.security_events_stream_name, None,
+            "sin SECURITY_EVENTS_STREAM_NAME no se publican eventos"
+        );
         assert_eq!(config.scan_requests_topic_arn, VALID_REQUESTS_TOPIC_ARN);
         assert_eq!(
             config.scan_cancellations_topic_arn,
@@ -722,6 +769,38 @@ mod tests {
         );
 
         clear_all_vars();
+    }
+
+    #[test]
+    fn security_events_stream_name_unset_or_blank_means_disabled() {
+        assert_eq!(
+            parse_stream_name(ENV_SECURITY_EVENTS_STREAM_NAME, None).unwrap(),
+            None
+        );
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                parse_stream_name(ENV_SECURITY_EVENTS_STREAM_NAME, Some(blank)).unwrap(),
+                None,
+                "{blank:?} debe tratarse como no definida"
+            );
+        }
+    }
+
+    #[test]
+    fn security_events_stream_name_is_trimmed_and_validated() {
+        assert_eq!(
+            parse_stream_name(ENV_SECURITY_EVENTS_STREAM_NAME, Some(" security-events ")).unwrap(),
+            Some("security-events".to_string())
+        );
+        for invalid in ["has space", "semi;colon", "ñandú", &"a".repeat(129)] {
+            let err = parse_stream_name(ENV_SECURITY_EVENTS_STREAM_NAME, Some(invalid))
+                .expect_err("nombre inválido");
+            assert!(matches!(err, ConfigError::InvalidStreamName { .. }));
+            assert!(
+                !err.to_string().contains(invalid),
+                "no debe incluir el valor"
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,10 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::{
+    NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError,
+    SecurityEventPublisher,
+};
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -207,6 +211,25 @@ async fn spawn_gateway_with(
     usuarios_base_url: String,
     broker_publisher: Arc<dyn ScanRequestPublisher>,
 ) -> GatewayUnderTest {
+    spawn_gateway_with_events(
+        max_requests,
+        window,
+        usuarios_base_url,
+        broker_publisher,
+        Arc::new(NoopSecurityEventPublisher),
+    )
+    .await
+}
+
+/// Igual que [`spawn_gateway_with`], pero permitiendo inyectar el publicador
+/// de eventos de seguridad (feature `security_event_publisher`).
+async fn spawn_gateway_with_events(
+    max_requests: u32,
+    window: Duration,
+    usuarios_base_url: String,
+    broker_publisher: Arc<dyn ScanRequestPublisher>,
+    security_events: Arc<dyn SecurityEventPublisher>,
+) -> GatewayUnderTest {
     let issuer_url = spawn_discovery_only_idp().await;
 
     let oidc_client = OidcClient::discover(
@@ -241,6 +264,7 @@ async fn spawn_gateway_with(
             max_requests,
             window,
         )),
+        security_events,
     };
 
     let app = app_router(state);
@@ -388,4 +412,85 @@ async fn exceeding_the_limit_never_reaches_ms_usuarios_or_the_broker() {
     let status = submit_scan(&http, gateway.addr, &session_cookie, "192.0.2.30").await;
 
     assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+}
+
+// --- Feature `security_event_publisher` (KAP-06): `ratelimit.hit` ---
+
+/// Publicador de eventos que siempre falla: el `429` no debe notarlo.
+struct AlwaysFailingEvents;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for AlwaysFailingEvents {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+#[tokio::test]
+async fn exceeding_the_limit_emits_one_ratelimit_hit_with_route_limit_and_window() {
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        2,
+        Duration::from_secs(60),
+        spawn_happy_usuarios_stub().await,
+        Arc::new(AlwaysSucceedsPublisher),
+        events.clone(),
+    )
+    .await;
+    let http = http_client();
+    let session_cookie = session_cookie_value_for("google-sub-rl-1");
+
+    for target in ["192.0.2.10", "192.0.2.11"] {
+        let status = submit_scan(&http, gateway.addr, &session_cookie, target).await;
+        assert_eq!(status, reqwest::StatusCode::OK);
+    }
+    let third = submit_scan(&http, gateway.addr, &session_cookie, "192.0.2.12").await;
+    assert_eq!(third, reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // 2 `scan.requested` de las solicitudes aceptadas + 1 `ratelimit.hit`.
+    let emitted = events.wait_for(3).await;
+    let hits: Vec<_> = emitted
+        .iter()
+        .filter(|e| e.event_type_str() == "ratelimit.hit")
+        .map(|e| serde_json::to_value(e).expect("serializa"))
+        .collect();
+    assert_eq!(hits.len(), 1, "un evento por solicitud rechazada");
+    assert_eq!(hits[0]["actor_sub"], "google-sub-rl-1");
+    assert_eq!(
+        hits[0]["payload"],
+        json!({"route": "/api/scans", "limit": 2, "window_seconds": 60})
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_response_is_unchanged_when_the_event_publisher_fails() {
+    let gateway = spawn_gateway_with_events(
+        1,
+        Duration::from_secs(60),
+        spawn_happy_usuarios_stub().await,
+        Arc::new(AlwaysSucceedsPublisher),
+        Arc::new(AlwaysFailingEvents),
+    )
+    .await;
+    let http = http_client();
+    let session_cookie = session_cookie_value_for("google-sub-rl-1");
+
+    let _ = submit_scan(&http, gateway.addr, &session_cookie, "192.0.2.10").await;
+    let response = http
+        .post(format!("http://{}/api/scans", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={session_cookie}"),
+        )
+        .json(&json!({ "target": "192.0.2.11" }))
+        .send()
+        .await
+        .expect("POST /api/scans debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let body = response.text().await.expect("cuerpo");
+    assert!(body.contains("límite de solicitudes"), "cuerpo: {body}");
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
 }

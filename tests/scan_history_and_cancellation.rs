@@ -32,6 +32,10 @@ use gateway::broker::{
 };
 use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::{
+    NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError,
+    SecurityEventPublisher,
+};
 use gateway::sns::SnsScanPublisher;
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
@@ -146,6 +150,19 @@ async fn spawn_gateway(
     usuarios_base_url: String,
     broker_publisher: Arc<dyn ScanRequestPublisher>,
 ) -> GatewayUnderTest {
+    spawn_gateway_with_events(
+        usuarios_base_url,
+        broker_publisher,
+        Arc::new(NoopSecurityEventPublisher),
+    )
+    .await
+}
+
+async fn spawn_gateway_with_events(
+    usuarios_base_url: String,
+    broker_publisher: Arc<dyn ScanRequestPublisher>,
+    security_events: Arc<dyn SecurityEventPublisher>,
+) -> GatewayUnderTest {
     let issuer_url = spawn_discovery_only_idp().await;
 
     let oidc_client = OidcClient::discover(
@@ -182,6 +199,7 @@ async fn spawn_gateway(
             1000,
             Duration::from_secs(60),
         )),
+        security_events,
     };
 
     let app = app_router(state);
@@ -470,6 +488,130 @@ async fn accepted_cancellation_marks_the_scan_as_cancel_requested() {
 
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     assert!(gateway.scan_ownership.is_cancel_requested("scan-running"));
+}
+
+// --- Feature `security_event_publisher` (KAP-06): `scan.cancelled` ---
+
+/// Publicador de eventos que siempre falla: la cancelación no debe notarlo.
+struct AlwaysFailingEvents;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for AlwaysFailingEvents {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+/// Cede el turno: las tareas de `emit` comparten el runtime de un hilo del
+/// test, y una ausencia de evento solo es concluyente tras dejarlas correr.
+async fn let_background_tasks_run() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn running_history() -> Value {
+    json!([{
+        "scan_id": "ms-usuarios-running", "user_id": "alice", "target": "192.0.2.10",
+        "status": "EN_PROGRESO",
+        "requested_at": "2024-01-01T00:00:00Z", "updated_at": "2024-01-01T00:05:00Z",
+        "failure_reason": null,
+    }])
+}
+
+async fn cancel_running_scan(gateway: &GatewayUnderTest) -> reqwest::Response {
+    gateway.scan_ownership.register(
+        "scan-running",
+        "ms-usuarios-running".to_string(),
+        session_for("alice"),
+    );
+    http_client()
+        .post(format!(
+            "http://{}/api/scans/scan-running/cancel",
+            gateway.addr
+        ))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("POST /api/scans/.../cancel debe responder")
+}
+
+#[tokio::test]
+async fn accepted_cancellation_emits_scan_cancelled_with_scan_id_and_actor() {
+    let usuarios_base_url = spawn_usuarios_history_stub(running_history()).await;
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        usuarios_base_url,
+        Arc::new(AcceptsCancellation),
+        events.clone(),
+    )
+    .await;
+
+    let response = cancel_running_scan(&gateway).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let emitted = events.wait_for(1).await;
+    assert_eq!(emitted.len(), 1);
+    let json = serde_json::to_value(&emitted[0]).expect("serializa");
+    assert_eq!(json["event_type"], "scan.cancelled");
+    assert_eq!(json["actor_sub"], "alice");
+    assert_eq!(json["scan_id"], "scan-running");
+    assert_eq!(json["payload"], json!({}));
+}
+
+#[tokio::test]
+async fn cancellation_response_is_unchanged_when_the_event_publisher_fails() {
+    let usuarios_base_url = spawn_usuarios_history_stub(running_history()).await;
+    let gateway = spawn_gateway_with_events(
+        usuarios_base_url,
+        Arc::new(AcceptsCancellation),
+        Arc::new(AlwaysFailingEvents),
+    )
+    .await;
+
+    let response = cancel_running_scan(&gateway).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(gateway.scan_ownership.is_cancel_requested("scan-running"));
+    let_background_tasks_run().await;
+}
+
+#[tokio::test]
+async fn rejected_cancellation_emits_no_event() {
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        unreachable_usuarios_base_url().await,
+        Arc::new(NeverPublishesToBroker),
+        events.clone(),
+    )
+    .await;
+
+    // `scan-unknown` no tiene propietario registrado: 404 antes de publicar.
+    let response = http_client()
+        .post(format!(
+            "http://{}/api/scans/scan-unknown/cancel",
+            gateway.addr
+        ))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("POST /api/scans/.../cancel debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let_background_tasks_run().await;
+    assert!(events.events().is_empty());
 }
 
 #[tokio::test]

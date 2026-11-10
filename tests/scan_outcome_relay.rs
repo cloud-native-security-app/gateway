@@ -31,6 +31,7 @@ use gateway::broker::{
 };
 use gateway::domain::{Role, ScanOutcomeEvent, ScanResult, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::NoopSecurityEventPublisher;
 use gateway::sqs::SqsScanOutcomeConsumer;
 use gateway::usuarios_client::UsuariosClient;
 use gateway::wiring::ScanOutcomeRelay;
@@ -181,6 +182,7 @@ async fn spawn_gateway(usuarios_client: UsuariosClient) -> GatewayUnderTest {
             1000,
             Duration::from_secs(60),
         )),
+        security_events: Arc::new(NoopSecurityEventPublisher),
     };
 
     let app = app_router(state);
