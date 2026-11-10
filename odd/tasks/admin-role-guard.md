@@ -61,8 +61,12 @@ The gateway learns the user's role from `ms-usuarios` at login, carries it in it
 - RED ARG-04: `tests/admin_role_guard.rs` failed to compile: `unresolved import gateway::auth::require_admin`.
 - GREEN ARG-04: `admin_role_guard` 8 passed (admin 200; validly signed user 403 with body `acceso denegado`; no cookie 401; wrong-key forged admin 401; payload edited to admin 401; `alg: none` 401; header/query/cookie role hints 403; no session layer 401).
 - Final: `make verify` exit 0 (fmt, clippy `-D warnings`, unit and integration tests, ignored LocalStack suites, `cargo doc`); `cargo test --lib` 91 passed on three consecutive runs.
-- Review: no pre-commit hook is installed in this checkout (only samples); no `gentle-ai review` run by the writer. KAP-05 touches authorization, so the parent should decide whether to assess/review.
+- Review: no pre-commit hook is installed in this checkout (only samples). Native review (high risk, 20 files, 829 lines) granted by the user 2026-11-10: four lenses (risk, resilience, readability, reliability), **approved** and acknowledged (lineage `review-d8600dec84d5befb`). Non-blocking advisory findings, kept as follow-ups:
+  - R1-001 (risk, SUGGESTION, `src/api.rs:1536`): the role is snapshotted into the session JWT with no server-side revocation, so a demoted admin keeps admin authority until the session expires. Not exploitable today (no `/api/admin/*` route). **Must be resolved in KAP-09** before admin routes are mounted: re-check the role against `user-service` inside `require_admin`, or use a short TTL for admin sessions.
+  - R2-dup-callback-role-test (readability, WARNING, `tests/oidc_login.rs:1169-1225`) and R3-001 (reliability): `callback_ignores_a_role_supplied_by_the_client_request` duplicates the `login_and_read_role_claim` helper and drops its `302 FOUND` assertion.
+  - R2-duplicated-signing-key-literal (readability): the session signing key literal is repeated in test decoders and `src/auth.rs` test helpers; use one named constant.
+  - R2-role-parse-parallel-decoder (readability, `src/domain.rs:24-34`): `Role::parse` duplicates the serde lowercase mapping; derive it from serde or add a test that both paths agree on every variant.
 
 ## Next step
 
-KAP-06 (event producers) and KAP-09 (`/api/admin/*` routes behind `require_session` + `require_admin`).
+KAP-06 (event producers) and KAP-09 (`/api/admin/*` routes behind `require_session` + `require_admin`); KAP-09 must first resolve review finding R1-001 (role revocation).
