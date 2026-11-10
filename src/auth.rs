@@ -13,7 +13,7 @@
 //! [`require_session`].
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
@@ -32,6 +32,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{Role, Session};
+use crate::usuarios_client::UsuariosClient;
 
 /// Nombre de la cookie que transporta la sesión propia firmada de este
 /// Gateway.
@@ -120,6 +121,10 @@ pub enum AuthError {
     /// Mensaje deliberadamente genérico: no revela el rol ni los claims.
     #[error("acceso denegado")]
     AdminRequired,
+    /// No se pudo confirmar el rol vigente contra `ms-usuarios` (caído,
+    /// timeout o error): se deniega (fail closed). Mensaje genérico.
+    #[error("no se pudo verificar el rol")]
+    RoleCheckUnavailable,
 }
 
 impl From<ClaimsVerificationError> for AuthError {
@@ -562,25 +567,49 @@ pub async fn require_session(
 }
 
 /// Middleware `axum` que exige que la sesión ya validada sea de un
-/// administrador (`role == admin`).
+/// administrador **vigente**.
 ///
 /// Debe aplicarse **dentro** de [`require_session`] (capa más interna): este
 /// último valida firma/`exp`/`aud`/`iss` e inserta la [`Session`] cuyo `role`
-/// salió del JWT firmado por este Gateway (y, en origen, de `ms-usuarios` en
-/// el login). Responde `403` ([`AuthError::AdminRequired`]) si el rol no es
-/// `admin`. Si no encuentra ninguna [`Session`] (router mal compuesto, sin
-/// `require_session`) responde `401` en vez de dejar pasar: falla cerrado.
-pub async fn require_admin(request: Request, next: Next) -> Result<Response, AuthError> {
-    match request.extensions().get::<Session>() {
-        None => {
-            tracing::error!("require_admin montado sin require_session: se rechaza la solicitud");
-            Err(AuthError::SessionInvalid)
-        }
-        Some(session) if session.role != Role::Admin => {
-            tracing::warn!("acceso a ruta de administración denegado a una sesión sin rol admin");
+/// es una instantánea tomada en el login. Como esa instantánea puede estar
+/// desactualizada (un admin degradado conserva su JWT hasta que expire), este
+/// middleware no se fía solo del claim:
+///
+/// 1. sin [`Session`] (router mal compuesto) responde `401`;
+/// 2. claim distinto de `admin` => `403` sin consultar a `ms-usuarios`;
+/// 3. claim `admin` => reconsulta el rol vigente en `ms-usuarios`
+///    ([`UsuariosClient::current_role`], timeout corto) y solo deja pasar si
+///    sigue siendo `admin`; si ya no lo es => `403`.
+///
+/// Falla cerrado: si `ms-usuarios` no responde, tarda más que el timeout o
+/// devuelve un error, responde `503` ([`AuthError::RoleCheckUnavailable`]) y
+/// nunca deja pasar. No hay caché: las rutas de administración tienen poco
+/// tráfico y el costo es una llamada interna por request.
+pub async fn require_admin(
+    State(usuarios): State<Arc<UsuariosClient>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let Some(session) = request.extensions().get::<Session>() else {
+        tracing::error!("require_admin montado sin require_session: se rechaza la solicitud");
+        return Err(AuthError::SessionInvalid);
+    };
+
+    if session.role != Role::Admin {
+        tracing::warn!("acceso a ruta de administración denegado a una sesión sin rol admin");
+        return Err(AuthError::AdminRequired);
+    }
+
+    match usuarios.current_role(session).await {
+        Ok(Role::Admin) => Ok(next.run(request).await),
+        Ok(Role::User) => {
+            tracing::warn!("acceso a ruta de administración denegado: el rol ya no es admin");
             Err(AuthError::AdminRequired)
         }
-        Some(_) => Ok(next.run(request).await),
+        Err(error) => {
+            tracing::error!(%error, "no se pudo confirmar el rol en ms-usuarios; se deniega");
+            Err(AuthError::RoleCheckUnavailable)
+        }
     }
 }
 

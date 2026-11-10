@@ -7,16 +7,21 @@
 //! por fuera y `require_admin` por dentro. No requieren Docker.
 
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
-use axum::{middleware, Router};
+use axum::{middleware, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use gateway::auth::{
     issue_session_token, require_admin, require_session, SessionValidator, SESSION_COOKIE_NAME,
 };
 use gateway::domain::{Role, Session};
+use gateway::usuarios_client::{UsuariosClient, GATEWAY_SECRET_HEADER_NAME};
 use secrecy::SecretString;
 use tokio::net::TcpListener;
 
@@ -24,6 +29,14 @@ const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const OTHER_SIGNING_KEY: &str = "lab-only-some-other-key";
+const USUARIOS_SHARED_SECRET: &str = "lab-only-usuarios-shared-secret";
+/// Cuerpo genérico de los 401/403/503: nunca revela rol ni claims.
+const BODY_UNAUTHENTICATED: &str = "sesión inválida o ausente";
+const BODY_FORBIDDEN: &str = "acceso denegado";
+const BODY_UNAVAILABLE: &str = "no se pudo verificar el rol";
+/// Timeout corto del cliente en los tests (la verificación real usa el valor
+/// por defecto del cliente).
+const TEST_ROLE_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
 
 fn validator() -> SessionValidator {
     SessionValidator::new(
@@ -48,11 +61,83 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
+/// Comportamiento del stub de `ms-usuarios` (`GET /users/me`).
+#[derive(Clone)]
+enum UsuariosBehavior {
+    /// `200` con el perfil indicado.
+    Profile(serde_json::Value),
+    /// Responde con ese status de error.
+    Status(StatusCode),
+    /// Nunca responde (simula un servicio colgado).
+    Hang,
+}
+
+#[derive(Clone)]
+struct UsuariosStub {
+    behavior: UsuariosBehavior,
+    calls: Arc<AtomicUsize>,
+}
+
+async fn get_users_me(
+    State(stub): State<UsuariosStub>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    stub.calls.fetch_add(1, Ordering::SeqCst);
+    let secret_ok = headers
+        .get(GATEWAY_SECRET_HEADER_NAME)
+        .and_then(|v| v.to_str().ok())
+        == Some(USUARIOS_SHARED_SECRET);
+    if !secret_ok {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+    }
+    match &stub.behavior {
+        UsuariosBehavior::Profile(profile) => (StatusCode::OK, Json(profile.clone())),
+        UsuariosBehavior::Status(status) => (*status, Json(serde_json::json!({}))),
+        UsuariosBehavior::Hang => std::future::pending().await,
+    }
+}
+
+/// Levanta el stub de `ms-usuarios`; devuelve su URL base y el contador de
+/// llamadas recibidas.
+async fn spawn_usuarios_stub(behavior: UsuariosBehavior) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/users/me", get(get_users_me))
+        .with_state(UsuariosStub {
+            behavior,
+            calls: calls.clone(),
+        });
+    let addr = serve(app).await;
+    (format!("http://{addr}"), calls)
+}
+
+/// URL de un `ms-usuarios` caído: un puerto que se cerró de inmediato.
+async fn unreachable_usuarios_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+fn usuarios_client(base_url: &str) -> Arc<UsuariosClient> {
+    Arc::new(
+        UsuariosClient::new(
+            base_url.to_string(),
+            SecretString::from(USUARIOS_SHARED_SECRET.to_string()),
+        )
+        .expect("cliente de ms-usuarios")
+        .with_role_check_timeout(TEST_ROLE_CHECK_TIMEOUT),
+    )
+}
+
 /// Router de prueba con la composición real: sesión por fuera, admin dentro.
-async fn spawn_admin_router() -> SocketAddr {
+async fn spawn_admin_router(usuarios_base_url: &str) -> SocketAddr {
     let app = Router::new()
         .route("/probe", get(probe))
-        .layer(middleware::from_fn(require_admin))
+        .layer(middleware::from_fn_with_state(
+            usuarios_client(usuarios_base_url),
+            require_admin,
+        ))
         .layer(middleware::from_fn_with_state(validator(), require_session));
     serve(app).await
 }
@@ -92,59 +177,173 @@ async fn get_probe(addr: SocketAddr, cookie_value: Option<&str>) -> reqwest::Res
     request.send().await.expect("GET /probe debe responder")
 }
 
+/// Asserts de cuerpo genérico: ni rol ni claims se filtran.
+async fn assert_generic_body(response: reqwest::Response, expected: &str) {
+    let body = response.text().await.unwrap();
+    assert_eq!(body, expected);
+    for leaked in ["user", "admin", "role", "google-sub-123", "example.com"] {
+        assert!(
+            !body.contains(leaked),
+            "el cuerpo no debe filtrar `{leaked}`"
+        );
+    }
+}
+
 #[tokio::test]
-async fn admin_session_reaches_the_admin_route() {
-    let addr = spawn_admin_router().await;
+async fn admin_claim_confirmed_by_ms_usuarios_reaches_the_admin_route() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
 
     let response = get_probe(addr, Some(&token)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "admin-only-content");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// R1-001: un admin degradado en `ms-usuarios` con un JWT admin todavía
+/// vigente ya no accede.
+#[tokio::test]
+async fn demoted_admin_with_a_still_valid_admin_jwt_gets_403() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "user"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = get_probe(addr, Some(&token)).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_generic_body(response, BODY_FORBIDDEN).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Fail closed: un perfil sin `role` o con un valor desconocido no confirma
+/// a un administrador.
+#[tokio::test]
+async fn missing_or_unknown_role_in_ms_usuarios_does_not_confirm_admin() {
+    for profile in [
+        serde_json::json!({"display_name": "x"}),
+        serde_json::json!({"role": "superuser"}),
+        serde_json::json!({"role": null}),
+    ] {
+        let (url, _calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(profile)).await;
+        let addr = spawn_admin_router(&url).await;
+        let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+        let response = get_probe(addr, Some(&token)).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_generic_body(response, BODY_FORBIDDEN).await;
+    }
+}
+
+/// Fail closed: si `ms-usuarios` no se puede consultar, nunca se permite.
+#[tokio::test]
+async fn ms_usuarios_error_response_fails_closed_with_503() {
+    let (url, _calls) =
+        spawn_usuarios_stub(UsuariosBehavior::Status(StatusCode::INTERNAL_SERVER_ERROR)).await;
+    let addr = spawn_admin_router(&url).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = get_probe(addr, Some(&token)).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_generic_body(response, BODY_UNAVAILABLE).await;
 }
 
 #[tokio::test]
-async fn validly_signed_user_session_gets_403_without_leaking_role_or_claims() {
-    let addr = spawn_admin_router().await;
+async fn unreachable_ms_usuarios_fails_closed_with_503() {
+    let addr = spawn_admin_router(&unreachable_usuarios_url().await).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = get_probe(addr, Some(&token)).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_generic_body(response, BODY_UNAVAILABLE).await;
+}
+
+/// Un `ms-usuarios` colgado no retiene la request más allá del timeout corto
+/// del cliente y tampoco deja pasar.
+#[tokio::test]
+async fn hanging_ms_usuarios_times_out_and_fails_closed_with_503() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Hang).await;
+    let addr = spawn_admin_router(&url).await;
+    let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), get_probe(addr, Some(&token)))
+        .await
+        .expect("la request debe terminar por el timeout del cliente");
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_generic_body(response, BODY_UNAVAILABLE).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Un claim `user` se rechaza sin tocar a `ms-usuarios`.
+#[tokio::test]
+async fn validly_signed_user_session_gets_403_without_calling_ms_usuarios() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let token = token_for(Role::User, SESSION_SIGNING_KEY);
 
     let response = get_probe(addr, Some(&token)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-    let body = response.text().await.unwrap();
-    assert_eq!(body, "acceso denegado");
-    for leaked in ["user", "admin", "role", "google-sub-123", "example.com"] {
-        assert!(!body.contains(leaked), "el 403 no debe filtrar `{leaked}`");
-    }
+    assert_generic_body(response, BODY_FORBIDDEN).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn missing_session_cookie_gets_401_not_403() {
-    let addr = spawn_admin_router().await;
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
 
     let response = get_probe(addr, None).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(response.text().await.unwrap(), "sesión inválida o ausente");
+    assert_generic_body(response, BODY_UNAUTHENTICATED).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 /// Un JWT con `role: admin` firmado con otra clave (forjado) se rechaza con
-/// 401: nunca llega a evaluarse el rol.
+/// 401: nunca llega a evaluarse el rol ni a consultarse `ms-usuarios`.
 #[tokio::test]
 async fn forged_admin_token_with_wrong_signing_key_gets_401() {
-    let addr = spawn_admin_router().await;
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let forged = token_for(Role::Admin, OTHER_SIGNING_KEY);
 
     let response = get_probe(addr, Some(&forged)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_generic_body(response, BODY_UNAUTHENTICATED).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 /// Un token legítimo de `user` cuyo payload se reescribe a `role: admin`
 /// conservando la firma original se rechaza con 401.
 #[tokio::test]
 async fn user_token_with_payload_edited_to_admin_gets_401() {
-    let addr = spawn_admin_router().await;
+    let (url, _calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let token = token_for(Role::User, SESSION_SIGNING_KEY);
     let mut parts = token.split('.').map(str::to_string).collect::<Vec<_>>();
     let payload = URL_SAFE_NO_PAD.decode(&parts[1]).expect("payload base64");
@@ -156,12 +355,17 @@ async fn user_token_with_payload_edited_to_admin_gets_401() {
     let response = get_probe(addr, Some(&tampered)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_generic_body(response, BODY_UNAUTHENTICATED).await;
 }
 
 /// Un token sin firma (`alg: none`) con `role: admin` se rechaza con 401.
 #[tokio::test]
 async fn unsigned_alg_none_admin_token_gets_401() {
-    let addr = spawn_admin_router().await;
+    let (url, _calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&serde_json::json!({
@@ -175,12 +379,17 @@ async fn unsigned_alg_none_admin_token_gets_401() {
     let response = get_probe(addr, Some(&unsigned)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_generic_body(response, BODY_UNAUTHENTICATED).await;
 }
 
 /// Ningún header, query ni cookie adicional puede elevar a un `user`.
 #[tokio::test]
 async fn client_supplied_role_hints_do_not_elevate_a_user() {
-    let addr = spawn_admin_router().await;
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
+    let addr = spawn_admin_router(&url).await;
     let token = token_for(Role::User, SESSION_SIGNING_KEY);
 
     let response = reqwest::Client::new()
@@ -196,19 +405,30 @@ async fn client_supplied_role_hints_do_not_elevate_a_user() {
         .expect("GET /probe debe responder");
 
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_generic_body(response, BODY_FORBIDDEN).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 /// Si `require_admin` se monta sin `require_session` (router mal armado) no
 /// deja pasar la request: responde 401 en vez de asumir un rol.
 #[tokio::test]
 async fn require_admin_without_a_session_layer_fails_closed() {
+    let (url, calls) = spawn_usuarios_stub(UsuariosBehavior::Profile(
+        serde_json::json!({"role": "admin"}),
+    ))
+    .await;
     let app = Router::new()
         .route("/probe", get(probe))
-        .layer(middleware::from_fn(require_admin));
+        .layer(middleware::from_fn_with_state(
+            usuarios_client(&url),
+            require_admin,
+        ));
     let addr = serve(app).await;
     let token = token_for(Role::Admin, SESSION_SIGNING_KEY);
 
     let response = get_probe(addr, Some(&token)).await;
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_generic_body(response, BODY_UNAUTHENTICATED).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
