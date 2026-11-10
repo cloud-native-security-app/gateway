@@ -1,0 +1,61 @@
+# admin-role-guard (KAP-05)
+
+Feature id: `admin-role-guard` | Branch: `feature/admin_role_guard` (from `origin/develop` b292ed3)
+
+Master plan: repo `infra`, path `odd/tasks/kinesis-admin-panel.md` (task KAP-05). Producer of the role: `user-service/odd/tasks/user-role.md` (KAP-04). Consumers: KAP-09 (`/api/admin/*`) and KAP-10 (front).
+
+## Objective
+
+The gateway learns the user's role from `ms-usuarios` at login, carries it in its own session JWT as a `role` claim, exposes it in `GET /api/me`, and offers a reusable `require_admin` guard that answers `403` to non-admins.
+
+## Scope
+
+- `usuarios_client`: parse `role` from the profile returned by `PUT /users/me` into `domain::Role` (`user`/`admin`).
+- Login (`/auth/callback`): put that role in `Session` and in the signed JWT (`role`, lowercase).
+- `auth::require_admin`: middleware layer that runs after `require_session` and requires `role == admin`.
+- `GET /api/me` returns `role`; OpenAPI schema updated.
+- No admin route is added here (KAP-09). The guard is proven on a test-only router.
+- Out of scope: any way to change a role (lives in `user-service`), server-side session revocation.
+
+## Constraints
+
+- Security-sensitive (authorization): the role is authoritative only from `ms-usuarios` at login. No header, query, cookie value or body field set by the client can set it; only a token signed with the gateway key is trusted.
+- Fail closed to least privilege: every missing or unrecognized role resolves to `user`, never to `admin`.
+- Error bodies follow the existing plain-text convention and never leak the role or any claim.
+- Unit tests do not mutate the process environment and have no wall-clock waits.
+- Docs and code comments in neutral Spanish like the rest of this repo; identifiers in English; this doc in English like the other `odd/tasks` docs.
+
+## Decisions
+
+- D1 Claim: `role`, lowercase string `"user"` / `"admin"` (same wire format as `user-service`). `domain::Role` implements `Default = User`.
+- D2 Missing `role` in the `ms-usuarios` profile (older `user-service`): `User`, silently (backward compatible).
+- D3 Unknown `role` value in the profile (contract drift): `User` plus a `tracing::warn!` that carries no personal data and not the received value. Never `admin`.
+- D4 JWT without `role` claim (issued before this change): decodes as `User` (`#[serde(default)]`), never admin. A token whose `role` is a value the gateway does not know fails to decode, so the session is rejected (`401`).
+- D5 `require_admin` is a middleware layer (same style as `require_session`) and must be applied inside it. If it ever runs without a `Session` extension (misconfigured router) it answers `401`, never lets the request through.
+- D6 `403` body is the generic text `acceso denegado`; `401` stays `sesión inválida o ausente`.
+
+## Tooling
+
+- TDD mode: on (source: user global config "Strict TDD Mode: enabled"); runner `make verify` (`cargo test -- --ignored` needs Docker).
+- Route: delegated direct, single writer. Review policy: authorization, so a review is allowed.
+
+## Checklist
+
+- [x] ARG-01 Feature doc.
+- [ ] ARG-02 `domain::Role`, `usuarios_client::role_from_profile` (missing and unknown handling), tests first.
+- [ ] ARG-03 `Session.role`, `role` claim, login wiring, `GET /api/me` `role`, OpenAPI.
+- [ ] ARG-04 `auth::require_admin`, `AuthError::AdminRequired` (`403`), forged-token and non-admin tests.
+- [ ] ARG-05 `docs/security-scope.md`, `docs/architecture.md`, this doc closed.
+
+## Known limitations
+
+- A role change in `user-service` (grant or revoke) takes effect at the user's next login: the role lives in the session JWT until it expires (`session_ttl_secs`). There is no server-side revocation (already a documented limit of this gateway).
+- The gateway trusts the `role` field of the `PUT /users/me` response; it relies on `user-service` never accepting a role from a request body (KAP-04).
+
+## Evidence
+
+(filled per task)
+
+## Next step
+
+KAP-06 (event producers) and KAP-09 (`/api/admin/*` routes behind `require_session` + `require_admin`).
