@@ -26,7 +26,7 @@ lint:
 test:
 	cargo test
 
-# Integration tests against a real LocalStack (SNS/SQS, localstack/localstack:4.4)
+# Integration tests against a real LocalStack (SNS/SQS/Kinesis, localstack/localstack:4.4)
 # via testcontainers (requires Docker); no AWS account or credentials needed.
 test-integration:
 	cargo test -- --ignored

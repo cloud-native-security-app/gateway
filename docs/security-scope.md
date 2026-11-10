@@ -85,7 +85,12 @@
   `sqs:ReceiveMessage`/`DeleteMessage`/`ChangeMessageVisibility` sobre la cola
   de resultados más `sqs:SendMessage` sobre su DLQ (los define `broker`/
   Terraform, no este repo).
-- Toda conexión a SNS/SQS usa HTTPS (SDK de AWS). `AWS_ENDPOINT_URL` (HTTP a
+- Eventos de seguridad (Kinesis, KAP-06): `kinesis:PutRecord` sobre el stream
+  `security-events` (rol de la tarea ECS, definido en `infra`). Los eventos no
+  llevan correos, tokens, credenciales, cuerpos de mensaje ni salida de
+  escaneos; los constructores de `SecurityEvent` rechazan valores que el schema
+  no admite y los logs de fallo solo nombran el tipo de evento.
+- Toda conexión a SNS/SQS/Kinesis usa HTTPS (SDK de AWS). `AWS_ENDPOINT_URL` (HTTP a
   LocalStack) existe solo para desarrollo y tests locales.
 - El cuerpo completo de un `ScanRequest` (que lleva `ssh_credentials_ref`,
   una credencial SSH real) **nunca** se loggea de forma persistente a

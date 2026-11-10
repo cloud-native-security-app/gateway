@@ -43,15 +43,42 @@ The gateway publishes immutable security events to the Kinesis stream `security-
 
 ## Checklist
 
-- [x] SEP-01 Feature doc.
-- [ ] SEP-02 `SecurityEvent` envelope, port, recorder and no-op adapters, schema parity tests (tests first).
-- [ ] SEP-03 Kinesis adapter, `SECURITY_EVENTS_STREAM_NAME`, wiring, LocalStack test.
-- [ ] SEP-04 Emission points with failure-isolation tests.
-- [ ] SEP-05 `docs/architecture.md`, README env table, this doc closed.
+- [x] SEP-01 Feature doc (d9171f2).
+- [x] SEP-02 `SecurityEvent` envelope, port, recorder and no-op adapters, `emit`, schema parity tests (579ed7a).
+- [x] SEP-03 Kinesis adapter, `SECURITY_EVENTS_STREAM_NAME`, wiring, LocalStack tests; also the `message.deadlettered` emission in the SQS consumer, since it needed the same wiring (b360828).
+- [x] SEP-04 Emission points `scan.requested`, `scan.cancelled`, `auth.login`, `auth.logout`, `ratelimit.hit`, each with a failing-publisher test (26422ca).
+- [x] SEP-05 `docs/architecture.md`, `docs/security-scope.md`, README env table, this doc closed (docs commit on top of 26422ca).
+
+## Emission points
+
+| Event | Where | Condition |
+|---|---|---|
+| `scan.requested` | `src/api.rs` `submit_scan` | after `publish_scan_request` succeeded |
+| `scan.cancelled` | `src/api.rs` `cancel_scan` | after `publish_scan_cancellation` succeeded |
+| `auth.login` | `src/api.rs` `callback` | after the session token was issued |
+| `auth.logout` | `src/api.rs` `logout` | only with a valid session cookie |
+| `ratelimit.hit` | `src/api.rs` `rate_limit_scan_submission` | each rejected request, before the 429 |
+| `message.deadlettered` | `src/sqs.rs` `SqsScanOutcomeConsumer::process` | after the malformed message was copied to the DLQ |
 
 ## Evidence
 
-(Filled per task.)
+- Contract parity: `tests/security_event_contract.rs` reads `../broker/contracts/` at test time (prints SKIP and passes if absent). Every constructor output validates against the schema (`jsonschema` 0.56, same as broker), and the 11 broker examples deserialize into `SecurityEvent` and round-trip exactly.
+- RED SEP-02: `cargo test --lib --no-run` failed with 60 compile errors (`SecurityEvent`, `emit`, publishers not found) after writing the unit tests first.
+- GREEN SEP-02: 13 `security_events` unit tests and 3 contract tests passed; clippy `-D warnings` clean.
+- RED SEP-03: `cargo test --lib config` failed to compile (`parse_stream_name`, `ConfigError::InvalidStreamName` missing). The LocalStack tests (`kinesis_publisher_localstack`, `wiring_localstack`, `sqs_consumer_localstack`) were written first and did not compile until the adapter existed.
+- GREEN SEP-03: `cargo test -- --ignored` for the three suites passed (Kinesis round trip with schema validation and partition keys, missing stream gives `PublishFailed` without the body, wiring publishes through `AppState.security_events`, malformed message emits `message.deadlettered` with queue and reason code only).
+- RED SEP-04: the positive tests failed before the handlers emitted (`oidc_login`: login and logout; `scan_submission`: scan.requested; `rate_limiting`: ratelimit.hit). For `scan_history_and_cancellation` the emission was written before its test, so RED was checked by temporarily corrupting the emitted actor: the positive test failed, then the code was restored.
+- GREEN SEP-04: every flow has a test where the publisher always fails and the HTTP response is identical (302 with cookie, 204, 200 with `scanId`, 202, 429 with the same body), and tests where no event is emitted on rejection (broker failure, bad callback, invalid logout cookie, unknown scan).
+- `emit` timeout: `emit_gives_up_on_a_hanging_publisher_after_the_timeout` uses a paused tokio clock (`test-util`), no wall-clock wait.
+- Dependency: `aws-sdk-kinesis` 1.125.0 is the newest release compatible with the `aws-runtime` 1.10.0 / `aws-smithy-runtime` 1.16.0 already in the lock; `Cargo.lock` changed only by additions.
+- Final: `make verify` exit 0 (fmt, clippy `-D warnings`, unit and integration tests, ignored LocalStack suites, `cargo doc`); `cargo test --lib` 107 passed on three consecutive runs.
+- Review: none run (stored user policy: decline; this task touches no permission or secret).
+
+## Known limitations
+
+- An event can be lost if the process dies (or `gateway::run` returns) before the spawned task publishes; no retry or outbox. Acceptable: events are observability facts.
+- `auth.logout` with an expired or invalid cookie, and `scan.cancelled` target, are not reported (see D2, D6).
+- `ratelimit.hit` volume equals the rejected-request volume; a flooding client produces one Kinesis write per rejected request (1 shard, 1000 records/s). Add sampling if KAP-11 shows pressure.
 
 ## Next step
 
