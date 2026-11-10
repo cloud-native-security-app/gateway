@@ -114,18 +114,3 @@ fn every_route_in_the_canonical_table_is_documented_in_the_generated_openapi_spe
         );
     }
 }
-
-/// Feature `admin-role-guard`: `GET /api/me` documenta el campo `role`
-/// (`user`/`admin`) para que `front` pueda mostrar u ocultar el acceso de
-/// administración.
-#[test]
-fn me_response_schema_documents_the_role_field() {
-    let spec = generated_spec_as_json();
-    let me = &spec["components"]["schemas"]["MeResponse"];
-    assert!(
-        me["properties"]["role"].is_object(),
-        "MeResponse debe declarar `role`: {me}"
-    );
-    let role = &spec["components"]["schemas"]["Role"];
-    assert_eq!(role["enum"], serde_json::json!(["user", "admin"]));
-}
