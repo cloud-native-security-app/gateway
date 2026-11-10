@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use gateway::broker::{ScanOutcomeHandler, ScanRequest, ROUTING_KEY_SCAN_REQUEST};
 use gateway::config::Config;
 use gateway::domain::ScanOutcomeEvent;
+use gateway::security_events::SecurityEvent;
 use gateway::wiring;
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -63,21 +64,15 @@ impl ScanOutcomeHandler for RecordingHandler {
     }
 }
 
-#[tokio::test]
-#[ignore = "requiere Docker"]
-async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
-    let localstack = common::LocalStack::start().await;
-    let (requests_arn, requests_queue) = localstack.topic_with_queue("scan-requests").await;
-    let (cancellations_arn, _cancellations_queue) =
-        localstack.topic_with_queue("scan-cancellations").await;
-    let (outcomes_queue, outcomes_dlq) = localstack.outcomes_queue_with_dlq().await;
-
-    // `connect` usa la cadena de credenciales por defecto de AWS.
-    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-
-    let issuer_url = spawn_discovery_only_idp().await;
-    let config = Config {
+/// `Config` del gateway apuntada a `localstack` y a los recursos dados.
+fn gateway_config(
+    localstack: &common::LocalStack,
+    issuer_url: String,
+    (requests_arn, cancellations_arn): (String, String),
+    (outcomes_queue, outcomes_dlq): (&str, &str),
+    security_events_stream_name: Option<String>,
+) -> Config {
+    Config {
         http_host: "127.0.0.1".to_string(),
         http_port: 0,
         google_client_id: "test-client-id".to_string(),
@@ -98,7 +93,31 @@ async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
         scan_cancellations_topic_arn: cancellations_arn,
         scan_outcomes_queue_url: outcomes_queue.parse().expect("queue url válida"),
         scan_outcomes_dlq_url: outcomes_dlq.parse().expect("dlq url válida"),
-    };
+        security_events_stream_name,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
+    let localstack = common::LocalStack::start().await;
+    let (requests_arn, requests_queue) = localstack.topic_with_queue("scan-requests").await;
+    let (cancellations_arn, _cancellations_queue) =
+        localstack.topic_with_queue("scan-cancellations").await;
+    let (outcomes_queue, outcomes_dlq) = localstack.outcomes_queue_with_dlq().await;
+
+    // `connect` usa la cadena de credenciales por defecto de AWS.
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+
+    let issuer_url = spawn_discovery_only_idp().await;
+    let config = gateway_config(
+        &localstack,
+        issuer_url,
+        (requests_arn, cancellations_arn),
+        (&outcomes_queue, &outcomes_dlq),
+        None,
+    );
 
     let built = wiring::build(config).await.expect("build debe completarse");
 
@@ -157,4 +176,40 @@ async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
         .await
         .expect("el consumidor debe detenerse")
         .expect("sin panic");
+}
+
+#[tokio::test]
+#[ignore = "requiere Docker"]
+async fn build_wires_the_kinesis_publisher_when_the_stream_name_is_configured() {
+    let localstack = common::LocalStack::start().await;
+    let (requests_arn, _) = localstack.topic_with_queue("scan-requests").await;
+    let (cancellations_arn, _) = localstack.topic_with_queue("scan-cancellations").await;
+    let (outcomes_queue, outcomes_dlq) = localstack.outcomes_queue_with_dlq().await;
+    localstack.create_stream("security-events").await;
+
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+
+    let issuer_url = spawn_discovery_only_idp().await;
+    let config = gateway_config(
+        &localstack,
+        issuer_url,
+        (requests_arn, cancellations_arn),
+        (&outcomes_queue, &outcomes_dlq),
+        Some("security-events".to_string()),
+    );
+    let built = wiring::build(config).await.expect("build debe completarse");
+
+    built
+        .state
+        .security_events
+        .publish(&SecurityEvent::auth_login("user-sub-123").expect("evento válido"))
+        .await
+        .expect("publicar a través del wiring");
+
+    let records = localstack.read_stream("security-events", 1).await;
+    assert_eq!(records.len(), 1);
+    let body: Value = serde_json::from_slice(records[0].data().as_ref()).expect("JSON");
+    assert_eq!(body["event_type"], "auth.login");
+    assert_eq!(body["actor_sub"], "user-sub-123");
 }

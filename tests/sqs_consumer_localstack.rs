@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use gateway::broker::ScanOutcomeHandler;
 use gateway::domain::ScanOutcomeEvent;
+use gateway::security_events::{RecordingSecurityEventPublisher, SecurityEventPublisher};
 use gateway::sqs::SqsScanOutcomeConsumer;
 
 const LOCALSTACK_TAG: &str = "4.4";
@@ -230,8 +231,11 @@ async fn malformed_body_goes_to_dlq_with_routing_key_and_is_removed_from_source(
     send(&sqs, &source, bad).await;
 
     let handler = Arc::new(RecordingHandler::default());
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let events_port: Arc<dyn SecurityEventPublisher> = events.clone();
     let token = CancellationToken::new();
-    let consumer = SqsScanOutcomeConsumer::from_client(sqs.clone(), source.clone(), dlq.clone());
+    let consumer = SqsScanOutcomeConsumer::from_client(sqs.clone(), source.clone(), dlq.clone())
+        .with_security_events(events_port);
     let task = tokio::spawn(consumer.run(handler.clone(), token.clone()));
 
     let in_dlq = receive_one(&sqs, &dlq, 10)
@@ -249,6 +253,22 @@ async fn malformed_body_goes_to_dlq_with_routing_key_and_is_removed_from_source(
     task.await.expect("run termina");
     assert_eq!(pending(&sqs, &source).await, 0, "fuera de la cola fuente");
     assert_eq!(handler.count(), 0, "el handler nunca se invoca");
+
+    // Feature `security_event_publisher`: un `message.deadlettered` con la
+    // cola fuente y un código de motivo, sin el cuerpo del mensaje.
+    let emitted = events.wait_for(1).await;
+    assert_eq!(emitted.len(), 1, "un solo evento por mensaje malformado");
+    let json = serde_json::to_value(&emitted[0]).expect("serializa");
+    assert_eq!(json["event_type"], "message.deadlettered");
+    assert_eq!(json["source"], "gateway");
+    assert_eq!(
+        json["payload"],
+        serde_json::json!({"queue": "gateway-scan-outcomes", "reason_code": "malformed_message"})
+    );
+    assert!(
+        !json.to_string().contains("correlation_id"),
+        "sin el cuerpo"
+    );
 }
 
 #[tokio::test]

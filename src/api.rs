@@ -40,6 +40,7 @@ use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::realtime::RealtimeRegistry;
+use crate::security_events::SecurityEventPublisher;
 use crate::usuarios_client::{
     role_from_profile, CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry,
     ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
@@ -356,6 +357,11 @@ pub struct AppState {
     /// Limitador de tasa por usuario aplicado a `POST /api/scans` (RF-12,
     /// feature `rate_limiting`, ver [`ScanSubmissionRateLimiter`]).
     pub scan_submission_rate_limiter: Arc<ScanSubmissionRateLimiter>,
+    /// Publicador de eventos de seguridad hacia Kinesis (feature
+    /// `security_event_publisher`, ver [`crate::security_events`]). Los
+    /// handlers lo usan solo a través de [`crate::security_events::emit`]:
+    /// un fallo de publicación nunca altera la respuesta HTTP.
+    pub security_events: Arc<dyn SecurityEventPublisher>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:

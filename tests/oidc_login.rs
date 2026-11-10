@@ -22,6 +22,7 @@ use gateway::api::{auth_router, AppState, ScanOwnershipRegistry, ScanSubmissionR
 use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::NoopSecurityEventPublisher;
 use gateway::usuarios_client::{UsuariosClient, FORWARDED_USER_HEADER_NAME};
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
@@ -385,6 +386,7 @@ async fn spawn_gateway(oidc_issuer_url: &str, usuarios_base_url: &str) -> Gatewa
             1000,
             Duration::from_secs(60),
         )),
+        security_events: Arc::new(NoopSecurityEventPublisher),
     };
 
     let app = auth_router(state);

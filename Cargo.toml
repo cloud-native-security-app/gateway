@@ -54,6 +54,12 @@ tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
 aws-sdk-sns = "1.116.0"
+# `aws-sdk-kinesis` para publicar `SecurityEvent` en el stream `security-events`
+# (`src/kinesis.rs`, feature `security_event_publisher`). Se fija `1.125.0` porque
+# es el último lanzamiento que acepta el `aws-runtime` 1.10.0 /
+# `aws-smithy-runtime` 1.16.0 que ya fija el lock para `aws-sdk-sns`/`-sqs`
+# (versiones posteriores obligan a subir esas crates compartidas).
+aws-sdk-kinesis = "1.125.0"
 # `aws-sdk-sqs` (promovida de dev-dependency en MSG-GW-03) para el consumidor SQS;
 # `tokio-util` aporta `CancellationToken`, la señal de shutdown de `SqsScanOutcomeConsumer::run`.
 aws-sdk-sqs = "1.114.0"

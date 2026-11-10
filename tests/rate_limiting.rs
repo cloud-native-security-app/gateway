@@ -22,6 +22,7 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
 use gateway::realtime::RealtimeRegistry;
+use gateway::security_events::NoopSecurityEventPublisher;
 use gateway::usuarios_client::UsuariosClient;
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -241,6 +242,7 @@ async fn spawn_gateway_with(
             max_requests,
             window,
         )),
+        security_events: Arc::new(NoopSecurityEventPublisher),
     };
 
     let app = app_router(state);

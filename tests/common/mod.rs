@@ -1,5 +1,5 @@
 //! Arnés compartido de los tests de integración que corren contra un
-//! LocalStack real (SNS + SQS) levantado con `testcontainers` — sin mocks y
+//! LocalStack real (SNS + SQS + Kinesis) levantado con `testcontainers` — sin mocks y
 //! sin cuenta AWS. Cada test levanta su propio contenedor, así que los
 //! nombres de topics/colas nunca colisionan entre tests.
 
@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use aws_sdk_kinesis::types::{Record, ShardIteratorType, StreamStatus};
 use aws_sdk_sns::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_sqs::types::{Message, MessageAttributeValue, QueueAttributeName};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -18,13 +19,14 @@ use testcontainers::{ContainerAsync, GenericImage};
 pub const LOCALSTACK_TAG: &str = "4.4";
 pub const REGION: &str = "us-east-1";
 
-/// LocalStack en marcha más clientes SNS/SQS ya apuntados a él. El
+/// LocalStack en marcha más clientes SNS/SQS/Kinesis ya apuntados a él. El
 /// contenedor se destruye al soltar este valor.
 pub struct LocalStack {
     _container: ContainerAsync<GenericImage>,
     pub endpoint: String,
     pub sns: aws_sdk_sns::Client,
     pub sqs: aws_sdk_sqs::Client,
+    pub kinesis: aws_sdk_kinesis::Client,
 }
 
 impl LocalStack {
@@ -57,12 +59,96 @@ impl LocalStack {
                 .credentials_provider(credentials())
                 .build(),
         );
+        let kinesis = aws_sdk_kinesis::Client::from_conf(
+            aws_sdk_kinesis::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new(REGION))
+                .endpoint_url(&endpoint)
+                .credentials_provider(credentials())
+                .build(),
+        );
         Self {
             _container: container,
             endpoint,
             sns,
             sqs,
+            kinesis,
         }
+    }
+
+    /// Crea el stream Kinesis `name` de 1 shard y espera a que esté `ACTIVE`
+    /// (sin dormir de más: sondea con tope de intentos).
+    pub async fn create_stream(&self, name: &str) {
+        self.kinesis
+            .create_stream()
+            .stream_name(name)
+            .shard_count(1)
+            .send()
+            .await
+            .expect("crear el stream");
+        for _ in 0..100 {
+            let status = self
+                .kinesis
+                .describe_stream_summary()
+                .stream_name(name)
+                .send()
+                .await
+                .expect("describir el stream")
+                .stream_description_summary
+                .expect("resumen del stream")
+                .stream_status;
+            if status == StreamStatus::Active {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("el stream {name} no llegó a ACTIVE");
+    }
+
+    /// Lee desde el principio (`TRIM_HORIZON`) del único shard de `stream`
+    /// hasta reunir `expected` registros (o agotar los intentos).
+    pub async fn read_stream(&self, stream: &str, expected: usize) -> Vec<Record> {
+        let shard_id = self
+            .kinesis
+            .list_shards()
+            .stream_name(stream)
+            .send()
+            .await
+            .expect("listar shards")
+            .shards
+            .expect("shards")
+            .remove(0)
+            .shard_id;
+        let mut iterator = self
+            .kinesis
+            .get_shard_iterator()
+            .stream_name(stream)
+            .shard_id(shard_id)
+            .shard_iterator_type(ShardIteratorType::TrimHorizon)
+            .send()
+            .await
+            .expect("iterador del shard")
+            .shard_iterator;
+        let mut records = Vec::new();
+        for _ in 0..50 {
+            let Some(current) = iterator.take() else {
+                break;
+            };
+            let out = self
+                .kinesis
+                .get_records()
+                .shard_iterator(current)
+                .send()
+                .await
+                .expect("leer registros");
+            records.extend(out.records);
+            if records.len() >= expected {
+                break;
+            }
+            iterator = out.next_shard_iterator;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        records
     }
 
     async fn queue_arn(&self, queue_url: &str) -> String {

@@ -34,6 +34,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::broker::{BrokerError, ScanOutcomeHandler};
 use crate::domain::ScanOutcomeEvent;
+use crate::security_events::{
+    emit, NoopSecurityEventPublisher, SecurityEvent, SecurityEventPublisher,
+};
 use crate::sns::ROUTING_KEY_ATTRIBUTE;
 
 /// Espera máxima del long polling de `ReceiveMessage`, en segundos.
@@ -45,13 +48,27 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// Tope del backoff exponencial.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Código de motivo de `message.deadlettered` para un cuerpo que no se pudo
+/// decodificar como [`ScanOutcomeEvent`].
+const REASON_MALFORMED_MESSAGE: &str = "malformed_message";
+
 /// Consumidor de la cola SQS de resultados de escaneo, con su DLQ para los
 /// mensajes malformados.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SqsScanOutcomeConsumer {
     client: Client,
     queue_url: String,
     dlq_url: String,
+    security_events: Arc<dyn SecurityEventPublisher>,
+}
+
+impl std::fmt::Debug for SqsScanOutcomeConsumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqsScanOutcomeConsumer")
+            .field("queue_url", &self.queue_url)
+            .field("dlq_url", &self.dlq_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqsScanOutcomeConsumer {
@@ -62,7 +79,19 @@ impl SqsScanOutcomeConsumer {
             client,
             queue_url,
             dlq_url,
+            security_events: Arc::new(NoopSecurityEventPublisher),
         }
+    }
+
+    /// Reemplaza el publicador de eventos de seguridad (por defecto, no-op):
+    /// con él, cada mensaje malformado enviado a la DLQ emite un
+    /// `message.deadlettered` (feature `security_event_publisher`).
+    pub fn with_security_events(
+        mut self,
+        security_events: Arc<dyn SecurityEventPublisher>,
+    ) -> Self {
+        self.security_events = security_events;
+        self
     }
 
     /// Construye el consumidor con la cadena de credenciales por defecto de
@@ -157,6 +186,14 @@ impl SqsScanOutcomeConsumer {
                     );
                     return;
                 }
+                // Solo tras copiarlo a la DLQ; nunca lleva el cuerpo.
+                emit(
+                    &self.security_events,
+                    SecurityEvent::message_deadlettered(
+                        queue_name_of(&self.queue_url),
+                        REASON_MALFORMED_MESSAGE,
+                    ),
+                );
                 if let Err(err) = self.delete(&self.queue_url, receipt_handle).await {
                     tracing::error!(
                         error = %err,
@@ -215,6 +252,15 @@ fn routing_key_of(message: &Message) -> Option<&str> {
 }
 
 /// Siguiente espera del backoff: el doble, con tope en [`BACKOFF_MAX`].
+/// Nombre de la cola: último segmento de su URL (`.../123456789012/<nombre>`).
+fn queue_name_of(queue_url: &str) -> &str {
+    queue_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+}
+
 fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(BACKOFF_MAX)
 }
@@ -232,6 +278,18 @@ mod tests {
             seen.push(d.as_secs());
         }
         assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    #[test]
+    fn queue_name_is_the_last_url_segment() {
+        assert_eq!(
+            queue_name_of("https://sqs.us-east-1.amazonaws.com/123456789012/gateway-scan-outcomes"),
+            "gateway-scan-outcomes"
+        );
+        assert_eq!(
+            queue_name_of("http://localhost:4566/000000000000/gateway-scan-outcomes/"),
+            "gateway-scan-outcomes"
+        );
     }
 
     #[test]
