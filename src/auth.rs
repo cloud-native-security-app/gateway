@@ -386,9 +386,24 @@ struct SessionClaims {
     iss: String,
     /// Rol firmado en el login. Un token emitido antes de esta feature no lo
     /// lleva y se decodifica como `user` (nunca `admin`); un valor
-    /// desconocido hace fallar la decodificación (sesión rechazada).
-    #[serde(default)]
+    /// desconocido también degrada a `user` (ver [`lenient_role`]).
+    #[serde(default, deserialize_with = "lenient_role")]
     role: Role,
+}
+
+/// Decodifica el claim `role` sin rechazar la sesión: cualquier valor que no
+/// sea un rol conocido (otro rol futuro, tipo equivocado, `null`) degrada a
+/// [`Role::User`] y emite un `warn` que no incluye el valor recibido ni datos
+/// personales. Nunca produce `admin` salvo por el valor exacto `"admin"`.
+fn lenient_role<'de, D>(deserializer: D) -> Result<Role, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().and_then(Role::parse).unwrap_or_else(|| {
+        tracing::warn!("claim `role` no reconocido en la sesión; se usa `user`");
+        Role::User
+    }))
 }
 
 /// Emite la sesión propia de este Gateway (JWT firmado con `jsonwebtoken`)
@@ -642,19 +657,31 @@ mod tests {
         assert_eq!(validated.role, Role::User);
     }
 
+    /// Un valor de `role` desconocido (otro rol futuro, tipo equivocado) no
+    /// invalida la sesión: degrada a `user`, nunca a `admin`.
     #[test]
-    fn token_with_unknown_role_claim_is_rejected() {
-        let token = sign_raw_claims(&serde_json::json!({
-            "sub": "s", "email": "e@example.com", "name": "n", "role": "superuser",
-            "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
-        }));
-        let result = SessionValidator::new(
-            lab_signing_key(),
-            "gateway".to_string(),
-            "gateway-issuer".to_string(),
-        )
-        .validate(&token);
-        assert!(matches!(result, Err(AuthError::SessionInvalid)));
+    fn token_with_unknown_role_claim_decodes_as_user_not_401() {
+        for unknown in [
+            serde_json::json!("superuser"),
+            serde_json::json!("ADMIN"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({"role": "admin"}),
+        ] {
+            let token = sign_raw_claims(&serde_json::json!({
+                "sub": "s", "email": "e@example.com", "name": "n", "role": unknown,
+                "exp": 9_999_999_999u64, "aud": "gateway", "iss": "gateway-issuer"
+            }));
+            let validated = SessionValidator::new(
+                lab_signing_key(),
+                "gateway".to_string(),
+                "gateway-issuer".to_string(),
+            )
+            .validate(&token)
+            .expect("un rol desconocido no debe rechazar la sesión");
+            assert_eq!(validated.role, Role::User, "claim: {unknown}");
+        }
     }
 
     #[test]
