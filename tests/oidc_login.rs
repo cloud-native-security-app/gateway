@@ -19,10 +19,13 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use gateway::api::{auth_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
-use gateway::auth::{LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
+use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::realtime::RealtimeRegistry;
-use gateway::security_events::NoopSecurityEventPublisher;
+use gateway::security_events::{
+    NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError,
+    SecurityEventPublisher,
+};
 use gateway::usuarios_client::{UsuariosClient, FORWARDED_USER_HEADER_NAME};
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse,
@@ -347,6 +350,19 @@ struct GatewayUnderTest {
 }
 
 async fn spawn_gateway(oidc_issuer_url: &str, usuarios_base_url: &str) -> GatewayUnderTest {
+    spawn_gateway_with_events(
+        oidc_issuer_url,
+        usuarios_base_url,
+        Arc::new(NoopSecurityEventPublisher),
+    )
+    .await
+}
+
+async fn spawn_gateway_with_events(
+    oidc_issuer_url: &str,
+    usuarios_base_url: &str,
+    security_events: Arc<dyn SecurityEventPublisher>,
+) -> GatewayUnderTest {
     let oidc_client = OidcClient::discover(
         oidc_issuer_url,
         TEST_CLIENT_ID,
@@ -386,7 +402,7 @@ async fn spawn_gateway(oidc_issuer_url: &str, usuarios_base_url: &str) -> Gatewa
             1000,
             Duration::from_secs(60),
         )),
-        security_events: Arc::new(NoopSecurityEventPublisher),
+        security_events,
     };
 
     let app = auth_router(state);
@@ -1224,4 +1240,260 @@ async fn callback_ignores_a_role_supplied_by_the_client_request() {
     let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
         .expect("la sesión emitida debe decodificar");
     assert_eq!(decoded.claims["role"], "user");
+}
+
+// --- Feature `security_event_publisher` (KAP-06): eventos `auth.*` ---
+
+/// Publicador que siempre falla: la operación de negocio no debe notarlo.
+struct AlwaysFailingEvents;
+
+#[async_trait::async_trait]
+impl SecurityEventPublisher for AlwaysFailingEvents {
+    async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
+        Err(SecurityEventError::PublishFailed("kinesis caído".into()))
+    }
+}
+
+/// Cede el turno varias veces: las tareas de `emit` corren en el mismo
+/// runtime de un hilo que el test, y una ausencia de evento solo es
+/// concluyente después de dejarlas correr.
+async fn let_background_tasks_run() {
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Completa un login exitoso contra `gateway` y devuelve la respuesta del
+/// callback.
+async fn successful_callback(
+    idp: &TestIdp,
+    key: &TestKey,
+    gateway: &GatewayUnderTest,
+) -> reqwest::Response {
+    let http = http_client_no_redirects();
+    let (state_value, nonce_value) = start_login(&http, gateway).await;
+    let claims = TestIdTokenClaims {
+        iss: &idp.issuer_url,
+        aud: TEST_CLIENT_ID,
+        sub: "google-sub-123",
+        email: "user@example.com",
+        name: "Test User",
+        exp: now_epoch_secs() + 300,
+        iat: now_epoch_secs(),
+        nonce: &nonce_value,
+    };
+    idp.set_next_id_token(sign_id_token(key, &claims));
+    http.get(format!(
+        "http://{}/auth/callback?code=irrelevant-code&state={state_value}",
+        gateway.addr
+    ))
+    .send()
+    .await
+    .expect("GET /auth/callback debe responder")
+}
+
+#[tokio::test]
+async fn successful_callback_emits_auth_login_with_only_the_actor_sub() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let (usuarios_base_url, _calls) = spawn_usuarios_upsert_stub(false).await;
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway =
+        spawn_gateway_with_events(&idp.issuer_url, &usuarios_base_url, events.clone()).await;
+
+    let response = successful_callback(&idp, &key, &gateway).await;
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+
+    let emitted = events.wait_for(1).await;
+    assert_eq!(emitted.len(), 1);
+    let json = serde_json::to_value(&emitted[0]).expect("serializa");
+    assert_eq!(json["event_type"], "auth.login");
+    assert_eq!(json["actor_sub"], "google-sub-123");
+    assert_eq!(json["payload"], json!({}));
+    let text = json.to_string();
+    assert!(!text.contains("user@example.com"), "sin correo: {text}");
+    assert!(!text.contains("Test User"), "sin nombre: {text}");
+}
+
+#[tokio::test]
+async fn callback_response_is_unchanged_when_the_event_publisher_fails() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let (usuarios_base_url, _calls) = spawn_usuarios_upsert_stub(false).await;
+    let gateway = spawn_gateway_with_events(
+        &idp.issuer_url,
+        &usuarios_base_url,
+        Arc::new(AlwaysFailingEvents),
+    )
+    .await;
+
+    let response = successful_callback(&idp, &key, &gateway).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some(TEST_FRONT_BASE_URL)
+    );
+    assert!(response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .is_some());
+    let_background_tasks_run().await;
+}
+
+#[tokio::test]
+async fn rejected_callback_emits_no_event() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        &idp.issuer_url,
+        NEVER_CONTACTED_USUARIOS_BASE_URL,
+        events.clone(),
+    )
+    .await;
+
+    let response = http_client_no_redirects()
+        .get(format!("http://{}/auth/callback", gateway.addr))
+        .send()
+        .await
+        .expect("GET /auth/callback debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let_background_tasks_run().await;
+    assert!(events.events().is_empty());
+}
+
+fn valid_session_token_for(gateway: &GatewayUnderTest, sub: &str) -> String {
+    let session = gateway::domain::Session {
+        sub: sub.to_string(),
+        email: "user@example.com".to_string(),
+        name: "Test User".to_string(),
+        exp: now_epoch_secs() as u64 + 3600,
+        role: gateway::domain::Role::User,
+    };
+    issue_session_token(
+        &session,
+        &gateway.session_signing_key,
+        SESSION_AUDIENCE,
+        SESSION_ISSUER,
+    )
+    .expect("sesión de laboratorio firmable")
+}
+
+#[tokio::test]
+async fn logout_with_a_valid_session_emits_auth_logout() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        &idp.issuer_url,
+        NEVER_CONTACTED_USUARIOS_BASE_URL,
+        events.clone(),
+    )
+    .await;
+    let token = valid_session_token_for(&gateway, "google-sub-123");
+
+    let response = http_client_no_redirects()
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={token}"),
+        )
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let emitted = events.wait_for(1).await;
+    assert_eq!(emitted.len(), 1);
+    let json = serde_json::to_value(&emitted[0]).expect("serializa");
+    assert_eq!(json["event_type"], "auth.logout");
+    assert_eq!(json["actor_sub"], "google-sub-123");
+    assert!(!json.to_string().contains(&token), "sin el token de sesión");
+}
+
+#[tokio::test]
+async fn logout_without_a_valid_session_still_answers_204_and_emits_nothing() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let gateway = spawn_gateway_with_events(
+        &idp.issuer_url,
+        NEVER_CONTACTED_USUARIOS_BASE_URL,
+        events.clone(),
+    )
+    .await;
+    let http = http_client_no_redirects();
+
+    let without_cookie = http
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+    let with_garbage = http
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}=not-a-jwt"),
+        )
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+
+    assert_eq!(without_cookie.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(with_garbage.status(), reqwest::StatusCode::NO_CONTENT);
+    let_background_tasks_run().await;
+    assert!(events.events().is_empty());
+}
+
+#[tokio::test]
+async fn logout_response_is_unchanged_when_the_event_publisher_fails() {
+    let key = generate_test_key("test-kid-1");
+    let idp = spawn_test_idp(JwkSet {
+        keys: vec![key.jwk.clone()],
+    })
+    .await;
+    let gateway = spawn_gateway_with_events(
+        &idp.issuer_url,
+        NEVER_CONTACTED_USUARIOS_BASE_URL,
+        Arc::new(AlwaysFailingEvents),
+    )
+    .await;
+    let token = valid_session_token_for(&gateway, "google-sub-123");
+
+    let response = http_client_no_redirects()
+        .post(format!("http://{}/auth/logout", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!("{SESSION_COOKIE_NAME}={token}"),
+        )
+        .send()
+        .await
+        .expect("POST /auth/logout debe responder");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .is_some());
+    let_background_tasks_run().await;
 }
