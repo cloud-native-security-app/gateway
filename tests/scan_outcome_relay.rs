@@ -250,12 +250,10 @@ fn lab_usuarios_client(base_url: String) -> UsuariosClient {
 }
 
 async fn unreachable_usuarios_base_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind temporal para reservar un puerto libre");
-    let addr = listener.local_addr().expect("addr temporal");
-    drop(listener);
-    format!("http://{addr}")
+    // Puerto 1 (tcpmux) en loopback: privilegiado y sin servicio, así que la
+    // conexión se rechaza de inmediato. Reservar un puerto con `bind` y soltarlo
+    // dejaba una carrera: el SO podía reasignarlo al gateway u otro stub del test.
+    "http://127.0.0.1:1".to_string()
 }
 
 #[tokio::test]
