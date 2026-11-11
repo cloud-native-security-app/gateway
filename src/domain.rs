@@ -288,6 +288,16 @@ pub struct VulnFinding {
     /// JSON verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub patch_state: Option<PatchState>,
+    /// Puerto donde se detectó el hallazgo. Ausente (`None`) para un hallazgo
+    /// a nivel de host o en resultados anteriores a este campo: se omite al
+    /// serializar para relayar el JSON verbatim (un `null` explícito se
+    /// decodifica igual que la ausencia).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Protocolo del puerto (`tcp`/`udp`). Ausente (`None`) cuando `port` lo
+    /// está.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 /// Confianza de un [`VulnFinding`]. Cerrado a propósito: un valor
@@ -651,5 +661,53 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
+    }
+
+    #[test]
+    fn vuln_finding_port_and_protocol_round_trip_verbatim() {
+        let mut json = completed_json_with_confidence(None);
+        json["result"]["vulnerabilities"][0]["port"] = serde_json::json!(22);
+        json["result"]["vulnerabilities"][0]["protocol"] = serde_json::json!("tcp");
+
+        let event: ScanOutcomeEvent =
+            serde_json::from_value(json.clone()).expect("completed con puerto decodifica");
+
+        let finding = first_vuln(event.clone());
+        assert_eq!(finding.port, Some(22));
+        assert_eq!(finding.protocol.as_deref(), Some("tcp"));
+        assert_eq!(serde_json::to_value(&event).unwrap(), json);
+    }
+
+    #[test]
+    fn vuln_finding_without_port_decodes_as_none_and_omits_it_on_reserialize() {
+        let json = completed_json_with_confidence(None);
+        let event: ScanOutcomeEvent = serde_json::from_value(json.clone()).expect("decodifica");
+
+        let finding = first_vuln(event.clone());
+        assert_eq!((finding.port, finding.protocol), (None, None));
+        let out = serde_json::to_value(&event).unwrap();
+        assert_eq!(out, json);
+        assert!(out["result"]["vulnerabilities"][0].get("port").is_none());
+    }
+
+    #[test]
+    fn vuln_finding_accepts_explicit_null_port_and_protocol() {
+        let mut json = completed_json_with_confidence(None);
+        json["result"]["vulnerabilities"][0]["port"] = serde_json::Value::Null;
+        json["result"]["vulnerabilities"][0]["protocol"] = serde_json::Value::Null;
+
+        let event: ScanOutcomeEvent = serde_json::from_value(json).expect("decodifica");
+
+        let finding = first_vuln(event);
+        assert_eq!((finding.port, finding.protocol), (None, None));
+    }
+
+    #[test]
+    fn vuln_finding_rejects_a_port_outside_the_u16_range() {
+        for bad in [serde_json::json!(70000), serde_json::json!(-1)] {
+            let mut json = completed_json_with_confidence(None);
+            json["result"]["vulnerabilities"][0]["port"] = bad;
+            assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
+        }
     }
 }

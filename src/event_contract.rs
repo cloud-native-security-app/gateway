@@ -178,8 +178,13 @@ fn validate_payload(event_type: &str, payload: &Map<String, Value>) -> Result<()
                 &["port", "protocol", "cve_id", "severity", "confidence"],
                 &[],
             )?;
-            uint(payload, "port", 0, 65_535)?;
-            check(payload, "protocol", |s| matches!(s, "tcp" | "udp"))?;
+            // `port`/`protocol` son `null` en un hallazgo a nivel de host.
+            if !payload["port"].is_null() {
+                uint(payload, "port", 0, 65_535)?;
+            }
+            if !payload["protocol"].is_null() {
+                check(payload, "protocol", |s| matches!(s, "tcp" | "udp"))?;
+            }
             if !payload["cve_id"].is_null() {
                 check(payload, "cve_id", is_cve)?;
             }
@@ -421,5 +426,33 @@ mod tests {
         assert!(!is_ip("::ffff:192.0.2.1"));
         assert!(!is_ip("01.2.3.4"));
         assert!(!is_ip("example.com"));
+    }
+
+    fn finding_critical(port: Value, protocol: Value) -> Value {
+        json!({
+            "event_id": "3f2b8c1e-5d4a-4e7b-9a10-2c6d8e0f1a06",
+            "event_type": "finding.critical",
+            "occurred_at": "2026-11-09T12:30:00Z",
+            "source": "nmap-service",
+            "scan_id": "scan-1",
+            "payload": {
+                "port": port, "protocol": protocol, "cve_id": "CVE-2023-38408",
+                "severity": "critical", "confidence": "confirmed"
+            }
+        })
+    }
+
+    #[test]
+    fn finding_critical_accepts_null_port_and_protocol_for_host_level_findings() {
+        assert!(validate(&finding_critical(json!(22), json!("tcp"))).is_ok());
+        assert!(validate(&finding_critical(Value::Null, Value::Null)).is_ok());
+        assert!(validate(&finding_critical(Value::Null, json!("udp"))).is_ok());
+    }
+
+    #[test]
+    fn finding_critical_still_rejects_bad_port_and_protocol() {
+        assert!(validate(&finding_critical(json!(70000), json!("tcp"))).is_err());
+        assert!(validate(&finding_critical(json!("22"), json!("tcp"))).is_err());
+        assert!(validate(&finding_critical(json!(22), json!("icmp"))).is_err());
     }
 }

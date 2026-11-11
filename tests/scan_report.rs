@@ -205,7 +205,8 @@ fn stored_result() -> Value {
         }],
         "vulnerabilities": [{
             "id": "CVE-2024-0001", "severity": "high", "description": "d",
-            "nse_script": "vulners", "source": "nmap_nse", "references": []
+            "nse_script": "vulners", "source": "nmap_nse", "references": [],
+            "port": 80, "protocol": "tcp"
         }],
         "scanned_at": "2024-01-01T00:00:00Z",
     })
