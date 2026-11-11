@@ -17,6 +17,7 @@ use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::routing::get;
 use axum::{Json, Router};
+use gateway::admin::AdminFeed;
 use gateway::api::{
     app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter, ROUTES,
 };
@@ -143,6 +144,7 @@ async fn spawn_gateway() -> GatewayUnderTest {
             Duration::from_secs(60),
         )),
         security_events: Arc::new(NoopSecurityEventPublisher),
+        admin_feed: Arc::new(AdminFeed::default()),
     };
 
     let app = app_router(state);

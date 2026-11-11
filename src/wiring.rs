@@ -8,12 +8,14 @@ use std::time::Duration;
 use axum::http::header::InvalidHeaderValue;
 use axum::http::HeaderValue;
 
+use crate::admin::{AdminAggregator, AdminFeed, SystemClock};
 use crate::api::{AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use crate::auth::{LoginStateStore, OidcClient};
 use crate::broker::{BrokerError, ScanOutcomeHandler, ScanRequestPublisher};
 use crate::config::Config;
 use crate::domain::ScanOutcomeEvent;
 use crate::kinesis::KinesisSecurityEventPublisher;
+use crate::kinesis_consumer::{AwsRecordsSource, SecurityEventConsumer};
 use crate::realtime::RealtimeRegistry;
 use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 use crate::sns::SnsScanPublisher;
@@ -67,6 +69,10 @@ pub struct Wiring {
     pub scan_outcome_consumer: SqsScanOutcomeConsumer,
     /// `handler` con el que se debe lanzar [`Self::scan_outcome_consumer`].
     pub scan_outcome_handler: Arc<dyn ScanOutcomeHandler>,
+    /// Consumidor de fondo del stream de eventos de seguridad que alimenta el
+    /// panel de administración (feature `admin_realtime_feed`). `None` si
+    /// `SECURITY_EVENTS_STREAM_NAME` no está definida.
+    pub security_event_consumer: Option<SecurityEventConsumer>,
 }
 
 /// Construye la composición completa de este Gateway a partir de `config`
@@ -133,6 +139,30 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
             }
         };
 
+    // El mismo stream alimenta el panel de administración: sin nombre de
+    // stream no hay consumidor y el agregador queda vacío.
+    let admin_aggregator = Arc::new(AdminAggregator::new(Arc::new(SystemClock)));
+    let security_event_consumer = match config.security_events_stream_name.as_deref() {
+        Some(stream_name) => Some(SecurityEventConsumer::new(
+            Arc::new(
+                AwsRecordsSource::connect(&config.aws_region, endpoint, stream_name.to_string())
+                    .await,
+            ),
+            Arc::clone(&admin_aggregator),
+        )),
+        None => {
+            tracing::info!(
+                "SECURITY_EVENTS_STREAM_NAME no está definida: no se consume el stream de \
+                 eventos de seguridad (el panel de administración queda vacío)"
+            );
+            None
+        }
+    };
+    let admin_feed = Arc::new(AdminFeed::new(
+        admin_aggregator,
+        Duration::from_secs(config.admin_events_role_recheck_secs),
+    ));
+
     let scan_outcome_consumer = SqsScanOutcomeConsumer::connect(
         &config.aws_region,
         endpoint,
@@ -173,12 +203,14 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         realtime,
         scan_submission_rate_limiter,
         security_events,
+        admin_feed,
     };
 
     Ok(Wiring {
         state,
         scan_outcome_consumer,
         scan_outcome_handler,
+        security_event_consumer,
     })
 }
 

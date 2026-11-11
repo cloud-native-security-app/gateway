@@ -24,6 +24,7 @@ use axum::http::HeaderValue;
 use axum::routing::{get, patch};
 use axum::{Json, Router};
 use futures_util::StreamExt;
+use gateway::admin::AdminFeed;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{
@@ -183,6 +184,7 @@ async fn spawn_gateway(usuarios_client: UsuariosClient) -> GatewayUnderTest {
             Duration::from_secs(60),
         )),
         security_events: Arc::new(NoopSecurityEventPublisher),
+        admin_feed: Arc::new(AdminFeed::default()),
     };
 
     let app = app_router(state);

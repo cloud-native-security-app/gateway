@@ -18,6 +18,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use gateway::admin::AdminFeed;
 use gateway::api::{auth_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
@@ -405,6 +406,7 @@ async fn spawn_gateway_with_events(
             Duration::from_secs(60),
         )),
         security_events,
+        admin_feed: Arc::new(AdminFeed::default()),
     };
 
     let app = auth_router(state);

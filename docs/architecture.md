@@ -117,6 +117,28 @@ Fuera de alcance: lógica de negocio de `ms-usuarios`, `ms-nmap`,
   `scan_id`, si no `actor_sub`, si no `event_id`. Un evento puede perderse si
   el proceso muere antes de publicarlo (el estado de negocio es la fuente de
   verdad).
+- **Panel de administración en tiempo real (KAP-09).** Gateway consume el
+  stream `security-events` con `GetShardIterator(LATEST)` + `GetRecords` por
+  shard (sin KCL ni servicio extra): **cada instancia lee todos los eventos** y
+  mantiene en memoria su propio agregado, así que no hay coordinación ni
+  checkpoints; lo publicado mientras una instancia estaba caída no aparece en
+  ella (el panel es una vista en vivo, no un registro de auditoría). El
+  consumidor (`kinesis_consumer`) vive detrás del puerto `RecordsSource`
+  (adaptador AWS y fuente falsa en tests), vuelve a tomar `LATEST` si el
+  iterador vence, relista los shards cada 30 s y reintenta con backoff
+  exponencial (1-30 s). Solo arranca si `SECURITY_EVENTS_STREAM_NAME` está
+  definida. Cada registro se valida contra el contrato
+  (`event_contract`, con un test diferencial contra `broker/contracts/security-event.schema.json`):
+  uno malformado o fuera del contrato se descarta con un `warn` sin el cuerpo y
+  se cuenta. El agregador (`admin`) es puro, con reloj inyectado y memoria
+  acotada: escaneos en curso, completados y fallidos en 15 minutos, tasa de
+  fallos, usuarios activos, límites de tasa, hallazgos críticos (50) y registro
+  de eventos (100). La ventana usa la hora de recepción, no `occurred_at`.
+  `GET /api/admin/metrics` devuelve el snapshot JSON y `GET /api/admin/events`
+  es un SSE (`snapshot`, luego `delta`; si el cliente se atrasa recibe un
+  `snapshot` nuevo, no un error). Ambas rutas van detrás de `require_session` +
+  `require_admin`; el SSE reconsulta el rol cada 60 s (`ADMIN_EVENTS_ROLE_RECHECK_SECS`)
+  y cierra el stream si ya no es admin o no se puede verificar.
 - **Rate limiting por usuario (RF-12)** con un limitador en memoria propio sobre la ruta
   de encolado de escaneos, con la identidad de la sesión de Gateway como
   clave (no la IP del cliente, que puede compartirse tras un NAT/proxy).
@@ -179,7 +201,7 @@ resuelva, no antes.
 4. **`usuarios_client`** — único módulo que conoce la URL y el contrato
    HTTP de `ms-usuarios`; nadie más en este repo hace una petición HTTP
    directa hacia `ms-usuarios`.
-5. **`broker`, `sns`, `sqs`, `security_events`, `kinesis`** — `broker` define los puertos
+5. **`broker`, `sns`, `sqs`, `security_events`, `kinesis`, `kinesis_consumer`, `event_contract`** — `broker` define los puertos
    (`ScanRequestPublisher`, `ScanOutcomeHandler`) y los tipos de mensaje;
    `sns` publica `ScanRequest`/`ScanCancellation` en SNS y `sqs` consume la
    cola de resultados de escaneo. Únicos módulos que conocen el contrato de
@@ -187,7 +209,13 @@ resuelva, no antes.
    `security_events` define el puerto `SecurityEventPublisher`, el sobre
    `SecurityEvent` (un constructor tipado por evento, validado contra el
    schema) y `emit`, el único punto de emisión de los handlers; `kinesis`
-   es su adaptador real.
+   es su adaptador real de publicación. `kinesis_consumer` lee el stream
+   (puerto `RecordsSource`) y `event_contract` valida cada registro leído
+   contra el contrato.
+5b. **`admin`, `admin_routes`** — `admin` es el agregador en memoria de
+   métricas (reloj inyectado, memoria acotada, difusión de deltas);
+   `admin_routes` expone `GET /api/admin/metrics` y el SSE `GET
+   /api/admin/events` con revalidación periódica del rol.
 6. **`realtime`** — registro de streams SSE activos por `scanId` y el
    puente entre un evento consumido del Broker y los clientes SSE
    suscritos.

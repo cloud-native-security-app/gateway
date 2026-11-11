@@ -39,14 +39,22 @@ impl KinesisSecurityEventPublisher {
     /// AWS, la `region` indicada y, opcionalmente, un `endpoint_url` (solo
     /// LocalStack).
     pub async fn connect(region: &str, endpoint_url: Option<&str>, stream_name: String) -> Self {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()));
-        if let Some(url) = endpoint_url {
-            loader = loader.endpoint_url(url);
-        }
-        let shared = loader.load().await;
-        Self::from_client(Client::new(&shared), stream_name)
+        Self::from_client(build_client(region, endpoint_url).await, stream_name)
     }
+}
+
+/// Construye un cliente de Kinesis con la cadena de credenciales por defecto
+/// de AWS, la `region` indicada y, opcionalmente, un `endpoint_url` (solo
+/// LocalStack). Lo comparten el publicador de este módulo y el consumidor
+/// ([`crate::kinesis_consumer`]).
+pub async fn build_client(region: &str, endpoint_url: Option<&str>) -> Client {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()));
+    if let Some(url) = endpoint_url {
+        loader = loader.endpoint_url(url);
+    }
+    let shared = loader.load().await;
+    Client::new(&shared)
 }
 
 #[async_trait::async_trait]

@@ -94,6 +94,7 @@ fn gateway_config(
         scan_outcomes_queue_url: outcomes_queue.parse().expect("queue url válida"),
         scan_outcomes_dlq_url: outcomes_dlq.parse().expect("dlq url válida"),
         security_events_stream_name,
+        admin_events_role_recheck_secs: 60,
     }
 }
 
@@ -120,6 +121,10 @@ async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
     );
 
     let built = wiring::build(config).await.expect("build debe completarse");
+    assert!(
+        built.security_event_consumer.is_none(),
+        "sin SECURITY_EVENTS_STREAM_NAME no hay consumidor del stream"
+    );
 
     // Publicación: AppState::broker_publisher -> SNS -> cola suscrita.
     built
@@ -199,6 +204,10 @@ async fn build_wires_the_kinesis_publisher_when_the_stream_name_is_configured() 
         Some("security-events".to_string()),
     );
     let built = wiring::build(config).await.expect("build debe completarse");
+    assert!(
+        built.security_event_consumer.is_some(),
+        "con SECURITY_EVENTS_STREAM_NAME se arma el consumidor del stream"
+    );
 
     built
         .state

@@ -7,6 +7,8 @@
 // usa una parte de sus helpers.
 #![allow(dead_code)]
 
+pub mod admin_gateway;
+
 use std::time::Duration;
 
 use aws_sdk_kinesis::types::{Record, ShardIteratorType, StreamStatus};

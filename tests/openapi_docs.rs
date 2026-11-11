@@ -129,3 +129,42 @@ fn me_response_schema_documents_the_role_field() {
     let role = &spec["components"]["schemas"]["Role"];
     assert_eq!(role["enum"], serde_json::json!(["user", "admin"]));
 }
+
+/// Feature `admin_realtime_feed`: las rutas de administración documentan sus
+/// respuestas de autorización y los esquemas del snapshot y del delta que
+/// consume `front`.
+#[test]
+fn admin_routes_document_their_authorization_responses_and_schemas() {
+    let spec = generated_spec_as_json();
+    for path in ["/api/admin/metrics", "/api/admin/events"] {
+        let responses = &spec["paths"][path]["get"]["responses"];
+        for status in ["200", "401", "403", "503"] {
+            assert!(
+                responses[status].is_object(),
+                "{path} debe documentar {status}"
+            );
+        }
+        assert!(
+            spec["paths"][path]["get"]["security"].is_array(),
+            "{path} debe exigir la cookie de sesión"
+        );
+    }
+    assert!(
+        spec["paths"]["/api/admin/events"]["get"]["responses"]["200"]["content"]
+            ["text/event-stream"]
+            .is_object()
+    );
+    for schema in [
+        "AdminSnapshot",
+        "AdminDelta",
+        "Kpis",
+        "EventEntry",
+        "AdminStreamClosed",
+    ] {
+        assert!(
+            spec["components"]["schemas"][schema].is_object(),
+            "falta el schema {schema}"
+        );
+    }
+    assert!(spec["components"]["schemas"]["AdminDelta"]["properties"]["seq"].is_object());
+}

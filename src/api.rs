@@ -36,6 +36,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
+use crate::admin::AdminFeed;
+use crate::admin_routes;
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
@@ -392,6 +394,11 @@ pub struct AppState {
     /// handlers lo usan solo a través de [`crate::security_events::emit`]:
     /// un fallo de publicación nunca altera la respuesta HTTP.
     pub security_events: Arc<dyn SecurityEventPublisher>,
+    /// Agregador de métricas de administración y su intervalo de
+    /// revalidación de rol (feature `admin_realtime_feed`, ver
+    /// [`crate::admin`]); lo alimenta el consumidor de Kinesis de
+    /// [`crate::kinesis_consumer`].
+    pub admin_feed: Arc<AdminFeed>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -479,6 +486,9 @@ fn protected_router(state: AppState) -> Router {
             "/api/network-credentials/:id",
             delete(delete_network_credential),
         )
+        // Rutas de administración: `require_admin` va dentro de su propio
+        // router y `require_session` (capa de abajo) las envuelve por fuera.
+        .merge(admin_routes::admin_router(state.usuarios_client.clone()))
         .layer(middleware::from_fn_with_state(
             validator,
             auth::require_session,
@@ -1274,6 +1284,16 @@ pub const ROUTES: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/admin/metrics",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/admin/events",
+        protected: true,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/openapi.json",
         protected: false,
     },
@@ -1421,8 +1441,20 @@ impl Modify for SessionCookieSecurity {
         list_network_credentials,
         create_network_credential,
         delete_network_credential,
+        crate::admin_routes::admin_metrics,
+        crate::admin_routes::admin_events,
     ),
     components(schemas(
+        crate::admin::AdminSnapshot,
+        crate::admin::AdminDelta,
+        crate::admin::Kpis,
+        crate::admin::InFlightScan,
+        crate::admin::CriticalFinding,
+        crate::admin::EventEntry,
+        crate::admin::ScanChange,
+        crate::admin::ScanFlightStatus,
+        crate::admin::ScanChangeStatus,
+        crate::admin_routes::AdminStreamClosed,
         MeResponse,
         ScanSubmissionRequest,
         ScanSubmissionResponse,
@@ -1443,7 +1475,8 @@ impl Modify for SessionCookieSecurity {
         (name = "docs", description = "Documentación OpenAPI de este Gateway (RNF-08)."),
         (name = "session", description = "Identidad y perfil de la sesión activa."),
         (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos."),
-        (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios.")
+        (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios."),
+        (name = "admin", description = "Métricas y eventos de seguridad en tiempo real, solo para administradores.")
     ),
     modifiers(&SessionCookieSecurity)
 )]
@@ -1707,8 +1740,13 @@ impl IntoResponse for UsuariosClientError {
             // ms-usuarios respondió, pero con un status inesperado (incluye
             // 5xx propio y un 401 por credencial de servicio rechazada) o un
             // cuerpo 2xx que no se pudo interpretar.
+            // `UserNotFound`/`ServiceMisconfigured` solo salen de `current_role`
+            // (que usa `auth::require_admin`, no estos handlers); si llegaran
+            // aquí son una falla del servicio de usuarios, no del cliente.
             UsuariosClientError::UnexpectedResponse { .. }
-            | UsuariosClientError::MalformedResponse => StatusCode::BAD_GATEWAY,
+            | UsuariosClientError::MalformedResponse
+            | UsuariosClientError::UserNotFound
+            | UsuariosClientError::ServiceMisconfigured => StatusCode::BAD_GATEWAY,
             // Fallo al construir la propia solicitud: un bug de este
             // Gateway, no de ms-usuarios.
             UsuariosClientError::RequestBuild => StatusCode::INTERNAL_SERVER_ERROR,
