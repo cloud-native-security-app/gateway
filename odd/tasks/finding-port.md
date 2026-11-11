@@ -37,10 +37,10 @@ The gateway accepts and relays the optional `port`/`protocol` of a `VulnFinding`
 
 | ID | Task | Done |
 |---|---|---|
-| FP-01 | Feature document | [ ] |
-| FP-02 | RED: tests (domain, event_contract, admin aggregator, broker schema parity) | [ ] |
-| FP-03 | GREEN: domain, event_contract, admin | [ ] |
-| FP-04 | Docs: architecture / decisions | [ ] |
+| FP-01 | Feature document | [x] 3a813d5 |
+| FP-02 | RED: tests (domain, event_contract, admin aggregator, broker schema parity) | [x] `cargo test --lib`: 11 compile errors (fields missing) |
+| FP-03 | GREEN: domain, event_contract, admin | [x] `cargo test`: all suites pass (lib 150) incl. parity against broker `feature/finding_port` |
+| FP-04 | Docs: decisions D-17 | [x] |
 | FP-05 | `make verify` | [ ] |
 
 ## Compatibility note

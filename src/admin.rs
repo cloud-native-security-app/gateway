@@ -141,10 +141,10 @@ pub struct CriticalFinding {
     pub occurred_at: String,
     /// Escaneo al que pertenece.
     pub scan_id: String,
-    /// Puerto afectado.
-    pub port: u16,
-    /// `tcp` o `udp`.
-    pub protocol: String,
+    /// Puerto afectado; `None` (`null`) en un hallazgo a nivel de host.
+    pub port: Option<u16>,
+    /// `tcp` o `udp`; `None` (`null`) en un hallazgo a nivel de host.
+    pub protocol: Option<String>,
     /// CVE asociado, si lo hay.
     pub cve_id: Option<String>,
     /// `high` o `critical`.
@@ -427,8 +427,11 @@ fn critical_finding(event: &SecurityEvent) -> Option<CriticalFinding> {
         event_id: event.event_id().to_string(),
         occurred_at: event.occurred_at().to_string(),
         scan_id: event.scan_id()?.to_string(),
-        port: u16::try_from(payload.get("port")?.as_u64()?).ok()?,
-        protocol: text("protocol")?,
+        port: match payload.get("port")? {
+            Value::Null => None,
+            port => Some(u16::try_from(port.as_u64()?).ok()?),
+        },
+        protocol: text("protocol"),
         cve_id: text("cve_id"),
         severity: text("severity")?,
         confidence: text("confidence")?,
@@ -900,9 +903,35 @@ mod tests {
             findings[0].scan_id,
             format!("scan-{}", MAX_CRITICAL_FINDINGS + 6)
         );
-        assert_eq!(findings[0].port, 22);
+        assert_eq!(findings[0].port, Some(22));
+        assert_eq!(findings[0].protocol.as_deref(), Some("tcp"));
         assert_eq!(findings[0].cve_id.as_deref(), Some("CVE-2023-38408"));
         assert_eq!(findings[0].severity, "critical");
+    }
+
+    #[test]
+    fn a_host_level_critical_finding_keeps_null_port_and_protocol() {
+        let (agg, _clock) = aggregator();
+        agg.ingest(&event(
+            1,
+            "finding.critical",
+            None,
+            Some("scan-host"),
+            json!({"port": null, "protocol": null, "cve_id": "CVE-2024-6387", "severity": "high", "confidence": "version_match"}),
+        ));
+        let findings = agg.snapshot().critical_findings;
+        assert_eq!(
+            findings.len(),
+            1,
+            "un hallazgo a nivel de host no se descarta"
+        );
+        assert_eq!(
+            (findings[0].port, findings[0].protocol.clone()),
+            (None, None)
+        );
+        let value = serde_json::to_value(&findings[0]).unwrap();
+        assert_eq!(value["port"], Value::Null);
+        assert_eq!(value["protocol"], Value::Null);
     }
 
     #[test]
@@ -990,7 +1019,7 @@ mod tests {
         );
 
         let second = rx.try_recv().unwrap();
-        assert_eq!(second.critical_finding.as_ref().unwrap().port, 22);
+        assert_eq!(second.critical_finding.as_ref().unwrap().port, Some(22));
 
         let third = rx.try_recv().unwrap();
         assert_eq!(third.seq, 3);

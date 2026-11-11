@@ -191,3 +191,16 @@ que no son evidentes leyendo el código.
     `ms-usuarios` con `ScanOwnershipRegistry`, que sigue siendo en memoria: tras
     un reinicio responde `404` aunque el reporte exista.
   - El shape SSE no cambia (`started`/`completed`/`failed`).
+
+## D-17 — Puerto y protocolo opcionales en `VulnFinding` y `finding.critical`
+
+- **Decisión:** `VulnFinding` acepta y relaya `port` (`u16`) y `protocol`
+  opcionales, que se omiten al serializar si faltan (un `null` explícito se
+  decodifica igual que la ausencia). En el feed de administración,
+  `CriticalFinding.port`/`protocol` son nullable y `event_contract` acepta
+  `null` en `finding.critical` (hallazgo a nivel de host). Contrato:
+  `broker/contracts/` (D-15 del broker).
+- **Consecuencia:** `VulnFinding` conserva `deny_unknown_fields`, por lo que el
+  orden de despliegue es Gateway primero y luego `nmap-service`; de lo
+  contrario un `completed` con puerto iría a la DLQ. Un hallazgo a nivel de
+  host ya no se descarta del feed por tener `port: null`.
