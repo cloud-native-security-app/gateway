@@ -749,9 +749,9 @@ struct ScanHistoryEntryResponse {
     /// Motivo del fallo o de la cancelación (`FALLIDO`/`CANCELADO`); siempre
     /// presente, `null` en cualquier otro estado.
     failure_reason: Option<String>,
-    /// Modo con el que se solicitó el escaneo (`ssh`/`network`). Ausente si
-    /// el Gateway ya no lo recuerda (reinicio del proceso: `ms-usuarios`
-    /// todavía no persiste el modo), igual que `scanId`. `front` lo usa para
+    /// Modo con el que se solicitó el escaneo (`ssh`/`network`). Viene
+    /// del histórico persistido en `ms-usuarios` (sobrevive a un reinicio);
+    /// si falta ahí, del registro en memoria; si tampoco, se omite. `front` lo usa para
     /// mostrar el modo y para derivar "estado de parches no verificado" en
     /// los escaneos `network`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,7 +766,11 @@ impl ScanHistoryEntryResponse {
     fn from_history_entry(entry: ScanHistoryEntry, ownership: &ScanOwnershipRegistry) -> Self {
         let known = ownership.find_by_ms_usuarios_scan_id(&entry.scan_id);
         Self {
-            mode: known.as_ref().map(|(_, o)| o.mode),
+            // El modo persistido en `ms-usuarios` manda; el registro en memoria
+            // solo cubre un `ms-usuarios` que aún no lo devuelve.
+            mode: entry
+                .scan_mode
+                .or_else(|| known.as_ref().map(|(_, o)| o.mode)),
             scan_id: known.map(|(scan_id, _)| scan_id),
             target: entry.target,
             status: entry.status,
@@ -953,7 +957,7 @@ async fn submit_scan(
 
     let history_entry = state
         .usuarios_client
-        .create_scan_history(&session, &target)
+        .create_scan_history(&session, &target, mode)
         .await?;
 
     // Feature `scan_outcome_relay`: registra a quién pertenece este
