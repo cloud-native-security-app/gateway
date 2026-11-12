@@ -33,6 +33,29 @@ impl Role {
     }
 }
 
+/// Modo de un escaneo solicitado en `POST /api/scans` (feature
+/// `network_scan_mode`). Mismos valores que `scan_mode` del contrato
+/// `broker/contracts/scan-request.schema.json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanMode {
+    /// El escaneo entra al objetivo por SSH con credenciales del usuario
+    /// (comportamiento original; es el valor por defecto).
+    #[default]
+    Ssh,
+    /// `ms-nmap` escanea la IP desde su propio contenedor, sin credenciales.
+    /// Exige el permiso `network_scan` (ver [`crate::network_scan`]).
+    Network,
+}
+
+impl ScanMode {
+    /// `true` para [`ScanMode::Ssh`]; usado para omitir el campo en los
+    /// payloads ssh y mantenerlos idénticos a los previos al modo.
+    pub fn is_ssh(&self) -> bool {
+        matches!(self, ScanMode::Ssh)
+    }
+}
+
 /// Identidad de un usuario ya autenticado por Google y verificada por este
 /// Gateway (firma/`aud`/`iss`/`exp` del ID token, ver `docs/security-scope.md`),
 /// junto con la validez temporal de la sesión propia que la encapsula

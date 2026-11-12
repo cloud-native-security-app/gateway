@@ -97,6 +97,7 @@ fn gateway_config(
         scan_outcomes_dlq_url: outcomes_dlq.parse().expect("dlq url válida"),
         security_events_stream_name,
         admin_events_role_recheck_secs: 60,
+        network_scan_allowed_cidrs: Vec::new(),
     }
 }
 

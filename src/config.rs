@@ -86,6 +86,10 @@ const ENV_SECURITY_EVENTS_STREAM_NAME: &str = "SECURITY_EVENTS_STREAM_NAME";
 /// `admin_realtime_feed`). Opcional, por defecto
 /// [`DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS`]; debe ser mayor que cero.
 const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS";
+/// Allowlist opcional de CIDR (separados por coma) para el modo `network` de
+/// `POST /api/scans` (feature `network_scan_mode`). Vacía o ausente = cualquier
+/// objetivo que pase la denylist fija de [`crate::network_scan`].
+const ENV_NETWORK_SCAN_ALLOWED_CIDRS: &str = "NETWORK_SCAN_ALLOWED_CIDRS";
 /// Valor por defecto de `ADMIN_EVENTS_ROLE_RECHECK_SECS`.
 const DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS: u64 = 60;
 /// Largo máximo de un nombre de stream de Kinesis.
@@ -176,6 +180,10 @@ pub struct Config {
     /// reconsulta el rol vigente del usuario y, si ya no es admin (o no se
     /// puede verificar), lo cierra (feature `admin_realtime_feed`).
     pub admin_events_role_recheck_secs: u64,
+    /// CIDR permitidos para escaneos en modo `network`
+    /// (`NETWORK_SCAN_ALLOWED_CIDRS`, feature `network_scan_mode`). Vacío =
+    /// sin restricción más allá de la denylist fija.
+    pub network_scan_allowed_cidrs: Vec<ipnet::IpNet>,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -221,6 +229,14 @@ pub enum ConfigError {
     /// El valor no se incluye en el error.
     #[error("la variable de entorno {name} no es un nombre de stream de Kinesis válido")]
     InvalidStreamName {
+        /// Nombre de la variable de entorno inválida.
+        name: &'static str,
+    },
+    /// Una variable de entorno que debe ser una lista de CIDR separados por
+    /// coma (`10.0.0.0/24,2001:db8::/32`) tiene un elemento que no lo es. El
+    /// valor no se incluye en el error.
+    #[error("la variable de entorno {name} no es una lista de CIDR válida")]
+    InvalidCidrList {
         /// Nombre de la variable de entorno inválida.
         name: &'static str,
     },
@@ -314,6 +330,25 @@ fn parse_stream_name(name: &'static str, raw: Option<&str>) -> Result<Option<Str
     } else {
         Err(ConfigError::InvalidStreamName { name })
     }
+}
+
+/// Interpreta el valor crudo de una lista de CIDR separados por coma: ausente,
+/// en blanco o solo comas es una lista vacía (sin restricción); cada elemento
+/// se recorta y debe ser un CIDR explícito (`a.b.c.d/n` o IPv6 con prefijo; una
+/// IP sin prefijo no lo es). Función pura para probarla sin tocar el entorno.
+fn parse_allowed_cidrs(
+    name: &'static str,
+    raw: Option<&str>,
+) -> Result<Vec<ipnet::IpNet>, ConfigError> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            item.parse::<ipnet::IpNet>()
+                .map_err(|_| ConfigError::InvalidCidrList { name })
+        })
+        .collect()
 }
 
 /// Interpreta el valor de `ADMIN_EVENTS_ROLE_RECHECK_SECS`: ausente o en
@@ -421,6 +456,11 @@ impl Config {
             env::var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS).ok().as_deref(),
         )?;
 
+        let network_scan_allowed_cidrs = parse_allowed_cidrs(
+            ENV_NETWORK_SCAN_ALLOWED_CIDRS,
+            env::var(ENV_NETWORK_SCAN_ALLOWED_CIDRS).ok().as_deref(),
+        )?;
+
         Ok(Self {
             http_host,
             http_port,
@@ -446,6 +486,7 @@ impl Config {
             scan_outcomes_dlq_url,
             security_events_stream_name,
             admin_events_role_recheck_secs,
+            network_scan_allowed_cidrs,
         })
     }
 }
@@ -498,6 +539,7 @@ mod tests {
         env::remove_var(ENV_AWS_ENDPOINT_URL);
         env::remove_var(ENV_SECURITY_EVENTS_STREAM_NAME);
         env::remove_var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS);
+        env::remove_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS);
     }
 
     fn set_all_valid_vars() {
@@ -818,6 +860,80 @@ mod tests {
         ));
 
         clear_all_vars();
+    }
+
+    #[test]
+    fn network_scan_allowed_cidrs_defaults_to_empty_meaning_any() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+
+        let config = Config::from_env().expect("config válida debe cargar");
+
+        assert!(config.network_scan_allowed_cidrs.is_empty());
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn network_scan_allowed_cidrs_is_loaded_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS, "10.0.0.0/24, 2001:db8::/32");
+
+        let config = Config::from_env().expect("config válida debe cargar");
+
+        assert_eq!(config.network_scan_allowed_cidrs.len(), 2);
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn invalid_network_scan_cidr_in_env_fails_startup_without_echoing_the_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS, "10.0.0.0/24,not-a-cidr");
+
+        let result = Config::from_env();
+
+        let error = result.expect_err("un CIDR inválido debe fallar el arranque");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidCidrList {
+                name: ENV_NETWORK_SCAN_ALLOWED_CIDRS
+            }
+        ));
+        assert!(!error.to_string().contains("not-a-cidr"));
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn parse_allowed_cidrs_handles_unset_blank_and_malformed_values() {
+        let name = ENV_NETWORK_SCAN_ALLOWED_CIDRS;
+        assert!(parse_allowed_cidrs(name, None).unwrap().is_empty());
+        assert!(parse_allowed_cidrs(name, Some("  ")).unwrap().is_empty());
+        assert!(parse_allowed_cidrs(name, Some(" , ")).unwrap().is_empty());
+        assert_eq!(
+            parse_allowed_cidrs(name, Some(" 10.0.0.0/8 ,192.0.2.0/24,"))
+                .unwrap()
+                .len(),
+            2
+        );
+        for bad in [
+            "10.0.0.0/33",
+            "10.0.0.1",
+            "garbage",
+            "10.0.0.0/8;x",
+            "10.0.0.0/8 10.1.0.0/16",
+        ] {
+            assert!(
+                parse_allowed_cidrs(name, Some(bad)).is_err(),
+                "{bad} debe rechazarse (un host sin prefijo tampoco es un CIDR)"
+            );
+        }
     }
 
     #[test]
