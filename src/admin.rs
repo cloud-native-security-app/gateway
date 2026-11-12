@@ -131,6 +131,30 @@ pub struct AdminSnapshot {
     pub critical_findings: Vec<CriticalFinding>,
     /// Últimos eventos, el más reciente primero (máx. 100).
     pub recent_events: Vec<EventEntry>,
+    /// Serie por minuto de los últimos 15 minutos.
+    pub series: AdminSeries,
+}
+
+/// Serie temporal: exactamente 15 cubetas de un minuto (UTC), la más antigua
+/// primero; la última es el minuto actual. Las cubetas vacías llevan mapas
+/// vacíos.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct AdminSeries {
+    /// Ancho de cada cubeta, en segundos (siempre 60).
+    pub bucket_seconds: u64,
+    /// Cubetas, la más antigua primero.
+    pub buckets: Vec<SeriesBucket>,
+}
+
+/// Conteos de un minuto de la serie.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SeriesBucket {
+    /// Inicio del minuto (RFC 3339, UTC).
+    pub minute: String,
+    /// Eventos por `event_type`.
+    pub by_type: std::collections::BTreeMap<String, u64>,
+    /// `finding.critical` por severidad (`high` o `critical`).
+    pub findings_by_severity: std::collections::BTreeMap<String, u64>,
 }
 
 /// Cambio de un escaneo en curso.

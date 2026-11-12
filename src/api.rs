@@ -1446,6 +1446,8 @@ impl Modify for SessionCookieSecurity {
     components(schemas(
         crate::admin::AdminSnapshot,
         crate::admin::AdminDelta,
+        crate::admin::AdminSeries,
+        crate::admin::SeriesBucket,
         crate::admin::Kpis,
         crate::admin::InFlightScan,
         crate::admin::CriticalFinding,
