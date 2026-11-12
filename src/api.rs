@@ -394,10 +394,9 @@ pub struct AppState {
     /// handlers lo usan solo a través de [`crate::security_events::emit`]:
     /// un fallo de publicación nunca altera la respuesta HTTP.
     pub security_events: Arc<dyn SecurityEventPublisher>,
-    /// Agregador de métricas de administración y su intervalo de
-    /// revalidación de rol (feature `admin_realtime_feed`, ver
-    /// [`crate::admin`]); lo alimenta el consumidor de Kinesis de
-    /// [`crate::kinesis_consumer`].
+    /// Cliente hacia `events-service` y el intervalo de revalidación de rol
+    /// del SSE (features `admin_realtime_feed`/`admin_feed_proxy`, ver
+    /// [`crate::admin`] y [`crate::events_client`]).
     pub admin_feed: Arc<AdminFeed>,
 }
 

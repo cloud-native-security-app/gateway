@@ -85,6 +85,8 @@ fn gateway_config(
         front_origin: "https://front.lab".to_string(),
         ms_usuarios_base_url: "http://ms-usuarios.invalid".to_string(),
         ms_usuarios_shared_secret: SecretString::from("lab-only-not-a-real-secret".to_string()),
+        events_service_base_url: "http://events-service.invalid".to_string(),
+        events_service_shared_secret: SecretString::from("lab-only-not-a-real-secret".to_string()),
         scan_submission_rate_limit_max_requests: 1000,
         scan_submission_rate_limit_window_secs: 60,
         aws_region: common::REGION.to_string(),
@@ -121,10 +123,6 @@ async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
     );
 
     let built = wiring::build(config).await.expect("build debe completarse");
-    assert!(
-        built.security_event_consumer.is_none(),
-        "sin SECURITY_EVENTS_STREAM_NAME no hay consumidor del stream"
-    );
 
     // Publicación: AppState::broker_publisher -> SNS -> cola suscrita.
     built
@@ -204,10 +202,6 @@ async fn build_wires_the_kinesis_publisher_when_the_stream_name_is_configured() 
         Some("security-events".to_string()),
     );
     let built = wiring::build(config).await.expect("build debe completarse");
-    assert!(
-        built.security_event_consumer.is_some(),
-        "con SECURITY_EVENTS_STREAM_NAME se arma el consumidor del stream"
-    );
 
     built
         .state

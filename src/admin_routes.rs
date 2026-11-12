@@ -1,35 +1,39 @@
 //! Rutas de administración (feature `admin_realtime_feed`, tarea KAP-09):
 //! `GET /api/admin/metrics` (snapshot JSON) y `GET /api/admin/events` (SSE).
 //!
-//! Son las primeras rutas detrás de [`crate::auth::require_admin`]; el router
-//! de [`crate::api`] las monta dentro de `require_session` (capa externa).
+//! Desde la feature `admin_feed_proxy` son un proxy hacia `events-service`
+//! ([`crate::events_client`]): el gateway conserva la sesión, [`require_admin`]
+//! y la revalidación periódica del rol, y nada más. El router de
+//! [`crate::api`] las monta dentro de `require_session` (capa externa).
 //!
 //! ## Protocolo SSE de `GET /api/admin/events`
 //!
-//! | Evento | Datos | Cuándo |
+//! | Evento | Datos | Origen |
 //! |---|---|---|
-//! | `snapshot` | [`AdminSnapshot`] | primero; tras un retraso del cliente (lag); y en cada revalidación del rol |
-//! | `delta` | [`AdminDelta`] | por cada evento (o registro malformado) nuevo |
-//! | `closed` | [`AdminStreamClosed`] | justo antes de cerrar por fallo de revalidación |
+//! | `snapshot` | [`AdminSnapshot`] | `events-service` (primero y de forma periódica) |
+//! | `delta` | [`AdminDelta`] | `events-service`, por cada evento nuevo |
+//! | `error` | texto | `events-service` |
+//! | `closed` | [`AdminStreamClosed`] | **este gateway**, justo antes de cerrar por fallo de revalidación |
 //!
-//! Más comentarios `: ping` de keep-alive cada 15 s. Snapshot y suscripción
-//! se toman de forma atómica ([`crate::admin::AdminAggregator::subscribe_with_snapshot`]),
-//! así que el primer `delta` es el siguiente al snapshot (`seq` consecutivo).
+//! Más los comentarios `: ping` de keep-alive que emite `events-service`.
 //!
 //! ## Decisiones de diseño
 //!
+//! - **Frames completos**: el stream de `events-service` se reenvía frame a
+//!   frame ([`FrameBuffer`]); un frame a medias nunca sale hacia el cliente,
+//!   de modo que `closed` jamás cae dentro de otro frame.
 //! - **Revalidación del rol**: una conexión SSE puede durar horas y el rol de
 //!   la sesión es una instantánea. Cada
 //!   [`AdminFeed::role_recheck_interval`] (60 s por defecto) el stream llama a
 //!   [`verify_admin`] (la misma política fail-closed que `require_admin`); si
 //!   el usuario ya no es admin, ya no existe o no se puede verificar, envía
-//!   `closed` (con un motivo genérico) y termina.
-//! - **Snapshot en cada revalidación**: la ventana de 15 minutos vence sin
-//!   que llegue ningún evento, así que los KPIs de un cliente quieto se
-//!   desactualizarían; el snapshot periódico los corrige.
-//! - **Cliente lento**: si el receptor del `broadcast` se atrasa más que su
-//!   capacidad ([`crate::admin::DELTA_CHANNEL_CAPACITY`]) no hay error: se
-//!   toma un snapshot nuevo con un receptor nuevo y se sigue.
+//!   `closed` (motivo genérico) y termina. Si el rol sigue vigente no se
+//!   emite nada: los snapshots periódicos los genera `events-service`.
+//! - **Fin del upstream**: si `events-service` cierra el stream o falla la
+//!   lectura, el stream del cliente termina sin inventar eventos (el front
+//!   reconecta y recibe un snapshot nuevo).
+//! - **Errores**: inalcanzable o timeout -> `503`; `401`/`5xx`/otros del
+//!   upstream -> `502` con mensaje genérico (el detalle solo se loggea).
 //! - **Sin PII**: ver [`crate::admin`].
 
 use std::collections::VecDeque;
@@ -37,25 +41,27 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{middleware, Extension, Json, Router};
+use axum::{middleware, Extension, Router};
+use bytes::Bytes;
 use futures_util::stream::{self, Stream};
+use futures_util::StreamExt;
 use serde::Serialize;
-use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior};
 use utoipa::ToSchema;
 
+#[allow(unused_imports)] // referenciados por la documentación y el OpenAPI
 use crate::admin::{AdminDelta, AdminFeed, AdminSnapshot};
 use crate::api::AppState;
 use crate::auth::{require_admin, verify_admin};
 use crate::domain::Session;
+use crate::events_client::{EventsClientError, FrameBuffer, UpstreamBytes};
 use crate::usuarios_client::UsuariosClient;
 
-/// Cada cuánto el servidor envía un comentario `: ping` para mantener viva la
-/// conexión a través de proxies.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Motivo (genérico, sin revelar el rol) del evento `closed`.
 const CLOSE_REASON: &str = "role_revalidation_failed";
 
@@ -89,8 +95,16 @@ pub fn admin_router(usuarios: Arc<UsuariosClient>) -> Router<AppState> {
         (status = 503, description = "No se pudo verificar el rol contra ms-usuarios.")
     )
 )]
-pub(crate) async fn admin_metrics(State(state): State<AppState>) -> Json<AdminSnapshot> {
-    Json(state.admin_feed.aggregator.snapshot())
+pub(crate) async fn admin_metrics(State(state): State<AppState>) -> Response {
+    match state.admin_feed.client.metrics().await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => upstream_error(&err),
+    }
 }
 
 /// Stream SSE de métricas de administración: `snapshot` primero, después
@@ -117,183 +131,108 @@ pub(crate) async fn admin_metrics(State(state): State<AppState>) -> Json<AdminSn
 pub(crate) async fn admin_events(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(events_stream(
-        Arc::clone(&state.admin_feed),
+) -> Response {
+    let upstream = match state.admin_feed.client.open_events().await {
+        Ok(upstream) => upstream,
+        Err(err) => return upstream_error(&err),
+    };
+    let stream = events_stream(
+        upstream,
+        state.admin_feed.role_recheck_interval,
         Arc::clone(&state.usuarios_client),
         session,
-    ))
-    .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL).text("ping"))
+    );
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// `503` si `events-service` no responde; `502` (genérico) ante cualquier otra
+/// respuesta inesperada. El detalle ya se loggeó en el cliente.
+fn upstream_error(err: &EventsClientError) -> Response {
+    match err {
+        EventsClientError::Unreachable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "servicio de eventos no disponible",
+        )
+            .into_response(),
+        EventsClientError::UnexpectedResponse { .. } | EventsClientError::RequestBuild => (
+            StatusCode::BAD_GATEWAY,
+            "respuesta inválida del servicio de eventos",
+        )
+            .into_response(),
+    }
 }
 
 struct StreamState {
-    feed: Arc<AdminFeed>,
+    upstream: UpstreamBytes,
+    frames: FrameBuffer,
     usuarios: Arc<UsuariosClient>,
     session: Session,
-    receiver: broadcast::Receiver<AdminDelta>,
     ticker: tokio::time::Interval,
-    /// Eventos ya armados que faltan por enviar, en orden.
-    pending: VecDeque<Event>,
+    /// Frames completos que faltan por enviar, en orden.
+    pending: VecDeque<Bytes>,
     /// `true` tras encolar `closed`: cuando `pending` se vacía, el stream termina.
     closing: bool,
 }
 
-fn snapshot_event(snapshot: &AdminSnapshot) -> Event {
-    Event::default()
-        .event("snapshot")
-        .json_data(snapshot)
-        .unwrap_or_else(|_| serialization_error_event())
+fn closed_frame() -> Bytes {
+    let data = serde_json::to_string(&AdminStreamClosed {
+        reason: CLOSE_REASON,
+    })
+    .unwrap_or_else(|_| "{}".to_string());
+    Bytes::from(format!("event: closed\ndata: {data}\n\n"))
 }
 
-fn delta_event(delta: &AdminDelta) -> Event {
-    Event::default()
-        .event("delta")
-        .json_data(delta)
-        .unwrap_or_else(|_| serialization_error_event())
-}
-
-fn serialization_error_event() -> Event {
-    Event::default()
-        .event("error")
-        .data("no se pudo serializar el evento")
-}
-
-/// Construye el stream de un cliente admin. Separada del handler para probar
-/// el lag y la revalidación sin pasar por HTTP.
+/// Reenvía `upstream` frame a frame e inyecta `closed` (y termina) cuando la
+/// revalidación del rol falla. Separada del handler para probarla sin HTTP.
 pub(crate) fn events_stream(
-    feed: Arc<AdminFeed>,
+    upstream: UpstreamBytes,
+    role_recheck_interval: Duration,
     usuarios: Arc<UsuariosClient>,
     session: Session,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    let (snapshot, receiver) = feed.aggregator.subscribe_with_snapshot();
-    let period = feed.role_recheck_interval;
-    let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let mut ticker = tokio::time::interval_at(
+        Instant::now() + role_recheck_interval,
+        role_recheck_interval,
+    );
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
     let state = StreamState {
-        feed,
+        upstream,
+        frames: FrameBuffer::new(),
         usuarios,
         session,
-        receiver,
         ticker,
-        pending: VecDeque::from([snapshot_event(&snapshot)]),
+        pending: VecDeque::new(),
         closing: false,
     };
 
     stream::unfold(state, |mut state| async move {
         loop {
-            if let Some(event) = state.pending.pop_front() {
-                return Some((Ok(event), state));
+            if let Some(frame) = state.pending.pop_front() {
+                return Some((Ok(frame), state));
             }
             if state.closing {
                 return None;
             }
             tokio::select! {
-                received = state.receiver.recv() => match received {
-                    Ok(delta) => state.pending.push_back(delta_event(&delta)),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::debug!(skipped, "cliente SSE de administración atrasado; se reenvía un snapshot");
-                        resync(&mut state);
+                chunk = state.upstream.next() => match chunk {
+                    Some(Ok(bytes)) => state.pending.extend(state.frames.push(&bytes)),
+                    Some(Err(_)) | None => {
+                        tracing::info!("el stream de events-service terminó; se cierra el del cliente");
+                        return None;
                     }
-                    Err(broadcast::error::RecvError::Closed) => return None,
                 },
                 _ = state.ticker.tick() => {
-                    match verify_admin(&state.usuarios, &state.session).await {
-                        Ok(()) => resync(&mut state),
-                        Err(_) => {
-                            // `verify_admin` ya loggeó la causa (sin datos personales).
-                            let closed = Event::default()
-                                .event("closed")
-                                .json_data(AdminStreamClosed { reason: CLOSE_REASON })
-                                .unwrap_or_else(|_| serialization_error_event());
-                            state.pending.push_back(closed);
-                            state.closing = true;
-                        }
+                    // `verify_admin` ya loggeó la causa (sin datos personales).
+                    if verify_admin(&state.usuarios, &state.session).await.is_err() {
+                        state.pending.push_back(closed_frame());
+                        state.closing = true;
                     }
                 }
             }
         }
     })
-}
-
-/// Reemplaza el receptor por uno nuevo y encola un snapshot consistente con
-/// él (descarta los deltas atrasados, que el snapshot ya refleja).
-fn resync(state: &mut StreamState) {
-    let (snapshot, receiver) = state.feed.aggregator.subscribe_with_snapshot();
-    state.receiver = receiver;
-    state.pending.clear();
-    state.pending.push_back(snapshot_event(&snapshot));
-}
-
-#[cfg(test)]
-mod tests {
-    use futures_util::StreamExt;
-    use secrecy::SecretString;
-
-    use super::*;
-    use crate::admin::{AdminAggregator, ManualClock, DELTA_CHANNEL_CAPACITY};
-    use crate::domain::Role;
-    use crate::security_events::SecurityEvent;
-
-    fn login(n: u64) -> SecurityEvent {
-        serde_json::from_value(serde_json::json!({
-            "event_id": format!("00000000-0000-4000-8000-{n:012}"),
-            "event_type": "auth.login",
-            "occurred_at": "2026-11-10T12:00:00Z",
-            "source": "gateway",
-            "actor_sub": format!("user-{n}"),
-            "payload": {}
-        }))
-        .unwrap()
-    }
-
-    fn admin_session() -> Session {
-        Session {
-            sub: "admin-1".into(),
-            email: "a@example.com".into(),
-            name: "A".into(),
-            exp: u64::MAX,
-            role: Role::Admin,
-        }
-    }
-
-    #[tokio::test]
-    async fn a_lagging_client_gets_a_fresh_snapshot_instead_of_an_error() {
-        let aggregator = Arc::new(AdminAggregator::new(Arc::new(ManualClock::new(0))));
-        // Intervalo largo: este test no ejerce la revalidación.
-        let feed = Arc::new(AdminFeed::new(
-            aggregator.clone(),
-            Duration::from_secs(3600),
-        ));
-        let usuarios = Arc::new(
-            UsuariosClient::new(
-                "http://ms-usuarios.invalid".into(),
-                SecretString::from("x".to_string()),
-            )
-            .unwrap(),
-        );
-        let mut stream = std::pin::pin!(events_stream(feed, usuarios, admin_session()));
-
-        let first = format!("{:?}", stream.next().await.unwrap().unwrap());
-        assert!(first.contains("snapshot"), "{first}");
-
-        // El cliente no lee mientras se desborda el canal.
-        for n in 0..(DELTA_CHANNEL_CAPACITY as u64 + 20) {
-            aggregator.ingest(&login(n));
-        }
-
-        let next = format!("{:?}", stream.next().await.unwrap().unwrap());
-        assert!(
-            next.contains("snapshot"),
-            "tras el lag llega un snapshot: {next}"
-        );
-        assert!(
-            next.contains(&format!("\\\"seq\\\":{}", DELTA_CHANNEL_CAPACITY + 20)),
-            "el snapshot refleja todo lo ingerido: {next}"
-        );
-
-        aggregator.ingest(&login(10_000));
-        let after = format!("{:?}", stream.next().await.unwrap().unwrap());
-        assert!(after.contains("delta"), "luego siguen los deltas: {after}");
-    }
 }

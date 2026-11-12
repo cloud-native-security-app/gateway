@@ -168,3 +168,29 @@ fn admin_routes_document_their_authorization_responses_and_schemas() {
     }
     assert!(spec["components"]["schemas"]["AdminDelta"]["properties"]["seq"].is_object());
 }
+
+/// Feature `admin_feed_proxy`: mover el consumidor y el agregador a
+/// `events-service` no cambia el contrato público. Las rutas `/api/admin/*` y
+/// sus esquemas deben coincidir con el snapshot tomado antes de la
+/// extracción (`tests/fixtures/admin_openapi.json`).
+#[test]
+fn admin_paths_and_schemas_match_the_pre_extraction_snapshot() {
+    let spec = generated_spec_as_json();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/admin_openapi.json"))
+            .expect("el snapshot debe ser JSON válido");
+
+    let mut paths = serde_json::Map::new();
+    for (path, item) in spec["paths"].as_object().unwrap() {
+        if path.starts_with("/api/admin/") {
+            paths.insert(path.clone(), item.clone());
+        }
+    }
+    assert_eq!(serde_json::Value::Object(paths), expected["paths"]);
+
+    let mut schemas = serde_json::Map::new();
+    for name in expected["schemas"].as_object().unwrap().keys() {
+        schemas.insert(name.clone(), spec["components"]["schemas"][name].clone());
+    }
+    assert_eq!(serde_json::Value::Object(schemas), expected["schemas"]);
+}

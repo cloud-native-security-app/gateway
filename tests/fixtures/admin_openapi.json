@@ -1,0 +1,416 @@
+{
+  "paths": {
+    "/api/admin/events": {
+      "get": {
+        "operationId": "admin_events",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Stream `text/event-stream`. Eventos: `snapshot` (datos: AdminSnapshot), `delta` (datos: AdminDelta) y `closed` (datos: AdminStreamClosed)."
+          },
+          "401": {
+            "description": "Sesión ausente, con firma inválida, o expirada."
+          },
+          "403": {
+            "description": "La sesión no es de un administrador vigente."
+          },
+          "503": {
+            "description": "No se pudo verificar el rol contra ms-usuarios."
+          }
+        },
+        "security": [
+          {
+            "session_cookie": []
+          }
+        ],
+        "summary": "Stream SSE de métricas de administración: `snapshot` primero, después\n`delta`, con revalidación periódica del rol (ver la documentación del\nmódulo).",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/metrics": {
+      "get": {
+        "operationId": "admin_metrics",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminSnapshot"
+                }
+              }
+            },
+            "description": "Snapshot de las métricas de administración."
+          },
+          "401": {
+            "description": "Sesión ausente, con firma inválida, o expirada."
+          },
+          "403": {
+            "description": "La sesión no es de un administrador vigente."
+          },
+          "503": {
+            "description": "No se pudo verificar el rol contra ms-usuarios."
+          }
+        },
+        "security": [
+          {
+            "session_cookie": []
+          }
+        ],
+        "summary": "Snapshot actual de las métricas de administración.",
+        "tags": [
+          "admin"
+        ]
+      }
+    }
+  },
+  "schemas": {
+    "AdminDelta": {
+      "description": "Cambio incremental que emite el agregador tras cada evento (o registro\nmalformado).",
+      "properties": {
+        "critical_finding": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/components/schemas/CriticalFinding",
+              "description": "Hallazgo crítico nuevo, si el evento era `finding.critical`."
+            }
+          ]
+        },
+        "event": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/components/schemas/EventEntry",
+              "description": "Evento que se añade al registro; ausente si el delta es solo por un\nregistro malformado."
+            }
+          ]
+        },
+        "kpis": {
+          "$ref": "#/components/schemas/Kpis",
+          "description": "KPIs completos tras aplicar el cambio."
+        },
+        "scan_change": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/components/schemas/ScanChange",
+              "description": "Cambio en la lista de escaneos en curso, si lo hubo."
+            }
+          ]
+        },
+        "seq": {
+          "description": "Número de secuencia, creciente de a uno.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "kpis"
+      ],
+      "type": "object"
+    },
+    "AdminSnapshot": {
+      "description": "Vista completa del estado, que sirve `GET /api/admin/metrics` y el primer\nevento `snapshot` del stream SSE.",
+      "properties": {
+        "critical_findings": {
+          "description": "Hallazgos críticos, el más reciente primero (máx. 50).",
+          "items": {
+            "$ref": "#/components/schemas/CriticalFinding"
+          },
+          "type": "array"
+        },
+        "generated_at": {
+          "description": "Instante (RFC 3339, UTC) en que se generó.",
+          "type": "string"
+        },
+        "kpis": {
+          "$ref": "#/components/schemas/Kpis",
+          "description": "Indicadores clave."
+        },
+        "recent_events": {
+          "description": "Últimos eventos, el más reciente primero (máx. 100).",
+          "items": {
+            "$ref": "#/components/schemas/EventEntry"
+          },
+          "type": "array"
+        },
+        "scans_in_flight": {
+          "description": "Escaneos en curso, del más antiguo al más reciente.",
+          "items": {
+            "$ref": "#/components/schemas/InFlightScan"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "description": "Número de secuencia del último delta que refleja este snapshot.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_seconds": {
+          "description": "Ancho de la ventana de los KPIs, en segundos.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "generated_at",
+        "window_seconds",
+        "kpis",
+        "scans_in_flight",
+        "critical_findings",
+        "recent_events"
+      ],
+      "type": "object"
+    },
+    "AdminStreamClosed": {
+      "description": "Datos del evento SSE `closed`.",
+      "properties": {
+        "reason": {
+          "description": "Motivo del cierre (`role_revalidation_failed`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "CriticalFinding": {
+      "description": "Hallazgo crítico (`finding.critical`).",
+      "properties": {
+        "confidence": {
+          "description": "`confirmed` o `version_match`.",
+          "type": "string"
+        },
+        "cve_id": {
+          "description": "CVE asociado, si lo hay.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_id": {
+          "description": "`event_id` del evento (identificador estable para el cliente).",
+          "type": "string"
+        },
+        "occurred_at": {
+          "description": "Instante del evento según el productor.",
+          "type": "string"
+        },
+        "port": {
+          "description": "Puerto afectado; `None` (`null`) en un hallazgo a nivel de host.",
+          "format": "int32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "protocol": {
+          "description": "`tcp` o `udp`; `None` (`null`) en un hallazgo a nivel de host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scan_id": {
+          "description": "Escaneo al que pertenece.",
+          "type": "string"
+        },
+        "severity": {
+          "description": "`high` o `critical`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "occurred_at",
+        "scan_id",
+        "severity",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "EventEntry": {
+      "description": "Entrada del registro de eventos: campos del sobre más el `payload`, nada más.",
+      "properties": {
+        "actor_sub": {
+          "description": "`sub` seudónimo del usuario que causó el evento, si aplica.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_id": {
+          "description": "UUID del evento.",
+          "type": "string"
+        },
+        "event_type": {
+          "description": "Tipo del evento (`scan.requested`, ...).",
+          "type": "string"
+        },
+        "occurred_at": {
+          "description": "Instante del evento según el productor (RFC 3339).",
+          "type": "string"
+        },
+        "payload": {
+          "description": "Carga útil del contrato para ese tipo de evento."
+        },
+        "scan_id": {
+          "description": "Escaneo al que pertenece el evento, si aplica.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Servicio productor.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "event_type",
+        "occurred_at",
+        "source",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "InFlightScan": {
+      "description": "Escaneo en curso.",
+      "properties": {
+        "scan_id": {
+          "description": "Identificador del escaneo.",
+          "type": "string"
+        },
+        "since": {
+          "description": "Instante (RFC 3339, UTC) en que se empezó a rastrear.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/components/schemas/ScanFlightStatus",
+          "description": "Estado actual."
+        }
+      },
+      "required": [
+        "scan_id",
+        "status",
+        "since"
+      ],
+      "type": "object"
+    },
+    "Kpis": {
+      "description": "Indicadores clave del panel.",
+      "properties": {
+        "active_users": {
+          "description": "Usuarios distintos con login en la ventana y sin logout posterior.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completed_last_window": {
+          "description": "`scan.completed` en la ventana.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_last_window": {
+          "description": "`scan.failed` en la ventana.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failure_rate": {
+          "description": "`failed / (completed + failed)` en la ventana; `null` sin escaneos.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "malformed_records": {
+          "description": "Registros descartados por malformados desde que arrancó el proceso.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rate_limit_hits": {
+          "description": "`ratelimit.hit` en la ventana.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scans_in_flight": {
+          "description": "Escaneos en curso (pedidos o empezados, sin evento terminal).",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scans_in_flight",
+        "completed_last_window",
+        "failed_last_window",
+        "active_users",
+        "rate_limit_hits",
+        "malformed_records"
+      ],
+      "type": "object"
+    },
+    "ScanChange": {
+      "description": "Cambio de un escaneo en curso.",
+      "properties": {
+        "scan_id": {
+          "description": "Escaneo afectado.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/components/schemas/ScanChangeStatus",
+          "description": "Nuevo estado."
+        }
+      },
+      "required": [
+        "scan_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ScanChangeStatus": {
+      "description": "Cambio de un escaneo en un [`AdminDelta`].",
+      "enum": [
+        "requested",
+        "running",
+        "finished"
+      ],
+      "type": "string"
+    },
+    "ScanFlightStatus": {
+      "description": "Estado de un escaneo en curso.",
+      "enum": [
+        "requested",
+        "running"
+      ],
+      "type": "string"
+    }
+  }
+}

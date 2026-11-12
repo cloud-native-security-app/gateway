@@ -43,6 +43,12 @@ const ENV_MS_USUARIOS_BASE_URL: &str = "MS_USUARIOS_BASE_URL";
 /// Nombre de la variable de entorno con la credencial de servicio
 /// compartida con `ms-usuarios`.
 const ENV_MS_USUARIOS_SHARED_SECRET: &str = "MS_USUARIOS_SHARED_SECRET";
+/// Nombre de la variable de entorno con la URL base de `events-service`
+/// (proxy del panel de administración).
+const ENV_EVENTS_SERVICE_BASE_URL: &str = "EVENTS_SERVICE_BASE_URL";
+/// Nombre de la variable de entorno con la credencial de servicio
+/// compartida con `events-service`.
+const ENV_EVENTS_SERVICE_SHARED_SECRET: &str = "EVENTS_SERVICE_SHARED_SECRET";
 /// Nombre de la variable de entorno con el número máximo de solicitudes de
 /// `POST /api/scans` que un mismo usuario (identidad de la sesión, no IP,
 /// ver `docs/security-scope.md`) puede hacer dentro de una ventana de
@@ -133,6 +139,11 @@ pub struct Config {
     /// Credencial de servicio compartida con `ms-usuarios`. Nunca se
     /// loggea.
     pub ms_usuarios_shared_secret: SecretString,
+    /// URL base de `events-service`, nunca expuesta a `front`.
+    pub events_service_base_url: String,
+    /// Credencial de servicio compartida con `events-service`. Nunca se
+    /// loggea.
+    pub events_service_shared_secret: SecretString,
     /// Número máximo de solicitudes de `POST /api/scans` que un mismo
     /// usuario puede hacer dentro de
     /// [`Config::scan_submission_rate_limit_window_secs`] (RF-12, feature
@@ -378,6 +389,8 @@ impl Config {
         let front_origin = front_origin_from_base_url(ENV_FRONT_BASE_URL, &front_base_url)?;
         let ms_usuarios_base_url = required_string(ENV_MS_USUARIOS_BASE_URL)?;
         let ms_usuarios_shared_secret = required_secret(ENV_MS_USUARIOS_SHARED_SECRET)?;
+        let events_service_base_url = required_string(ENV_EVENTS_SERVICE_BASE_URL)?;
+        let events_service_shared_secret = required_secret(ENV_EVENTS_SERVICE_SHARED_SECRET)?;
         let scan_submission_rate_limit_max_requests =
             required_string(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS)?
                 .parse::<u32>()
@@ -421,6 +434,8 @@ impl Config {
             front_origin,
             ms_usuarios_base_url,
             ms_usuarios_shared_secret,
+            events_service_base_url,
+            events_service_shared_secret,
             scan_submission_rate_limit_max_requests,
             scan_submission_rate_limit_window_secs,
             aws_region,
@@ -456,6 +471,8 @@ mod tests {
         ENV_FRONT_BASE_URL,
         ENV_MS_USUARIOS_BASE_URL,
         ENV_MS_USUARIOS_SHARED_SECRET,
+        ENV_EVENTS_SERVICE_BASE_URL,
+        ENV_EVENTS_SERVICE_SHARED_SECRET,
         ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS,
         ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS,
         ENV_AWS_REGION,
@@ -494,6 +511,14 @@ mod tests {
         env::set_var(ENV_FRONT_BASE_URL, "https://front.lab/post-login");
         env::set_var(ENV_MS_USUARIOS_BASE_URL, "http://ms-usuarios.internal");
         env::set_var(ENV_MS_USUARIOS_SHARED_SECRET, "lab-only-not-a-real-secret");
+        env::set_var(
+            ENV_EVENTS_SERVICE_BASE_URL,
+            "http://events-service.internal",
+        );
+        env::set_var(
+            ENV_EVENTS_SERVICE_SHARED_SECRET,
+            "lab-only-events-secret-not-real",
+        );
         env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_MAX_REQUESTS, "5");
         env::set_var(ENV_SCAN_SUBMISSION_RATE_LIMIT_WINDOW_SECS, "60");
         env::set_var(ENV_AWS_REGION, "us-east-1");
@@ -528,6 +553,14 @@ mod tests {
             "front_origin debe ser el origen (sin path) de FRONT_BASE_URL"
         );
         assert_eq!(config.ms_usuarios_base_url, "http://ms-usuarios.internal");
+        assert_eq!(
+            config.events_service_base_url,
+            "http://events-service.internal"
+        );
+        assert_eq!(
+            config.events_service_shared_secret.expose_secret(),
+            "lab-only-events-secret-not-real"
+        );
         assert_eq!(
             config.google_oidc_issuer_url, DEFAULT_GOOGLE_OIDC_ISSUER_URL,
             "sin GOOGLE_OIDC_ISSUER_URL debe usarse el issuer real de Google por defecto"

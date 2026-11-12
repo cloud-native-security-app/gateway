@@ -45,8 +45,8 @@ impl KinesisSecurityEventPublisher {
 
 /// Construye un cliente de Kinesis con la cadena de credenciales por defecto
 /// de AWS, la `region` indicada y, opcionalmente, un `endpoint_url` (solo
-/// LocalStack). Lo comparten el publicador de este módulo y el consumidor
-/// ([`crate::kinesis_consumer`]).
+/// LocalStack). Lo usa el publicador de este módulo (la lectura del stream
+/// vive en `events-service`).
 pub async fn build_client(region: &str, endpoint_url: Option<&str>) -> Client {
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(region.to_string()));
