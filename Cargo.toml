@@ -16,7 +16,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 secrecy = "0.10.3"
 thiserror = "2.0.20"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# `Bytes`/`BytesMut` del proxy SSE (`src/events_client.rs`, `src/admin_routes.rs`).
+bytes = "1"
 # `AppState` guarda el publicador del Broker como `Arc<dyn ScanRequestPublisher>`
 # (feature `scan_submission`) para que los tests de otras features no
 # necesiten LocalStack/AWS solo para construir el router; los traits
@@ -79,15 +81,6 @@ rand = "0.8"
 base64 = "0.22"
 # `url` ya está en `[dependencies]` (feature `cors_for_front`, ver arriba) y
 # por lo tanto ya disponible en `tests/`; no se repite aquí.
-# `Response::bytes_stream()` en los tests de integración del stream SSE
-# (feature `scan_outcome_relay`) está tras este feature de `reqwest`, no
-# activo en `[dependencies]` (ver `docs/decisions.md` D-06).
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
-# `bytes::Bytes` es el `Item` de `Response::bytes_stream()`, usado para leer
-# a mano el `text/event-stream` en los tests de `scan_outcome_relay` (ya es
-# una dependencia transitiva de `reqwest`, se declara explícita para poder
-# nombrarla en `tests/`).
-bytes = "1"
 # Valida cada evento emitido contra `../broker/contracts/security-event.schema.json`
 # (`tests/security_event_contract.rs`). Misma versión y features que `broker`
 # (sin resolución de referencias remotas: el schema es autocontenido).

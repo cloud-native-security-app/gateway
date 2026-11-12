@@ -1,35 +1,43 @@
 //! Arnés compartido de los tests de las rutas de administración (feature
 //! `admin_realtime_feed`): el router real de `gateway::api::app_router` con un
 //! `ms-usuarios` stub cuyos roles por identidad puede cambiar el test (para
-//! probar revocaciones) y un agregador inyectable.
+//! probar revocaciones) y un `events-service` falso ([`FakeEventsService`])
+//! servido en proceso.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use gateway::admin::{AdminAggregator, AdminFeed, ManualClock};
+use bytes::Bytes;
+use gateway::admin::AdminFeed;
 use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
-use gateway::event_contract::parse_record;
+use gateway::events_client::EventsClient;
 use gateway::realtime::RealtimeRegistry;
-use gateway::security_events::{NoopSecurityEventPublisher, SecurityEvent};
+use gateway::security_events::NoopSecurityEventPublisher;
 use gateway::usuarios_client::{UsuariosClient, FORWARDED_USER_HEADER_NAME};
 use jsonwebtoken::jwk::JwkSet;
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 const SESSION_AUDIENCE: &str = "gateway-test";
 const SESSION_ISSUER: &str = "gateway-test-issuer";
 const SESSION_SIGNING_KEY: &str = "lab-only-not-a-real-secret";
 const SHARED_SECRET: &str = "lab-only-usuarios-shared-secret";
+/// Credencial de servicio que el gateway debe enviar a `events-service`.
+pub const EVENTS_SECRET: &str = "lab-only-events-shared-secret";
 
 pub struct NeverPublishesToBroker;
 
@@ -107,24 +115,131 @@ async fn spawn_discovery_only_idp() -> String {
 
 pub struct Gateway {
     pub addr: SocketAddr,
-    pub feed: Arc<AdminFeed>,
     pub usuarios: UsuariosStub,
 }
 
-/// Gateway completo con un agregador de reloj manual vacío.
-pub async fn spawn_gateway(role_recheck_interval: Duration) -> Gateway {
-    let feed = Arc::new(AdminFeed::new(
-        Arc::new(AdminAggregator::new(Arc::new(ManualClock::new(
-            1_800_000_000_000,
-        )))),
-        role_recheck_interval,
-    ));
-    spawn_gateway_with_feed(feed).await
+/// `events-service` falso, en proceso y vivo mientras el test lo conserve:
+/// `GET /metrics` devuelve la respuesta configurada y `GET /events` entrega
+/// los trozos que el test empuja con [`FakeEventsService::push`].
+pub struct FakeEventsService {
+    pub addr: SocketAddr,
+    /// Peticiones recibidas (cualquier ruta).
+    pub calls: Arc<AtomicUsize>,
+    /// Último valor del header `X-Gateway-Secret` recibido.
+    pub last_secret: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Mutex<(StatusCode, String)>>,
+    sender: Mutex<Option<mpsc::UnboundedSender<Bytes>>>,
 }
 
-/// Gateway completo (router real) sobre el `feed` dado, con `ms-usuarios`
-/// stub de roles por identidad.
-pub async fn spawn_gateway_with_feed(feed: Arc<AdminFeed>) -> Gateway {
+#[derive(Clone)]
+struct FakeState {
+    calls: Arc<AtomicUsize>,
+    last_secret: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Mutex<(StatusCode, String)>>,
+    receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<Bytes>>>>,
+}
+
+fn record(state: &FakeState, headers: &HeaderMap) {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    *state.last_secret.lock().unwrap() = headers
+        .get("x-gateway-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+}
+
+async fn fake_metrics(State(state): State<FakeState>, headers: HeaderMap) -> Response {
+    record(&state, &headers);
+    let (status, body) = state.metrics.lock().unwrap().clone();
+    (status, [("content-type", "application/json")], body).into_response()
+}
+
+async fn fake_events(State(state): State<FakeState>, headers: HeaderMap) -> Response {
+    record(&state, &headers);
+    let Some(mut rx) = state.receiver.lock().unwrap().take() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        rx.poll_recv(cx)
+            .map(|chunk| chunk.map(Ok::<Bytes, std::convert::Infallible>))
+    });
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+impl FakeEventsService {
+    pub async fn spawn() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let state = FakeState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            last_secret: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(Mutex::new((StatusCode::OK, "{}".to_string()))),
+            receiver: Arc::new(Mutex::new(Some(rx))),
+        };
+        Self {
+            addr: serve(
+                Router::new()
+                    .route("/metrics", get(fake_metrics))
+                    .route("/events", get(fake_events))
+                    .with_state(state.clone()),
+            )
+            .await,
+            calls: state.calls.clone(),
+            last_secret: state.last_secret.clone(),
+            metrics: state.metrics.clone(),
+            sender: Mutex::new(Some(tx)),
+        }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn set_metrics(&self, status: StatusCode, body: &str) {
+        *self.metrics.lock().unwrap() = (status, body.to_string());
+    }
+
+    /// Empuja un trozo crudo al stream `GET /events` (puede cortar un frame).
+    pub fn push(&self, chunk: &str) {
+        self.sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("el stream ya terminó")
+            .send(Bytes::from(chunk.to_string()))
+            .expect("el gateway cerró la conexión");
+    }
+
+    /// Termina el stream upstream (como un apagado de `events-service`).
+    pub fn end(&self) {
+        self.sender.lock().unwrap().take();
+    }
+}
+
+/// Dirección en la que no escucha nadie (el puerto se liberó), para probar
+/// un `events-service` inalcanzable.
+pub async fn unreachable_base_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+/// Gateway completo (router real) cuyo `events-service` es `events_base_url`,
+/// con `ms-usuarios` stub de roles por identidad.
+pub async fn spawn_gateway(events_base_url: &str, role_recheck_interval: Duration) -> Gateway {
+    let feed = Arc::new(AdminFeed::new(
+        Arc::new(
+            EventsClient::with_connect_timeout(
+                events_base_url.to_string(),
+                SecretString::from(EVENTS_SECRET.to_string()),
+                Duration::from_millis(500),
+            )
+            .expect("cliente de events-service"),
+        ),
+        role_recheck_interval,
+    ));
     let issuer = spawn_discovery_only_idp().await;
     let oidc = OidcClient::discover(
         &issuer,
@@ -167,12 +282,11 @@ pub async fn spawn_gateway_with_feed(feed: Arc<AdminFeed>) -> Gateway {
             Duration::from_secs(60),
         )),
         security_events: Arc::new(NoopSecurityEventPublisher),
-        admin_feed: feed.clone(),
+        admin_feed: feed,
     };
     let addr = serve(app_router(state)).await;
     Gateway {
         addr,
-        feed,
         usuarios: usuarios_stub,
     }
 }
@@ -220,27 +334,4 @@ pub async fn get_with(gw: &Gateway, path: &str, cookie: Option<&str>) -> reqwest
         request = request.header(reqwest::header::COOKIE, cookie);
     }
     request.send().await.expect("la ruta debe responder")
-}
-
-pub fn event(
-    n: u64,
-    event_type: &str,
-    actor: Option<&str>,
-    scan: Option<&str>,
-    payload: Value,
-) -> SecurityEvent {
-    let mut body = json!({
-        "event_id": format!("00000000-0000-4000-8000-{n:012}"),
-        "event_type": event_type,
-        "occurred_at": "2026-11-10T12:00:00Z",
-        "source": "gateway",
-        "payload": payload,
-    });
-    if let Some(actor) = actor {
-        body["actor_sub"] = json!(actor);
-    }
-    if let Some(scan) = scan {
-        body["scan_id"] = json!(scan);
-    }
-    parse_record(&serde_json::to_vec(&body).unwrap()).expect("evento válido")
 }

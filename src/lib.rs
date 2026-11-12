@@ -14,9 +14,8 @@ pub mod auth;
 pub mod broker;
 pub mod config;
 pub mod domain;
-pub mod event_contract;
+pub mod events_client;
 pub mod kinesis;
-pub mod kinesis_consumer;
 pub mod realtime;
 pub mod security_events;
 pub mod sns;
@@ -106,17 +105,17 @@ pub async fn run() -> Result<(), RunError> {
             .run(built.scan_outcome_handler, shutdown.clone()),
     );
 
-    // Consumidor del stream de eventos de seguridad del panel de
-    // administración (solo si hay `SECURITY_EVENTS_STREAM_NAME`).
-    let event_consumer = built
-        .security_event_consumer
-        .map(|consumer| tokio::spawn(consumer.run(shutdown.clone())));
-
     let app = api::app_router(built.state);
     let listener = match TcpListener::bind((http_host.as_str(), http_port)).await {
         Ok(listener) => listener,
         Err(source) => {
-            stop_consumers(&shutdown, consumer, event_consumer).await;
+            stop_consumer(
+                &shutdown,
+                consumer,
+                CONSUMER_SHUTDOWN_TIMEOUT,
+                "consumidor SQS",
+            )
+            .await;
             return Err(RunError::Bind {
                 host: http_host,
                 port: http_port,
@@ -144,7 +143,13 @@ pub async fn run() -> Result<(), RunError> {
         }
     };
 
-    stop_consumers(&shutdown, consumer, event_consumer).await;
+    stop_consumer(
+        &shutdown,
+        consumer,
+        CONSUMER_SHUTDOWN_TIMEOUT,
+        "consumidor SQS",
+    )
+    .await;
     served.map_err(RunError::Serve)
 }
 
@@ -177,35 +182,6 @@ async fn shutdown_signal() {
         () = ctrl_c => {}
         () = terminate => {}
     }
-}
-
-/// Cancela el token compartido y espera, en paralelo, a la tarea del
-/// consumidor SQS y a la del consumidor de eventos de seguridad (si existe),
-/// cada una con [`CONSUMER_SHUTDOWN_TIMEOUT`].
-async fn stop_consumers(
-    token: &CancellationToken,
-    sqs_consumer: JoinHandle<()>,
-    event_consumer: Option<JoinHandle<()>>,
-) {
-    token.cancel();
-    let events = async {
-        if let Some(handle) = event_consumer {
-            stop_consumer(
-                token,
-                handle,
-                CONSUMER_SHUTDOWN_TIMEOUT,
-                "consumidor de eventos de seguridad",
-            )
-            .await;
-        }
-    };
-    let sqs = stop_consumer(
-        token,
-        sqs_consumer,
-        CONSUMER_SHUTDOWN_TIMEOUT,
-        "consumidor SQS",
-    );
-    tokio::join!(events, sqs);
 }
 
 /// Cancela `token` y espera hasta `timeout` a que la tarea del consumidor
