@@ -125,6 +125,29 @@
       ],
       "type": "object"
     },
+    "AdminSeries": {
+      "description": "Serie temporal: exactamente 15 cubetas de un minuto (UTC), la más antigua\nprimero; la última es el minuto actual. Las cubetas vacías llevan mapas\nvacíos.",
+      "properties": {
+        "bucket_seconds": {
+          "description": "Ancho de cada cubeta, en segundos (siempre 60).",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "buckets": {
+          "description": "Cubetas, la más antigua primero.",
+          "items": {
+            "$ref": "#/components/schemas/SeriesBucket"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bucket_seconds",
+        "buckets"
+      ],
+      "type": "object"
+    },
     "AdminSnapshot": {
       "description": "Vista completa del estado, que sirve `GET /api/admin/metrics` y el primer\nevento `snapshot` del stream SSE.",
       "properties": {
@@ -163,6 +186,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "series": {
+          "$ref": "#/components/schemas/AdminSeries",
+          "description": "Serie por minuto de los últimos 15 minutos."
+        },
         "window_seconds": {
           "description": "Ancho de la ventana de los KPIs, en segundos.",
           "format": "int64",
@@ -177,7 +204,8 @@
         "kpis",
         "scans_in_flight",
         "critical_findings",
-        "recent_events"
+        "recent_events",
+        "series"
       ],
       "type": "object"
     },
@@ -411,6 +439,45 @@
         "running"
       ],
       "type": "string"
+    },
+    "SeriesBucket": {
+      "description": "Conteos de un minuto de la serie.",
+      "properties": {
+        "by_type": {
+          "additionalProperties": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Eventos por `event_type`.",
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "findings_by_severity": {
+          "additionalProperties": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "`finding.critical` por severidad (`high` o `critical`).",
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "minute": {
+          "description": "Inicio del minuto (RFC 3339, UTC).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "minute",
+        "by_type",
+        "findings_by_severity"
+      ],
+      "type": "object"
     }
   }
 }
