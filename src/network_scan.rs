@@ -6,10 +6,12 @@
 //! metadatos de nube o a direcciones no unicast:
 //!
 //! 1. **Denylist fija** ([`TargetRejection`]): loopback, link-local (incluye
-//!    `169.254.169.254`), multicast, broadcast y sin especificar, para IPv4 y
+//!    `169.254.169.254`), unique-local IPv6 (`fc00::/7`, incluye el metadata
+//!    `fd00:ec2::254`), multicast, broadcast y sin especificar, para IPv4 y
 //!    IPv6. Las formas IPv6 que envuelven un IPv4 (IPv4-mapped
-//!    `::ffff:a.b.c.d` y el obsoleto IPv4-compatible `::a.b.c.d`) se evalúan
-//!    con las reglas del IPv4 envuelto, para que no sean un desvío.
+//!    `::ffff:a.b.c.d` y el obsoleto IPv4-compatible `::a.b.c.d`) se
+//!    canonicalizan a su IPv4 ([`canonical_target`]) antes de evaluar y
+//!    publicar, para que no sean un desvío.
 //! 2. **Allowlist opcional** (`NETWORK_SCAN_ALLOWED_CIDRS`): si no está
 //!    vacía, el objetivo debe caer dentro de alguno de sus CIDR. La denylist
 //!    se evalúa primero y no se puede anular con la allowlist.
@@ -29,6 +31,10 @@ pub enum TargetRejection {
     /// 169.254.0.0/16 (incluye el servicio de metadatos de nube) o fe80::/10.
     #[error("el objetivo es una dirección link-local")]
     LinkLocal,
+    /// fc00::/7 (unique-local IPv6; incluye el metadata IPv6 de AWS,
+    /// `fd00:ec2::254`).
+    #[error("el objetivo es una dirección unique-local")]
+    UniqueLocal,
     /// 224.0.0.0/4 o ff00::/8.
     #[error("el objetivo es una dirección multicast")]
     Multicast,
@@ -51,6 +57,7 @@ impl TargetRejection {
         match self {
             Self::Loopback => "target_loopback",
             Self::LinkLocal => "target_link_local",
+            Self::UniqueLocal => "target_unique_local",
             Self::Multicast => "target_multicast",
             Self::Broadcast => "target_broadcast",
             Self::Unspecified => "target_unspecified",
@@ -59,10 +66,14 @@ impl TargetRejection {
     }
 }
 
-/// Forma canónica de `ip` para evaluar y publicar: un IPv4-mapped
-/// (`::ffff:a.b.c.d`) pasa a su IPv4; cualquier otra dirección queda igual.
+/// Forma canónica de `ip`, la única que se evalúa (denylist y allowlist) y se
+/// publica: un IPv4-mapped (`::ffff:a.b.c.d`) o IPv4-compatible (`::a.b.c.d`)
+/// pasa a su IPv4; `::` y `::1` siguen siendo IPv6; el resto queda igual.
 pub fn canonical_target(ip: IpAddr) -> IpAddr {
-    ip.to_canonical()
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => ipv4_compatible(v6).map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    }
 }
 
 /// IPv4 envuelto en un IPv6 IPv4-compatible obsoleto (`::a.b.c.d`), excluidos
@@ -93,15 +104,14 @@ fn denylisted(ip: IpAddr) -> Option<TargetRejection> {
     match ip {
         IpAddr::V4(v4) => denylisted_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(embedded) = ipv4_compatible(v6) {
-                return denylisted_v4(embedded);
-            }
             if v6.is_unspecified() {
                 Some(TargetRejection::Unspecified)
             } else if v6.is_loopback() {
                 Some(TargetRejection::Loopback)
             } else if v6.segments()[0] & 0xffc0 == 0xfe80 {
                 Some(TargetRejection::LinkLocal)
+            } else if v6.segments()[0] & 0xfe00 == 0xfc00 {
+                Some(TargetRejection::UniqueLocal)
             } else if v6.is_multicast() {
                 Some(TargetRejection::Multicast)
             } else {
@@ -131,8 +141,9 @@ impl NetworkScanPolicy {
 
     /// Evalúa `ip`: primero la denylist, luego la allowlist si la hay. Ambas
     /// sobre la forma canónica ([`canonical_target`]), así que
-    /// `::ffff:10.0.0.7` se trata como `10.0.0.7`.
-    pub fn check_target(&self, ip: IpAddr) -> Result<(), TargetRejection> {
+    /// `::ffff:10.0.0.7` se trata como `10.0.0.7`. Devuelve esa forma
+    /// canónica, que es la que debe publicarse.
+    pub fn check_target(&self, ip: IpAddr) -> Result<IpAddr, TargetRejection> {
         let ip = canonical_target(ip);
         if let Some(rejection) = denylisted(ip) {
             return Err(rejection);
@@ -140,7 +151,7 @@ impl NetworkScanPolicy {
         if !self.allowed.is_empty() && !self.allowed.iter().any(|net| net.contains(&ip)) {
             return Err(TargetRejection::OutsideAllowedRanges);
         }
-        Ok(())
+        Ok(ip)
     }
 }
 
@@ -180,6 +191,10 @@ mod tests {
             // IPv4-compatible (obsoleto) con el mismo riesgo.
             ("::127.0.0.1", "target_loopback"),
             ("::169.254.169.254", "target_link_local"),
+            // Unique-local fc00::/7 (incluye el metadata IPv6 de AWS).
+            ("fd00:ec2::254", "target_unique_local"),
+            ("fc00::1", "target_unique_local"),
+            ("fdff:ffff::1", "target_unique_local"),
         ];
         let policy = NetworkScanPolicy::unrestricted();
         for (raw, reason) in cases {
@@ -202,6 +217,8 @@ mod tests {
             "2001:db8::1",
             "::ffff:10.0.0.5",
             "fec0::1",
+            "fbff::1",
+            "fe00::1",
         ] {
             assert!(policy.check_target(ip(raw)).is_ok(), "{raw} debe aceptarse");
         }
@@ -239,6 +256,13 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_matches_the_canonical_form_of_ipv4_compatible_targets() {
+        let policy = NetworkScanPolicy::new(vec!["10.0.0.0/8".parse().unwrap()]);
+        assert!(policy.check_target(ip("::10.0.0.7")).is_ok());
+        assert!(policy.check_target(ip("::192.0.2.7")).is_err());
+    }
+
+    #[test]
     fn denylist_wins_over_an_allowlist_that_contains_the_target() {
         let policy = NetworkScanPolicy::new(vec![
             "127.0.0.0/8".parse().unwrap(),
@@ -261,8 +285,29 @@ mod tests {
     }
 
     #[test]
+    fn check_target_returns_the_canonical_ip_to_publish() {
+        let policy = NetworkScanPolicy::unrestricted();
+        assert_eq!(policy.check_target(ip("::10.0.0.7")), Ok(ip("10.0.0.7")));
+        assert_eq!(
+            policy.check_target(ip("::ffff:10.0.0.7")),
+            Ok(ip("10.0.0.7"))
+        );
+        assert_eq!(
+            policy.check_target(ip("2001:db8::1")),
+            Ok(ip("2001:db8::1"))
+        );
+    }
+
+    #[test]
     fn canonical_target_unwraps_ipv4_mapped_addresses() {
         assert_eq!(canonical_target(ip("::ffff:10.0.0.5")), ip("10.0.0.5"));
         assert_eq!(canonical_target(ip("2001:db8::1")), ip("2001:db8::1"));
+    }
+
+    #[test]
+    fn canonical_target_unwraps_ipv4_compatible_but_keeps_unspecified_and_loopback() {
+        assert_eq!(canonical_target(ip("::10.0.0.7")), ip("10.0.0.7"));
+        assert_eq!(canonical_target(ip("::")), ip("::"));
+        assert_eq!(canonical_target(ip("::1")), ip("::1"));
     }
 }

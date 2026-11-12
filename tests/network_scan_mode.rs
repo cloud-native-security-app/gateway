@@ -524,6 +524,8 @@ async fn denylisted_targets_get_422_with_a_reason_code_and_nothing_is_published(
         ("::", "target_unspecified"),
         ("::ffff:127.0.0.1", "target_loopback"),
         ("::ffff:169.254.169.254", "target_link_local"),
+        ("::127.0.0.1", "target_loopback"),
+        ("fd00:ec2::254", "target_unique_local"),
         // Un /32 normalizado a IP simple sigue sujeto a la lista.
         ("127.0.0.1/32", "target_loopback"),
     ];
@@ -571,14 +573,17 @@ async fn allowlist_accepts_targets_inside_and_rejects_outside() {
         h.post(network("::ffff:10.0.0.8")).await.status(),
         StatusCode::OK
     );
+    // IPv4-compatible (obsoleto): misma canonicalización.
+    assert_eq!(h.post(network("::10.0.0.9")).await.status(), StatusCode::OK);
     let published = h.published();
     assert_eq!(published[1]["ip"], "10.0.0.8");
+    assert_eq!(published[2]["ip"], "10.0.0.9");
 
     let outside = h.post(network("192.0.2.10")).await;
     assert_eq!(outside.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body: Value = outside.json().await.expect("json");
     assert_eq!(body["reason"], "target_outside_allowed_ranges");
-    assert_eq!(h.published().len(), 2, "el rechazado no se publica");
+    assert_eq!(h.published().len(), 3, "el rechazado no se publica");
 }
 
 #[tokio::test]
@@ -708,8 +713,17 @@ async fn scan_requested_event_carries_scan_mode_for_network_and_stays_unchanged_
 
     let emitted = events.wait_for(2).await;
     assert_eq!(emitted.len(), 2);
-    let network_event = serde_json::to_value(&emitted[0]).unwrap();
-    let ssh_event = serde_json::to_value(&emitted[1]).unwrap();
+    // El orden de llegada de los eventos no está garantizado: se buscan por
+    // su `payload.target`.
+    let find = |target: &str| {
+        emitted
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .find(|event| event["payload"]["target"] == target)
+            .unwrap_or_else(|| panic!("no hay evento para {target}"))
+    };
+    let network_event = find("192.0.2.10");
+    let ssh_event = find("192.0.2.11");
     assert_eq!(network_event["event_type"], "scan.requested");
     assert_eq!(
         network_event["payload"],

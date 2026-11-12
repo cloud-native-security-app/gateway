@@ -232,7 +232,7 @@ async fn get_report(
 async fn report_returns_the_stored_result_translating_the_gateway_scan_id() {
     let (usuarios_url, requested) = spawn_report_stub(StatusCode::OK, stored_result()).await;
     let gateway = spawn_gateway(usuarios_url).await;
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "gw-scan-1",
         "ms-usuarios-9".to_string(),
         session_for("alice"),
@@ -264,7 +264,7 @@ async fn report_of_an_unknown_or_foreign_scan_is_not_found_without_calling_ms_us
     let gateway = spawn_gateway(usuarios_url).await;
     gateway
         .scan_ownership
-        .register("owned-by-alice", "ms-1".to_string(), session_for("alice"));
+        .register_ssh("owned-by-alice", "ms-1".to_string(), session_for("alice"));
 
     let unknown = get_report(&gateway, "no-existe", Some(cookie_for("alice"))).await;
     let foreign = get_report(&gateway, "owned-by-alice", Some(cookie_for("bob"))).await;
@@ -281,7 +281,7 @@ async fn report_maps_ms_usuarios_404_to_404() {
     let gateway = spawn_gateway(usuarios_url).await;
     gateway
         .scan_ownership
-        .register("gw-scan-1", "ms-1".to_string(), session_for("alice"));
+        .register_ssh("gw-scan-1", "ms-1".to_string(), session_for("alice"));
 
     let response = get_report(&gateway, "gw-scan-1", Some(cookie_for("alice"))).await;
 
@@ -298,7 +298,7 @@ async fn report_maps_ms_usuarios_409_to_409_with_a_spanish_error_body() {
     let gateway = spawn_gateway(usuarios_url).await;
     gateway
         .scan_ownership
-        .register("gw-scan-1", "ms-1".to_string(), session_for("alice"));
+        .register_ssh("gw-scan-1", "ms-1".to_string(), session_for("alice"));
 
     let response = get_report(&gateway, "gw-scan-1", Some(cookie_for("alice"))).await;
 
@@ -313,10 +313,10 @@ async fn report_maps_upstream_failures_to_502_and_unreachable_to_504() {
     let failing = spawn_gateway(usuarios_url).await;
     failing
         .scan_ownership
-        .register("gw-scan-1", "ms-1".to_string(), session_for("alice"));
+        .register_ssh("gw-scan-1", "ms-1".to_string(), session_for("alice"));
     let down = spawn_gateway(unreachable_base_url().await).await;
     down.scan_ownership
-        .register("gw-scan-1", "ms-1".to_string(), session_for("alice"));
+        .register_ssh("gw-scan-1", "ms-1".to_string(), session_for("alice"));
 
     let upstream_error = get_report(&failing, "gw-scan-1", Some(cookie_for("alice"))).await;
     let unreachable = get_report(&down, "gw-scan-1", Some(cookie_for("alice"))).await;

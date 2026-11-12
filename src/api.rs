@@ -138,12 +138,14 @@ impl ScanOwnershipRegistry {
 
     /// Registra que `scan_id` (propio de este Gateway) pertenece a `owner`,
     /// y que `ms-usuarios` lo identifica internamente como
-    /// `ms_usuarios_scan_id`.
-    pub fn register(&self, scan_id: &str, ms_usuarios_scan_id: String, owner: Session) {
+    /// `ms_usuarios_scan_id`. El escaneo queda registrado en modo
+    /// [`ScanMode::Ssh`] (el modo por defecto); para otro modo usar
+    /// [`Self::register_with_mode`].
+    pub fn register_ssh(&self, scan_id: &str, ms_usuarios_scan_id: String, owner: Session) {
         self.register_with_mode(scan_id, ms_usuarios_scan_id, owner, ScanMode::Ssh);
     }
 
-    /// Como [`Self::register`], recordando el [`ScanMode`] de la solicitud
+    /// Como [`Self::register_ssh`], recordando el [`ScanMode`] de la solicitud
     /// (`POST /api/scans`, feature `network_scan_mode`).
     pub fn register_with_mode(
         &self,
@@ -899,7 +901,7 @@ enum ScanSubmitError {
         (status = 400, description = "El objetivo (`target`) no es una única IP válida (los rangos no están soportados; solo IPv4/IPv6 o CIDR /32 o /128)."),
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
         (status = 403, description = "Modo `network` sin el permiso `network_scan` vigente en ms-usuarios. Cuerpo JSON `{\"error\": \"network_scan_not_permitted\"}`."),
-        (status = 422, description = "Modo `ssh`: ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo. Modo `network`: objetivo prohibido (loopback, link-local, multicast, broadcast, sin especificar) o fuera de NETWORK_SCAN_ALLOWED_CIDRS; cuerpo JSON `{\"error\": \"network_scan_target_rejected\", \"reason\": <target_loopback|target_link_local|target_multicast|target_broadcast|target_unspecified|target_outside_allowed_ranges>}`. Un `mode` desconocido también responde 422."),
+        (status = 422, description = "Modo `ssh`: ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo. Modo `network`: objetivo prohibido (loopback, link-local, unique-local, multicast, broadcast, sin especificar) o fuera de NETWORK_SCAN_ALLOWED_CIDRS; cuerpo JSON `{\"error\": \"network_scan_target_rejected\", \"reason\": <target_loopback|target_link_local|target_unique_local|target_multicast|target_broadcast|target_unspecified|target_outside_allowed_ranges>}`. Un `mode` desconocido también responde 422."),
         (status = 429, description = "Se superó el límite de solicitudes de escaneo permitidas para este usuario (RF-12)."),
         (status = 501, description = "La API de ms-usuarios para resolver las credenciales de red todavía no existe (ver docs/architecture.md §Dependencia pendiente)."),
         (status = 502, description = "Fallo al registrar el histórico en ms-usuarios o al publicar en el Broker."),
@@ -923,16 +925,16 @@ async fn submit_scan(
     let target = match mode {
         ScanMode::Ssh => submission.target,
         ScanMode::Network => {
-            // `ScanSubmission::parse` ya garantiza una IP; se publica su
-            // forma canónica (un IPv4-mapped pasa a IPv4) para que lo
-            // evaluado y lo escaneado sean la misma dirección.
+            // `ScanSubmission::parse` ya garantiza una IP. `check_target`
+            // evalúa y devuelve la forma canónica (IPv4-mapped/compatible
+            // pasa a IPv4), que es la que se publica: lo evaluado y lo
+            // escaneado son la misma dirección.
             let ip = submission.target.parse::<std::net::IpAddr>().map_err(|_| {
                 ScanSubmissionError::InvalidTarget {
                     target: submission.target.clone(),
                 }
             })?;
-            state.network_scan_policy.check_target(ip)?;
-            crate::network_scan::canonical_target(ip).to_string()
+            state.network_scan_policy.check_target(ip)?.to_string()
         }
     };
 

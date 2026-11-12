@@ -65,7 +65,7 @@
   nube. Exige el permiso `network_scan` re-validado contra `ms-usuarios` en
   cada solicitud (fail closed: `403` sin permiso, `503` si no se puede
   confirmar, sin caché ni claim en el JWT), rechaza con `422` una denylist
-  fija (loopback, link-local incl. `169.254.169.254`, multicast, broadcast,
+  fija (loopback, link-local incl. `169.254.169.254`, unique-local IPv6 `fc00::/7` incl. el metadata `fd00:ec2::254`, multicast, broadcast,
   sin especificar, y sus formas IPv4-mapped/compatibles de IPv6) y, si
   `NETWORK_SCAN_ALLOWED_CIDRS` está definida, todo objetivo fuera de ella. La
   allowlist nunca anula la denylist. No viaja ninguna credencial SSH. **No

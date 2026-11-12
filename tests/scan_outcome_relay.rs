@@ -262,7 +262,7 @@ async fn sse_events_rejects_a_scan_id_owned_by_another_session() {
     let usuarios_base_url = unreachable_usuarios_base_url().await;
     let gateway = spawn_gateway(lab_usuarios_client(usuarios_base_url)).await;
 
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "scan-owned-by-alice",
         "ms-usuarios-1".to_string(),
         session_for("alice"),
@@ -360,7 +360,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     .await;
 
     const SCAN_ID: &str = "scan-int-test-1";
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         SCAN_ID,
         "ms-usuarios-scan-1".to_string(),
         session_for("alice"),
@@ -527,7 +527,7 @@ struct RelayUnderTest {
 async fn relay_with_registered_scan(scan_id: &str) -> RelayUnderTest {
     let (usuarios_base_url, calls) = spawn_usuarios_status_stub().await;
     let ownership = Arc::new(ScanOwnershipRegistry::new());
-    ownership.register(scan_id, "ms-1".to_string(), session_for("alice"));
+    ownership.register_ssh(scan_id, "ms-1".to_string(), session_for("alice"));
     let relay = ScanOutcomeRelay::new(
         Arc::new(lab_usuarios_client(usuarios_base_url)),
         ownership.clone(),
@@ -619,7 +619,7 @@ async fn relay_sends_cancelado_with_the_reason_when_the_user_requested_cancellat
 async fn relay_cancel_marker_is_per_scan_and_does_not_affect_started_events() {
     let t = relay_with_registered_scan("scan-1").await;
     t.ownership
-        .register("scan-2", "ms-2".to_string(), session_for("alice"));
+        .register_ssh("scan-2", "ms-2".to_string(), session_for("alice"));
     t.ownership.mark_cancel_requested("scan-2");
 
     t.relay
@@ -645,7 +645,7 @@ async fn relay_cancel_marker_is_per_scan_and_does_not_affect_started_events() {
 async fn relay_adapts_blank_and_oversized_reasons_to_what_ms_usuarios_accepts() {
     let t = relay_with_registered_scan("scan-1").await;
     t.ownership
-        .register("scan-2", "ms-2".to_string(), session_for("alice"));
+        .register_ssh("scan-2", "ms-2".to_string(), session_for("alice"));
 
     t.relay.handle(failed_event("scan-1", "   ")).await;
     t.relay
@@ -689,7 +689,7 @@ async fn relay_marks_completado_without_a_result_when_ms_usuarios_rejects_it_as_
         axum::serve(listener, app).await.expect("servidor stub");
     });
     let ownership = Arc::new(ScanOwnershipRegistry::new());
-    ownership.register("scan-1", "ms-1".to_string(), session_for("alice"));
+    ownership.register_ssh("scan-1", "ms-1".to_string(), session_for("alice"));
     let relay = ScanOutcomeRelay::new(
         Arc::new(lab_usuarios_client(format!("http://{addr}"))),
         ownership,

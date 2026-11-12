@@ -41,7 +41,7 @@ comportamiento y el payload publicado no cambian.
 |---|---|
 | Permiso `network_scan` re-validado contra `ms-usuarios` en cada solicitud (`GET /users/me`, campo `can_network_scan`; sin caché) | `403` `{"error":"network_scan_not_permitted"}` si no lo tiene o el usuario no existe; `503` `{"error":"network_scan_permission_unavailable"}` si no se puede confirmar (fail closed) |
 | `target` es una única IP (como en `ssh`) | `400` |
-| Denylist fija: loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, sin especificar (`0.0.0.0`, `::`) y sus formas IPv6 que envuelven un IPv4 (`::ffff:127.0.0.1`) | `422` `{"error":"network_scan_target_rejected","reason":<código>}` con `target_loopback`, `target_link_local`, `target_multicast`, `target_broadcast` o `target_unspecified` |
+| Denylist fija: loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), unique-local IPv6 (`fc00::/7`, incluye el metadata `fd00:ec2::254`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, sin especificar (`0.0.0.0`, `::`) y sus formas IPv6 que envuelven un IPv4 (`::ffff:127.0.0.1`, `::127.0.0.1`) | `422` `{"error":"network_scan_target_rejected","reason":<código>}` con `target_loopback`, `target_link_local`, `target_unique_local`, `target_multicast`, `target_broadcast` o `target_unspecified` |
 | Allowlist `NETWORK_SCAN_ALLOWED_CIDRS`, si está definida | `422` con `reason` `target_outside_allowed_ranges` |
 
 No se resuelven credenciales SSH (no hay `422` por credencial ausente), se

@@ -214,9 +214,11 @@ que no son evidentes leyendo el código.
   (`404`/falso => `403`; error => `503`); no hay claim en el JWT ni caché, así
   que revocar el permiso surte efecto en la siguiente solicitud; (2) denylist
   fija y allowlist opcional (`NETWORK_SCAN_ALLOWED_CIDRS`) en
-  `src/network_scan.rs`, evaluadas sobre la forma canónica de la IP (un
-  IPv4-mapped se trata como su IPv4 y se publica así), con la denylist primero
-  e inanulable; (3) no se resuelven credenciales SSH y el `ScanRequest` lleva
+  `src/network_scan.rs` (loopback, link-local, unique-local `fc00::/7` que
+  cubre el metadata IPv6 de AWS `fd00:ec2::254`, multicast, broadcast, sin
+  especificar), evaluadas sobre una única forma canónica de la IP (IPv4-mapped
+  e IPv4-compatible se tratan como su IPv4 y se publican así; `::` y `::1`
+  siguen siendo IPv6), con la denylist primero e inanulable; (3) no se resuelven credenciales SSH y el `ScanRequest` lleva
   `scan_mode: "network"` sin campos de credenciales (el schema del Broker los
   prohíbe). En `ssh` el payload es byte-idéntico al anterior (el campo se omite).
 - **`/api/me`:** expone `can_network_scan` leyéndolo de `ms-usuarios` en cada
