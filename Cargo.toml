@@ -81,10 +81,6 @@ rand = "0.8"
 base64 = "0.22"
 # `url` ya está en `[dependencies]` (feature `cors_for_front`, ver arriba) y
 # por lo tanto ya disponible en `tests/`; no se repite aquí.
-# `Response::bytes_stream()` en los tests de integración del stream SSE
-# (feature `scan_outcome_relay`) está tras este feature de `reqwest`, no
-# activo en `[dependencies]` (ver `docs/decisions.md` D-06).
-reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 # Valida cada evento emitido contra `../broker/contracts/security-event.schema.json`
 # (`tests/security_event_contract.rs`). Misma versión y features que `broker`
 # (sin resolución de referencias remotas: el schema es autocontenido).

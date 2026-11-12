@@ -231,6 +231,43 @@ async fn sse_forwards_only_complete_frames_so_a_partial_frame_is_withheld() {
     assert_eq!(sse.expect("delta").await["seq"], 2);
 }
 
+/// Lee el cuerpo crudo del SSE hasta que el stream termina.
+async fn drain_raw(response: reqwest::Response) -> Vec<u8> {
+    let mut stream = response.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(WAIT, stream.next())
+        .await
+        .expect("el stream debe terminar")
+    {
+        out.extend_from_slice(&chunk.expect("chunk"));
+    }
+    out
+}
+
+#[tokio::test]
+async fn sse_ends_without_forwarding_a_partial_frame_when_upstream_exceeds_the_frame_cap() {
+    let (gw, upstream, cookie) = setup(Duration::from_secs(60)).await;
+    let response = get_with(&gw, "/api/admin/events", Some(&cookie)).await;
+    upstream.push(SNAPSHOT);
+    // Sin línea en blanco: nunca completa un frame.
+    upstream.push(&"x".repeat(40 * 1024));
+    upstream.push(&"x".repeat(40 * 1024));
+
+    let body = drain_raw(response).await;
+
+    assert_eq!(body, SNAPSHOT.as_bytes(), "solo el frame completo sale");
+}
+
+#[tokio::test]
+async fn sse_forwards_comment_only_ping_frames_so_the_alb_idle_timeout_is_not_hit() {
+    let (gw, upstream, cookie) = setup(Duration::from_secs(60)).await;
+    let response = get_with(&gw, "/api/admin/events", Some(&cookie)).await;
+    upstream.push(": ping\n\n");
+    upstream.end();
+
+    assert_eq!(drain_raw(response).await, b": ping\n\n");
+}
+
 #[tokio::test]
 async fn sse_ends_when_the_upstream_stream_ends_without_inventing_events() {
     let (gw, upstream, cookie) = setup(Duration::from_secs(60)).await;

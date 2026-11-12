@@ -15,13 +15,19 @@
 //! | `error` | texto | `events-service` |
 //! | `closed` | [`AdminStreamClosed`] | **este gateway**, justo antes de cerrar por fallo de revalidación |
 //!
-//! Más los comentarios `: ping` de keep-alive que emite `events-service`.
+//! Más los comentarios `: ping` de keep-alive que emite `events-service`
+//! cada 15 s: [`FrameBuffer`] los reenvía como cualquier frame completo, así
+//! el cliente recibe bytes antes del idle timeout del ALB (60 s) sin que el
+//! gateway añada un keep-alive propio.
 //!
 //! ## Decisiones de diseño
 //!
 //! - **Frames completos**: el stream de `events-service` se reenvía frame a
 //!   frame ([`FrameBuffer`]); un frame a medias nunca sale hacia el cliente,
 //!   de modo que `closed` jamás cae dentro de otro frame.
+//! - **Tope de frame**: un frame incompleto de más de
+//!   [`crate::events_client::MAX_PENDING_FRAME_BYTES`] cierra el stream del
+//!   cliente (sin reenviar nada parcial).
 //! - **Revalidación del rol**: una conexión SSE puede durar horas y el rol de
 //!   la sesión es una instantánea. Cada
 //!   [`AdminFeed::role_recheck_interval`] (60 s por defecto) el stream llama a
@@ -219,7 +225,13 @@ pub(crate) fn events_stream(
             }
             tokio::select! {
                 chunk = state.upstream.next() => match chunk {
-                    Some(Ok(bytes)) => state.pending.extend(state.frames.push(&bytes)),
+                    Some(Ok(bytes)) => match state.frames.push(&bytes) {
+                        Ok(frames) => state.pending.extend(frames),
+                        Err(_) => {
+                            tracing::warn!("frame SSE de events-service sobre el tope; se cierra el stream del cliente");
+                            return None;
+                        }
+                    },
                     Some(Err(_)) | None => {
                         tracing::info!("el stream de events-service terminó; se cierra el del cliente");
                         return None;
