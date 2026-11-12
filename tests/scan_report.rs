@@ -156,6 +156,7 @@ async fn spawn_gateway(usuarios_base_url: String) -> GatewayUnderTest {
         )),
         security_events: Arc::new(NoopSecurityEventPublisher),
         admin_feed: Arc::new(AdminFeed::default()),
+        network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
     };
     let app = app_router(state);
     let listener = TcpListener::bind("127.0.0.1:0")

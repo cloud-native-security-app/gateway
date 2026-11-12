@@ -37,6 +37,8 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::domain::ScanMode;
+
 /// Tiempo máximo que una tarea de [`emit`] espera a que el adaptador
 /// publique antes de soltar el evento.
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,15 +218,36 @@ impl SecurityEvent {
         scan_id: &str,
         target: &str,
     ) -> Result<Self, InvalidSecurityEvent> {
+        Self::scan_requested_in_mode(actor_sub, scan_id, target, ScanMode::Ssh)
+    }
+
+    /// `scan.requested` con el modo del escaneo: el payload lleva
+    /// `scan_mode` solo para [`ScanMode::Network`]; en `ssh` queda idéntico
+    /// al de [`Self::scan_requested`] (el schema trata la ausencia como
+    /// `ssh`).
+    pub fn scan_requested_in_mode(
+        actor_sub: &str,
+        scan_id: &str,
+        target: &str,
+        mode: ScanMode,
+    ) -> Result<Self, InvalidSecurityEvent> {
         let ip: IpAddr = target.parse().map_err(|_| InvalidSecurityEvent {
             event_type: EventType::ScanRequested.as_str(),
             field: "target",
         })?;
+        let mut payload = json!({ "target": schema_safe_ip(ip) });
+        if !mode.is_ssh() {
+            payload["scan_mode"] =
+                serde_json::to_value(mode).map_err(|_| InvalidSecurityEvent {
+                    event_type: EventType::ScanRequested.as_str(),
+                    field: "scan_mode",
+                })?;
+        }
         Self::new(
             EventType::ScanRequested,
             Some(actor_sub),
             Some(scan_id),
-            json!({ "target": schema_safe_ip(ip) }),
+            payload,
         )
     }
 
@@ -643,6 +666,28 @@ mod tests {
             serde_json::to_value(SecurityEvent::scan_requested("s", "c", "192.0.2.10").unwrap())
                 .unwrap();
         assert_eq!(v4["payload"]["target"], "192.0.2.10");
+    }
+
+    #[test]
+    fn scan_requested_carries_scan_mode_only_for_network_scans() {
+        use crate::domain::ScanMode;
+
+        let network = serde_json::to_value(
+            SecurityEvent::scan_requested_in_mode("s", "c", "192.0.2.10", ScanMode::Network)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            network["payload"],
+            json!({"target": "192.0.2.10", "scan_mode": "network"})
+        );
+
+        // ssh: el payload es idéntico al previo al campo (ausente == ssh).
+        let ssh = serde_json::to_value(
+            SecurityEvent::scan_requested_in_mode("s", "c", "192.0.2.10", ScanMode::Ssh).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ssh["payload"], json!({"target": "192.0.2.10"}));
     }
 
     #[test]

@@ -129,14 +129,14 @@ async fn build_wires_the_sns_publisher_and_the_sqs_consumer() {
     built
         .state
         .broker_publisher
-        .publish_scan_request(&ScanRequest {
-            correlation_id: "corr-wiring".to_string(),
-            ip: "192.0.2.10".to_string(),
-            network_user: "netuser".to_string(),
-            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
-            has_sudo: false,
-            requested_by: "google-sub-123".to_string(),
-        })
+        .publish_scan_request(&ScanRequest::ssh(
+            "corr-wiring".to_string(),
+            "192.0.2.10".to_string(),
+            "netuser".to_string(),
+            "lab-only-not-a-real-secret".to_string(),
+            false,
+            "google-sub-123".to_string(),
+        ))
         .await
         .expect("publicar a través del wiring");
     let delivered = localstack

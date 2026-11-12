@@ -26,7 +26,7 @@
 
 use serde::Serialize;
 
-use crate::domain::ScanOutcomeEvent;
+use crate::domain::{ScanMode, ScanOutcomeEvent};
 
 /// Routing key (atributo de mensaje `routing_key`) con la que este Gateway
 /// publica cada `ScanRequest`.
@@ -38,9 +38,13 @@ pub const ROUTING_KEY_SCAN_CANCELLATION: &str = "scan.cancellation";
 
 /// Mensaje publicado en el topic SNS de solicitudes (routing key
 /// [`ROUTING_KEY_SCAN_REQUEST`]), consumido por `ms-nmap`. Shape copiado
-/// literalmente de `broker/contracts/scan-request.schema.json` (6 campos,
-/// todos requeridos, `additionalProperties: false` en el schema — este
-/// `struct` no añade ni omite ninguno).
+/// literalmente de `broker/contracts/scan-request.schema.json`
+/// (`additionalProperties: false`): `correlation_id`, `ip` y `requested_by`
+/// siempre; `scan_mode` solo en modo `network` (ausente == `ssh`, así el
+/// payload ssh es idéntico al previo al campo); `network_user`,
+/// `ssh_credentials_ref` y `has_sudo` solo en modo `ssh` y **nunca** en
+/// `network` (el schema los prohíbe: una credencial no viaja con un escaneo de
+/// red). Constrúyelo con [`ScanRequest::ssh`] o [`ScanRequest::network`].
 ///
 /// `ssh_credentials_ref` transporta una credencial SSH **real** (ver
 /// `docs/security-scope.md`): este tipo implementa `Debug` a mano para
@@ -51,30 +55,76 @@ pub struct ScanRequest {
     /// Identificador de correlación de la solicitud, generado por este
     /// Gateway antes de cualquier llamada externa (RF-04).
     pub correlation_id: String,
+    /// Modo del escaneo; se serializa solo si no es [`ScanMode::Ssh`].
+    #[serde(skip_serializing_if = "ScanMode::is_ssh")]
+    pub scan_mode: ScanMode,
     /// Dirección IP única objetivo del escaneo, ya normalizada por
     /// [`crate::domain::ScanSubmission`] (siempre parseable como `IpAddr`,
     /// nunca un CIDR).
     pub ip: String,
-    /// Usuario de red resuelto por `ms-usuarios` para este objetivo.
-    pub network_user: String,
-    /// Credencial SSH real resuelta por `ms-usuarios` para este objetivo.
-    /// Nunca se loggea (ver `docs/security-scope.md`).
-    pub ssh_credentials_ref: String,
+    /// Usuario de red resuelto por `ms-usuarios` para este objetivo (solo
+    /// modo `ssh`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_user: Option<String>,
+    /// Credencial SSH real resuelta por `ms-usuarios` para este objetivo
+    /// (solo modo `ssh`). Nunca se loggea (ver `docs/security-scope.md`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_credentials_ref: Option<String>,
     /// Si el usuario de red resuelto tiene privilegios `sudo` en el
-    /// objetivo.
-    pub has_sudo: bool,
+    /// objetivo (solo modo `ssh`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_sudo: Option<bool>,
     /// Identidad (ya verificada por este Gateway) de quien solicitó el
     /// escaneo.
     pub requested_by: String,
+}
+
+impl ScanRequest {
+    /// Solicitud en modo `ssh`: lleva las tres credenciales resueltas.
+    pub fn ssh(
+        correlation_id: String,
+        ip: String,
+        network_user: String,
+        ssh_credentials_ref: String,
+        has_sudo: bool,
+        requested_by: String,
+    ) -> Self {
+        Self {
+            correlation_id,
+            scan_mode: ScanMode::Ssh,
+            ip,
+            network_user: Some(network_user),
+            ssh_credentials_ref: Some(ssh_credentials_ref),
+            has_sudo: Some(has_sudo),
+            requested_by,
+        }
+    }
+
+    /// Solicitud en modo `network`: sin ningún campo de credenciales SSH.
+    pub fn network(correlation_id: String, ip: String, requested_by: String) -> Self {
+        Self {
+            correlation_id,
+            scan_mode: ScanMode::Network,
+            ip,
+            network_user: None,
+            ssh_credentials_ref: None,
+            has_sudo: None,
+            requested_by,
+        }
+    }
 }
 
 impl std::fmt::Debug for ScanRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanRequest")
             .field("correlation_id", &self.correlation_id)
+            .field("scan_mode", &self.scan_mode)
             .field("ip", &self.ip)
             .field("network_user", &self.network_user)
-            .field("ssh_credentials_ref", &"[REDACTED]")
+            .field(
+                "ssh_credentials_ref",
+                &self.ssh_credentials_ref.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("has_sudo", &self.has_sudo)
             .field("requested_by", &self.requested_by)
             .finish()
@@ -183,15 +233,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssh_scan_request_payload_is_byte_identical_to_the_pre_scan_mode_contract() {
+        let request = ScanRequest::ssh(
+            "corr-1".to_string(),
+            "192.0.2.10".to_string(),
+            "netuser".to_string(),
+            "lab-only-not-a-real-secret".to_string(),
+            true,
+            "google-sub-123".to_string(),
+        );
+
+        assert_eq!(
+            serde_json::to_string(&request).expect("serializa"),
+            r#"{"correlation_id":"corr-1","ip":"192.0.2.10","network_user":"netuser","ssh_credentials_ref":"lab-only-not-a-real-secret","has_sudo":true,"requested_by":"google-sub-123"}"#
+        );
+    }
+
+    #[test]
+    fn network_scan_request_carries_the_mode_and_no_ssh_fields() {
+        let request = ScanRequest::network(
+            "corr-2".to_string(),
+            "192.0.2.10".to_string(),
+            "google-sub-123".to_string(),
+        );
+
+        assert_eq!(
+            serde_json::to_value(&request).expect("serializa"),
+            serde_json::json!({
+                "correlation_id": "corr-2",
+                "scan_mode": "network",
+                "ip": "192.0.2.10",
+                "requested_by": "google-sub-123",
+            })
+        );
+        assert_eq!(request.scan_mode, crate::domain::ScanMode::Network);
+    }
+
+    #[test]
     fn scan_request_debug_redacts_ssh_credentials_ref() {
-        let request = ScanRequest {
-            correlation_id: "corr-1".to_string(),
-            ip: "192.0.2.10".to_string(),
-            network_user: "netuser".to_string(),
-            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
-            has_sudo: true,
-            requested_by: "google-sub-123".to_string(),
-        };
+        let request = ScanRequest::ssh(
+            "corr-1".to_string(),
+            "192.0.2.10".to_string(),
+            "netuser".to_string(),
+            "lab-only-not-a-real-secret".to_string(),
+            true,
+            "google-sub-123".to_string(),
+        );
 
         let debug_output = format!("{request:?}");
 
@@ -202,14 +289,14 @@ mod tests {
 
     #[test]
     fn scan_request_serializes_with_the_exact_contract_fields() {
-        let request = ScanRequest {
-            correlation_id: "corr-1".to_string(),
-            ip: "192.0.2.10".to_string(),
-            network_user: "netuser".to_string(),
-            ssh_credentials_ref: "lab-only-not-a-real-secret".to_string(),
-            has_sudo: true,
-            requested_by: "google-sub-123".to_string(),
-        };
+        let request = ScanRequest::ssh(
+            "corr-1".to_string(),
+            "192.0.2.10".to_string(),
+            "netuser".to_string(),
+            "lab-only-not-a-real-secret".to_string(),
+            true,
+            "google-sub-123".to_string(),
+        );
 
         let value = serde_json::to_value(&request).expect("debe serializar a JSON");
         let object = value.as_object().expect("debe ser un objeto JSON");
