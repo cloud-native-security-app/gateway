@@ -21,7 +21,7 @@ Browser (front) ──HTTPS──▶ Gateway ──▶ Identity Provider (Google
                               │                │
                               │     cola SQS de resultados (SSE hacia front)
                               │
-                              └──(HTTPS, best-effort)──▶ Kinesis `security-events`
+                              └──(HTTPS, best-effort, 3 intentos con backoff)──▶ Kinesis `security-events`
 ```
 
 ## Responsabilidades
