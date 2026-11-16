@@ -200,6 +200,7 @@ async fn spawn_gateway_with_events(
         )),
         security_events,
         admin_feed: Arc::new(AdminFeed::default()),
+        network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
     };
 
     let app = app_router(state);
@@ -284,7 +285,7 @@ async fn scan_history_returns_the_entries_of_the_active_session_with_and_without
     // (simula un proceso que no se reinició desde que se publicó ese
     // escaneo); la segunda simula la limitación documentada de
     // `ScanOwnershipRegistry` (sin mapeo conocido).
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "gateway-scan-id-known",
         "ms-usuarios-known".to_string(),
         session_for("alice"),
@@ -334,7 +335,7 @@ async fn cancel_scan_owned_by_another_session_returns_not_found() {
     let usuarios_base_url = unreachable_usuarios_base_url().await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
 
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "scan-owned-by-alice",
         "ms-usuarios-1".to_string(),
         session_for("alice"),
@@ -403,7 +404,7 @@ async fn assert_cancel_rejected_for_terminal_status(terminal: &str) {
     let usuarios_base_url = spawn_usuarios_history_stub(history).await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
 
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "scan-already-done",
         "ms-usuarios-done".to_string(),
         session_for("alice"),
@@ -463,7 +464,7 @@ async fn accepted_cancellation_marks_the_scan_as_cancel_requested() {
     }]);
     let usuarios_base_url = spawn_usuarios_history_stub(history).await;
     let gateway = spawn_gateway(usuarios_base_url, Arc::new(AcceptsCancellation)).await;
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "scan-running",
         "ms-usuarios-running".to_string(),
         session_for("alice"),
@@ -520,7 +521,7 @@ fn running_history() -> Value {
 }
 
 async fn cancel_running_scan(gateway: &GatewayUnderTest) -> reqwest::Response {
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         "scan-running",
         "ms-usuarios-running".to_string(),
         session_for("alice"),
@@ -644,7 +645,7 @@ async fn cancel_scan_owned_and_in_progress_publishes_a_valid_scan_cancellation()
     let gateway = spawn_gateway(usuarios_base_url, broker_publisher).await;
 
     const SCAN_ID: &str = "gateway-scan-id-in-progress";
-    gateway.scan_ownership.register(
+    gateway.scan_ownership.register_ssh(
         SCAN_ID,
         "ms-usuarios-in-progress".to_string(),
         session_for("alice"),

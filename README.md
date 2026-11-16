@@ -24,11 +24,33 @@ completo está en `GET /api/openapi.json`.
 
 | Método y ruta | Respuesta |
 |---|---|
-| `POST /api/scans` | Alta de escaneo; devuelve `{"scanId"}` |
-| `GET /api/scans` | Histórico: `scanId` (si se conoce), `target`, `status` (`PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO`), `requested_at`, `updated_at`, `failure_reason` (`null` si no hay) |
+| `POST /api/scans` | Alta de escaneo; cuerpo `{"target", "mode"?}` con `mode` `"ssh"` (por defecto) o `"network"` (ver abajo); devuelve `{"scanId"}` |
+| `GET /api/me` | Identidad de la sesión (`sub`, `email`, `name`, `role`) y `can_network_scan` (booleano, leído de `ms-usuarios` en cada llamada; `false` si no responde) |
+| `GET /api/scans` | Histórico: `scanId` (si se conoce), `mode` (`ssh`/`network`, si se conoce), `target`, `status` (`PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO`), `requested_at`, `updated_at`, `failure_reason` (`null` si no hay) |
 | `GET /api/scans/{scan_id}/events` | Stream SSE `started`/`completed`/`failed` |
 | `POST /api/scans/{scan_id}/cancel` | `202`; `404` ajeno; `409` si ya es terminal (`COMPLETADO`/`FALLIDO`/`CANCELADO`) |
 | `GET /api/scans/{scan_id}/report` | `200` con el `ScanResult` (`host`, `ports`, `vulnerabilities`, `scanned_at`); `404` inexistente o ajeno; `409` si aún no hay reporte; `502`/`504` fallo de `ms-usuarios` |
+
+### Modo `network` (solo IP)
+
+`POST /api/scans` con `"mode": "network"` pide a `ms-nmap` escanear la IP desde
+su propio contenedor, sin credenciales SSH. Sin `mode` (o con `"ssh"`) el
+comportamiento y el payload publicado no cambian.
+
+| Paso (en este orden) | Resultado |
+|---|---|
+| Permiso `network_scan` re-validado contra `ms-usuarios` en cada solicitud (`GET /users/me`, campo `can_network_scan`; sin caché) | `403` `{"error":"network_scan_not_permitted"}` si no lo tiene o el usuario no existe; `503` `{"error":"network_scan_permission_unavailable"}` si no se puede confirmar (fail closed) |
+| `target` es una única IP (como en `ssh`) | `400` |
+| Denylist fija: loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), unique-local IPv6 (`fc00::/7`, incluye el metadata `fd00:ec2::254`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, sin especificar (`0.0.0.0`, `::`) y sus formas IPv6 que envuelven un IPv4 (`::ffff:127.0.0.1`, `::127.0.0.1`) | `422` `{"error":"network_scan_target_rejected","reason":<código>}` con `target_loopback`, `target_link_local`, `target_unique_local`, `target_multicast`, `target_broadcast` o `target_unspecified` |
+| Allowlist `NETWORK_SCAN_ALLOWED_CIDRS`, si está definida | `422` con `reason` `target_outside_allowed_ranges` |
+
+No se resuelven credenciales SSH (no hay `422` por credencial ausente), se
+publica un `ScanRequest` con `scan_mode: "network"` y sin
+`network_user`/`ssh_credentials_ref`/`has_sudo`, y el evento `scan.requested`
+lleva `scan_mode: "network"` (en `ssh` el evento no cambia). Si se rechaza, no
+se registra histórico ni se publica nada. Cuenta contra el mismo límite de tasa
+que los escaneos `ssh`. El `mode` del histórico vive solo en memoria del
+Gateway (ver `docs/decisions.md` D-18).
 
 Al terminar un escaneo, el Gateway guarda en `ms-usuarios` el resultado completo
 (`COMPLETADO`) o el motivo (`FALLIDO`/`CANCELADO`). Si el usuario pidió cancelar
@@ -177,6 +199,7 @@ un error tipado explícito, nunca con un panic:
 | `AWS_ENDPOINT_URL` | No | Endpoint alternativo de AWS, solo LocalStack. Si se define debe ser una URL válida |
 | `SECURITY_EVENTS_STREAM_NAME` | No | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`). Si no se define o está vacía, Gateway no publica eventos (un aviso informativo al arrancar). El panel de administración lo sirve `events-service`, no este proceso. Solo admite `[a-zA-Z0-9_.-]`, hasta 128 caracteres. Usa `AWS_REGION`/`AWS_ENDPOINT_URL` y las credenciales por defecto de AWS; un fallo de Kinesis solo se loggea y nunca altera una respuesta |
 | `ADMIN_EVENTS_ROLE_RECHECK_SECS` | No (por defecto `60`) | Cada cuántos segundos un stream SSE de `GET /api/admin/events` reconsulta el rol vigente del usuario en `ms-usuarios` y lo cierra si ya no es admin o no se puede verificar. Entero mayor que cero |
+| `NETWORK_SCAN_ALLOWED_CIDRS` | No | Lista de CIDR separados por coma (`10.0.0.0/24,2001:db8::/32`) a los que se limita el modo `network` de `POST /api/scans`; un objetivo fuera de ellos recibe `422`. Vacía o sin definir = cualquier objetivo que pase la denylist fija (que ninguna allowlist puede anular). Un elemento que no sea un CIDR con prefijo hace fallar el arranque con `ConfigError::InvalidCidrList` (el valor no se imprime) |
 | `SCAN_REQUESTS_TOPIC_ARN` | Sí | ARN del topic SNS de solicitudes de escaneo (`arn:<partición>:sns:<región>:<cuenta>:<nombre>`) |
 | `SCAN_CANCELLATIONS_TOPIC_ARN` | Sí | ARN del topic SNS de cancelaciones de escaneo |
 | `GATEWAY_SCAN_OUTCOMES_QUEUE_URL` | Sí | URL de la cola SQS de la que Gateway consume los resultados de escaneo |

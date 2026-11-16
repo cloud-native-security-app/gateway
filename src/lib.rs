@@ -16,6 +16,7 @@ pub mod config;
 pub mod domain;
 pub mod events_client;
 pub mod kinesis;
+pub mod network_scan;
 pub mod realtime;
 pub mod security_events;
 pub mod sns;

@@ -126,6 +126,20 @@ pub fn role_from_profile(profile: &UserProfile) -> Role {
     }
 }
 
+/// Extrae el permiso `network_scan` del perfil que devuelve `ms-usuarios`
+/// (`GET /users/me`, campo booleano `can_network_scan`, feature
+/// `network_scan_mode`).
+///
+/// Fail closed: solo un booleano `true` explícito concede el permiso. Campo
+/// ausente (un `ms-usuarios` anterior al permiso), de otro tipo o `null`, o un
+/// perfil que no es un objeto, es `false`. El rol `admin` no lo concede.
+pub fn can_network_scan_from_profile(profile: &UserProfile) -> bool {
+    profile
+        .get("can_network_scan")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Estado de una solicitud de escaneo en el histórico de `ms-usuarios`.
 ///
 /// Codificación (`SCREAMING_SNAKE_CASE`) confirmada contra
@@ -456,6 +470,31 @@ impl UsuariosClient {
     /// Los demás fallos de red, timeout o status no-2xx se propagan tal cual:
     /// quien llama debe tratarlos como "no confirmado" (fail closed).
     pub async fn current_role(&self, identity: &Session) -> Result<Role, UsuariosClientError> {
+        self.current_profile(identity)
+            .await
+            .map(|profile| role_from_profile(&profile))
+    }
+
+    /// Reconsulta el permiso `network_scan` vigente de `identity` (`GET
+    /// /users/me`, campo `can_network_scan`, ver
+    /// [`can_network_scan_from_profile`]) con el mismo timeout corto y los
+    /// mismos errores que [`Self::current_role`]: sin caché, y quien llama
+    /// debe tratar cualquier `Err` como "no confirmado" (fail closed).
+    pub async fn can_network_scan(&self, identity: &Session) -> Result<bool, UsuariosClientError> {
+        self.current_profile(identity)
+            .await
+            .map(|profile| can_network_scan_from_profile(&profile))
+    }
+
+    /// `GET /users/me` con el timeout corto de las reconsultas de
+    /// autorización; traduce `404` a [`UsuariosClientError::UserNotFound`]
+    /// (definitivo: el usuario ya no existe) y `401` a
+    /// [`UsuariosClientError::ServiceMisconfigured`] (el secreto compartido no
+    /// coincide, que no es un veredicto sobre el usuario).
+    async fn current_profile(
+        &self,
+        identity: &Session,
+    ) -> Result<UserProfile, UsuariosClientError> {
         let identity_header = self.identity_header_value(identity)?;
         let request = self
             .http
@@ -468,17 +507,13 @@ impl UsuariosClient {
             );
 
         match self.send_and_decode::<UserProfile>(request).await {
-            Ok(profile) => Ok(role_from_profile(&profile)),
-            // `404` definitivo: el usuario ya no existe, por lo tanto no es
-            // admin. `401`: el secreto compartido no coincide (despliegue mal
-            // configurado), que no es un veredicto sobre el usuario.
             Err(UsuariosClientError::UnexpectedResponse { status: 404 }) => {
                 Err(UsuariosClientError::UserNotFound)
             }
             Err(UsuariosClientError::UnexpectedResponse { status: 401 }) => {
                 Err(UsuariosClientError::ServiceMisconfigured)
             }
-            Err(other) => Err(other),
+            other => other,
         }
     }
 
@@ -919,6 +954,30 @@ impl UsuariosClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn can_network_scan_from_profile_reads_the_flag_and_fails_closed() {
+        assert!(can_network_scan_from_profile(
+            &serde_json::json!({"role": "user", "can_network_scan": true})
+        ));
+        assert!(!can_network_scan_from_profile(
+            &serde_json::json!({"role": "admin", "can_network_scan": false})
+        ));
+        // Ausente (user-service anterior a NS-07), tipo equivocado o perfil
+        // no objeto: sin permiso. Un admin tampoco lo obtiene por serlo.
+        assert!(!can_network_scan_from_profile(
+            &serde_json::json!({"role": "admin"})
+        ));
+        for bad in [
+            serde_json::json!({"can_network_scan": "true"}),
+            serde_json::json!({"can_network_scan": 1}),
+            serde_json::json!({"can_network_scan": null}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            assert!(!can_network_scan_from_profile(&bad), "{bad}");
+        }
+    }
 
     #[test]
     fn role_from_profile_reads_admin_and_user() {

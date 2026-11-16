@@ -54,6 +54,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 # `openidconnect`/`reqwest` (y ya era dev-dependency), se declara explícita
 # para poder nombrarla en `src/config.rs`.
 url = "2"
+# `IpNet` para `NETWORK_SCAN_ALLOWED_CIDRS` (`src/network_scan.rs`, feature
+# `network_scan_mode`): contención de una IP en un CIDR IPv4/IPv6. Ya resuelta
+# transitivamente vía `reqwest`; se declara explícita para poder nombrarla.
+ipnet = "2"
 aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
 aws-sdk-sns = "1.116.0"
 # `aws-sdk-kinesis` para publicar `SecurityEvent` en el stream `security-events`

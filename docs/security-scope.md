@@ -60,6 +60,18 @@
   `403`; un `401` de `ms-usuarios` (credencial compartida rechazada) sigue
   siendo `503` pero se loggea con el tipo distinto `misconfigured`. En todos
   los casos el log lleva solo el tipo de error, nunca datos personales.
+- **Escaneo en modo `network`** (feature `network_scan_mode`, NS-03): el
+  Gateway es quien impide que `ms-nmap` apunte a sí mismo o a metadatos de
+  nube. Exige el permiso `network_scan` re-validado contra `ms-usuarios` en
+  cada solicitud (fail closed: `403` sin permiso, `503` si no se puede
+  confirmar, sin caché ni claim en el JWT), rechaza con `422` una denylist
+  fija (loopback, link-local incl. `169.254.169.254`, unique-local IPv6 `fc00::/7` incl. el metadata `fd00:ec2::254`, multicast, broadcast,
+  sin especificar, y sus formas IPv4-mapped/compatibles de IPv6) y, si
+  `NETWORK_SCAN_ALLOWED_CIDRS` está definida, todo objetivo fuera de ella. La
+  allowlist nunca anula la denylist. No viaja ninguna credencial SSH. **No
+  cubre:** nombres DNS (solo se aceptan IP), rangos de red interna propios (p.
+  ej. VPC), ni NAT64 (`64:ff9b::/96`): se contienen con la allowlist y los
+  security groups.
 - **Rutas de administración y su feed en tiempo real** (feature
   `admin_realtime_feed`, KAP-09): `GET /api/admin/metrics` y el SSE `GET
   /api/admin/events` son las primeras rutas detrás de `require_session` +

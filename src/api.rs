@@ -32,6 +32,7 @@ use axum_extra::extract::cookie::CookieJar;
 use futures_util::Stream;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
@@ -40,7 +41,8 @@ use crate::admin::AdminFeed;
 use crate::admin_routes;
 use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator};
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
-use crate::domain::{Role, ScanResult, ScanSubmission, ScanSubmissionError, Session};
+use crate::domain::{Role, ScanMode, ScanResult, ScanSubmission, ScanSubmissionError, Session};
+use crate::network_scan::{NetworkScanPolicy, TargetRejection};
 use crate::realtime::RealtimeRegistry;
 use crate::security_events::{emit, SecurityEvent, SecurityEventPublisher};
 use crate::usuarios_client::{
@@ -65,6 +67,10 @@ pub struct ScanOwnership {
     /// correspondiente (feature `scan_outcome_relay`, criterio de
     /// aceptación 4).
     pub owner: Session,
+    /// Modo con el que se solicitó el escaneo (feature `network_scan_mode`).
+    /// Solo vive en memoria, igual que el resto del registro: ver la
+    /// limitación documentada en [`ScanOwnershipRegistry`].
+    pub mode: ScanMode,
 }
 
 /// Registro en memoria, por `scanId`/`correlation_id` propio de este
@@ -132,8 +138,22 @@ impl ScanOwnershipRegistry {
 
     /// Registra que `scan_id` (propio de este Gateway) pertenece a `owner`,
     /// y que `ms-usuarios` lo identifica internamente como
-    /// `ms_usuarios_scan_id`.
-    pub fn register(&self, scan_id: &str, ms_usuarios_scan_id: String, owner: Session) {
+    /// `ms_usuarios_scan_id`. El escaneo queda registrado en modo
+    /// [`ScanMode::Ssh`] (el modo por defecto); para otro modo usar
+    /// [`Self::register_with_mode`].
+    pub fn register_ssh(&self, scan_id: &str, ms_usuarios_scan_id: String, owner: Session) {
+        self.register_with_mode(scan_id, ms_usuarios_scan_id, owner, ScanMode::Ssh);
+    }
+
+    /// Como [`Self::register_ssh`], recordando el [`ScanMode`] de la solicitud
+    /// (`POST /api/scans`, feature `network_scan_mode`).
+    pub fn register_with_mode(
+        &self,
+        scan_id: &str,
+        ms_usuarios_scan_id: String,
+        owner: Session,
+        mode: ScanMode,
+    ) {
         let mut entries = self
             .entries
             .write()
@@ -143,6 +163,7 @@ impl ScanOwnershipRegistry {
             ScanOwnership {
                 ms_usuarios_scan_id,
                 owner,
+                mode,
             },
         );
     }
@@ -173,6 +194,16 @@ impl ScanOwnershipRegistry {
     /// se publicó ese escaneo (misma limitación documentada en
     /// [`ScanOwnershipRegistry`]).
     pub fn lookup_by_ms_usuarios_scan_id(&self, ms_usuarios_scan_id: &str) -> Option<String> {
+        self.find_by_ms_usuarios_scan_id(ms_usuarios_scan_id)
+            .map(|(scan_id, _)| scan_id)
+    }
+
+    /// Como [`Self::lookup_by_ms_usuarios_scan_id`], devolviendo además la
+    /// [`ScanOwnership`] completa (de ahí el [`ScanMode`] del escaneo).
+    pub fn find_by_ms_usuarios_scan_id(
+        &self,
+        ms_usuarios_scan_id: &str,
+    ) -> Option<(String, ScanOwnership)> {
         let entries = self
             .entries
             .read()
@@ -180,7 +211,7 @@ impl ScanOwnershipRegistry {
         entries
             .iter()
             .find(|(_, ownership)| ownership.ms_usuarios_scan_id == ms_usuarios_scan_id)
-            .map(|(scan_id, _)| scan_id.clone())
+            .map(|(scan_id, ownership)| (scan_id.clone(), ownership.clone()))
     }
 }
 
@@ -398,6 +429,10 @@ pub struct AppState {
     /// del SSE (features `admin_realtime_feed`/`admin_feed_proxy`, ver
     /// [`crate::admin`] y [`crate::events_client`]).
     pub admin_feed: Arc<AdminFeed>,
+    /// Política de objetivos de los escaneos en modo `network` (feature
+    /// `network_scan_mode`, ver [`crate::network_scan`]): denylist fija más la
+    /// allowlist `NETWORK_SCAN_ALLOWED_CIDRS`.
+    pub network_scan_policy: Arc<NetworkScanPolicy>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -509,23 +544,32 @@ struct MeResponse {
     /// oculte el acceso de administración; la autorización real la aplica
     /// este Gateway con `require_admin`.
     role: Role,
+    /// Si la cuenta tiene el permiso `network_scan` ahora mismo (leído de
+    /// `ms-usuarios` en cada llamada, no del JWT de sesión), para que `front`
+    /// ofrezca o no el modo "solo IP". Es solo de presentación: `POST
+    /// /api/scans` re-valida el permiso en cada solicitud. `false` si
+    /// `ms-usuarios` no responde.
+    can_network_scan: bool,
 }
 
-impl From<Session> for MeResponse {
-    fn from(session: Session) -> Self {
+impl MeResponse {
+    fn new(session: Session, can_network_scan: bool) -> Self {
         Self {
             sub: session.sub,
             email: session.email,
             name: session.name,
             role: session.role,
+            can_network_scan,
         }
     }
 }
 
 /// Devuelve la identidad (`sub`/`email`/`name`/`role`) de la sesión activa, ya
-/// validada por el middleware de sesión. No consulta `ms-usuarios`: el
-/// perfil completo del usuario es responsabilidad de una feature posterior
-/// (`usuarios_profile_proxy`).
+/// validada por el middleware de sesión, más `can_network_scan`: el único dato
+/// que consulta a `ms-usuarios` (con el timeout corto de las reconsultas de
+/// autorización), porque un cambio del permiso debe verse sin volver a
+/// iniciar sesión. Un fallo de `ms-usuarios` no tumba la ruta: responde
+/// `can_network_scan: false` (el perfil completo es de `usuarios_profile_proxy`).
 #[utoipa::path(
     get,
     path = "/api/me",
@@ -536,8 +580,21 @@ impl From<Session> for MeResponse {
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada.")
     )
 )]
-async fn me(Extension(session): Extension<Session>) -> Json<MeResponse> {
-    Json(session.into())
+async fn me(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+) -> Json<MeResponse> {
+    let can_network_scan = match state.usuarios_client.can_network_scan(&session).await {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            tracing::warn!(
+                kind = error.kind(),
+                "no se pudo leer can_network_scan en ms-usuarios; /api/me responde false"
+            );
+            false
+        }
+    };
+    Json(MeResponse::new(session, can_network_scan))
 }
 
 /// Devuelve el perfil del usuario de la sesión activa, proxeando
@@ -692,6 +749,13 @@ struct ScanHistoryEntryResponse {
     /// Motivo del fallo o de la cancelación (`FALLIDO`/`CANCELADO`); siempre
     /// presente, `null` en cualquier otro estado.
     failure_reason: Option<String>,
+    /// Modo con el que se solicitó el escaneo (`ssh`/`network`). Ausente si
+    /// el Gateway ya no lo recuerda (reinicio del proceso: `ms-usuarios`
+    /// todavía no persiste el modo), igual que `scanId`. `front` lo usa para
+    /// mostrar el modo y para derivar "estado de parches no verificado" en
+    /// los escaneos `network`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<ScanMode>,
 }
 
 impl ScanHistoryEntryResponse {
@@ -700,8 +764,10 @@ impl ScanHistoryEntryResponse {
     /// `scanId` propio de este Gateway vía `ownership` (ver la nota de
     /// diseño de este tipo).
     fn from_history_entry(entry: ScanHistoryEntry, ownership: &ScanOwnershipRegistry) -> Self {
+        let known = ownership.find_by_ms_usuarios_scan_id(&entry.scan_id);
         Self {
-            scan_id: ownership.lookup_by_ms_usuarios_scan_id(&entry.scan_id),
+            mode: known.as_ref().map(|(_, o)| o.mode),
+            scan_id: known.map(|(scan_id, _)| scan_id),
             target: entry.target,
             status: entry.status,
             requested_at: entry.requested_at,
@@ -747,6 +813,11 @@ async fn list_scan_history(
 #[derive(Debug, Deserialize, ToSchema)]
 struct ScanSubmissionRequest {
     target: String,
+    /// `ssh` (por defecto, comportamiento original: usa las credenciales SSH
+    /// del usuario) o `network` (escaneo desde el contenedor de `ms-nmap`, sin
+    /// credenciales; exige el permiso `network_scan`).
+    #[serde(default)]
+    mode: ScanMode,
 }
 
 /// Respuesta de `POST /api/scans` con éxito: el identificador de
@@ -776,6 +847,18 @@ enum ScanSubmitError {
     /// registrado ya la entrada de histórico.
     #[error(transparent)]
     Broker(#[from] BrokerError),
+    /// Modo `network` sin el permiso `network_scan` vigente (o el usuario ya
+    /// no existe en `ms-usuarios`): `403`.
+    #[error("la cuenta no tiene el permiso network_scan")]
+    NetworkScanNotPermitted,
+    /// No se pudo confirmar el permiso `network_scan` en `ms-usuarios`
+    /// (caído, timeout, 5xx, secreto rechazado): `503`, fail closed.
+    #[error("no se pudo confirmar el permiso network_scan")]
+    NetworkScanPermissionUnavailable,
+    /// Objetivo prohibido por la denylist o fuera de la allowlist del modo
+    /// `network`: `422` con el código de motivo.
+    #[error(transparent)]
+    NetworkTargetRejected(#[from] TargetRejection),
 }
 
 /// Valida el objetivo del escaneo (RF-02/RF-03), resuelve
@@ -798,6 +881,15 @@ enum ScanSubmitError {
 ///    se actualiza a `Fallido` (best-effort: un fallo al marcarla se
 ///    loggea, nunca tumba la respuesta de error ya en curso) antes de
 ///    responder el error al cliente — nunca queda un `Pendiente` huérfano.
+///
+/// **Modo `network`** (feature `network_scan_mode`, `mode: "network"`): el
+/// orden pasa a ser (1) permiso `network_scan` re-validado contra
+/// `ms-usuarios` en cada solicitud (`403`; `503` si no se puede confirmar,
+/// fail closed), antes de cualquier otro trabajo del modo; (2) formato del
+/// `target` (`400`); (3) [`NetworkScanPolicy`] (`422` con `reason`); (4) sin
+/// resolver credenciales SSH, el histórico y la publicación como arriba, con
+/// un `ScanRequest` sin campos de credenciales. Nada se registra ni publica
+/// si se rechaza. Cuenta contra el mismo límite de tasa que el modo `ssh`.
 #[utoipa::path(
     post,
     path = "/api/scans",
@@ -808,10 +900,12 @@ enum ScanSubmitError {
         (status = 200, description = "scanId de seguimiento generado, ya encolado en el Broker.", body = ScanSubmissionResponse),
         (status = 400, description = "El objetivo (`target`) no es una única IP válida (los rangos no están soportados; solo IPv4/IPv6 o CIDR /32 o /128)."),
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
-        (status = 422, description = "ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo."),
+        (status = 403, description = "Modo `network` sin el permiso `network_scan` vigente en ms-usuarios. Cuerpo JSON `{\"error\": \"network_scan_not_permitted\"}`."),
+        (status = 422, description = "Modo `ssh`: ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo. Modo `network`: objetivo prohibido (loopback, link-local, unique-local, multicast, broadcast, sin especificar) o fuera de NETWORK_SCAN_ALLOWED_CIDRS; cuerpo JSON `{\"error\": \"network_scan_target_rejected\", \"reason\": <target_loopback|target_link_local|target_unique_local|target_multicast|target_broadcast|target_unspecified|target_outside_allowed_ranges>}`. Un `mode` desconocido también responde 422."),
         (status = 429, description = "Se superó el límite de solicitudes de escaneo permitidas para este usuario (RF-12)."),
         (status = 501, description = "La API de ms-usuarios para resolver las credenciales de red todavía no existe (ver docs/architecture.md §Dependencia pendiente)."),
         (status = 502, description = "Fallo al registrar el histórico en ms-usuarios o al publicar en el Broker."),
+        (status = 503, description = "Modo `network`: no se pudo confirmar el permiso network_scan en ms-usuarios (fail closed). Cuerpo JSON `{\"error\": \"network_scan_permission_unavailable\"}`."),
         (status = 504, description = "No se pudo contactar a ms-usuarios.")
     )
 )]
@@ -820,18 +914,46 @@ async fn submit_scan(
     Extension(session): Extension<Session>,
     Json(body): Json<ScanSubmissionRequest>,
 ) -> Result<Json<ScanSubmissionResponse>, ScanSubmitError> {
+    let mode = body.mode;
+    if mode == ScanMode::Network {
+        // Primer paso del modo, antes de validar nada del cuerpo: quien no
+        // tiene el permiso no aprende nada sobre la política de objetivos.
+        verify_network_scan_permission(&state.usuarios_client, &session).await?;
+    }
+
     let submission = ScanSubmission::parse(&body.target)?;
+    let target = match mode {
+        ScanMode::Ssh => submission.target,
+        ScanMode::Network => {
+            // `ScanSubmission::parse` ya garantiza una IP. `check_target`
+            // evalúa y devuelve la forma canónica (IPv4-mapped/compatible
+            // pasa a IPv4), que es la que se publica: lo evaluado y lo
+            // escaneado son la misma dirección.
+            let ip = submission.target.parse::<std::net::IpAddr>().map_err(|_| {
+                ScanSubmissionError::InvalidTarget {
+                    target: submission.target.clone(),
+                }
+            })?;
+            state.network_scan_policy.check_target(ip)?.to_string()
+        }
+    };
 
     let scan_id = uuid::Uuid::new_v4().to_string();
 
-    let credentials = state
-        .usuarios_client
-        .resolve_scan_target(&session, &submission.target)
-        .await?;
+    // Solo `ssh` entra por SSH, así que solo `ssh` resuelve credenciales.
+    let credentials = match mode {
+        ScanMode::Ssh => Some(
+            state
+                .usuarios_client
+                .resolve_scan_target(&session, &target)
+                .await?,
+        ),
+        ScanMode::Network => None,
+    };
 
     let history_entry = state
         .usuarios_client
-        .create_scan_history(&session, &submission.target)
+        .create_scan_history(&session, &target)
         .await?;
 
     // Feature `scan_outcome_relay`: registra a quién pertenece este
@@ -840,17 +962,23 @@ async fn submit_scan(
     // `gateway.scan-outcomes` y el stream SSE puedan resolverlo más
     // adelante (ver `AppState::scan_ownership`). No altera el resto de esta
     // función, ya aprobada en la feature `scan_submission`.
-    state
-        .scan_ownership
-        .register(&scan_id, history_entry.scan_id.clone(), session.clone());
+    state.scan_ownership.register_with_mode(
+        &scan_id,
+        history_entry.scan_id.clone(),
+        session.clone(),
+        mode,
+    );
 
-    let scan_request = ScanRequest {
-        correlation_id: scan_id.clone(),
-        ip: submission.target,
-        network_user: credentials.network_user,
-        ssh_credentials_ref: credentials.ssh_credentials_ref,
-        has_sudo: credentials.has_sudo,
-        requested_by: session.sub.clone(),
+    let scan_request = match credentials {
+        Some(credentials) => ScanRequest::ssh(
+            scan_id.clone(),
+            target,
+            credentials.network_user,
+            credentials.ssh_credentials_ref,
+            credentials.has_sudo,
+            session.sub.clone(),
+        ),
+        None => ScanRequest::network(scan_id.clone(), target, session.sub.clone()),
     };
 
     if let Err(broker_err) = state
@@ -876,10 +1004,43 @@ async fn submit_scan(
     // solicitud, y sin esperar ni propagar nada.
     emit(
         &state.security_events,
-        SecurityEvent::scan_requested(&session.sub, &scan_id, &scan_request.ip),
+        SecurityEvent::scan_requested_in_mode(&session.sub, &scan_id, &scan_request.ip, mode),
     );
 
     Ok(Json(ScanSubmissionResponse { scan_id }))
+}
+
+/// Re-valida contra `ms-usuarios`, en cada solicitud y sin caché, que la
+/// cuenta tenga hoy el permiso `network_scan`. Misma política fail closed que
+/// [`crate::auth::verify_admin`]: permiso `false`/ausente o usuario inexistente
+/// (`404`) deniega con `403`; cualquier otro fallo (caído, timeout, 5xx,
+/// secreto compartido rechazado) responde `503`. Solo se loggea la clase del
+/// error ([`UsuariosClientError::kind`]), nunca datos personales.
+async fn verify_network_scan_permission(
+    usuarios: &UsuariosClient,
+    session: &Session,
+) -> Result<(), ScanSubmitError> {
+    match usuarios.can_network_scan(session).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!("escaneo network denegado: la cuenta no tiene el permiso network_scan");
+            Err(ScanSubmitError::NetworkScanNotPermitted)
+        }
+        Err(UsuariosClientError::UserNotFound) => {
+            tracing::warn!(
+                kind = "user_not_found",
+                "escaneo network denegado: el usuario ya no existe"
+            );
+            Err(ScanSubmitError::NetworkScanNotPermitted)
+        }
+        Err(error) => {
+            tracing::error!(
+                kind = error.kind(),
+                "no se pudo confirmar el permiso network_scan en ms-usuarios; se deniega"
+            );
+            Err(ScanSubmitError::NetworkScanPermissionUnavailable)
+        }
+    }
 }
 
 /// Errores de `GET /api/scans/{scan_id}/events`.
@@ -1467,6 +1628,7 @@ impl Modify for SessionCookieSecurity {
         crate::domain::PatchState,
         crate::domain::Role,
         crate::usuarios_client::ScanStatus,
+        ScanMode,
         crate::usuarios_client::NetworkCredential,
         crate::usuarios_client::CreateNetworkCredentialRequest,
     )),
@@ -1803,6 +1965,30 @@ impl IntoResponse for ScanSubmitError {
                 (
                     StatusCode::BAD_GATEWAY,
                     "no se pudo encolar la solicitud de escaneo".to_string(),
+                )
+                    .into_response()
+            }
+            ScanSubmitError::NetworkScanNotPermitted => (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "network_scan_not_permitted" })),
+            )
+                .into_response(),
+            ScanSubmitError::NetworkScanPermissionUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "network_scan_permission_unavailable" })),
+            )
+                .into_response(),
+            ScanSubmitError::NetworkTargetRejected(rejection) => {
+                tracing::debug!(
+                    reason = rejection.reason_code(),
+                    "objetivo network rechazado"
+                );
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": "network_scan_target_rejected",
+                        "reason": rejection.reason_code(),
+                    })),
                 )
                     .into_response()
             }

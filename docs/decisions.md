@@ -204,3 +204,28 @@ que no son evidentes leyendo el código.
   orden de despliegue es Gateway primero y luego `nmap-service`; de lo
   contrario un `completed` con puerto iría a la DLQ. Un hallazgo a nivel de
   host ya no se descarta del feed por tener `port: null`.
+
+## D-18 — Modo `network` de `POST /api/scans` (NS-03)
+
+- **Decisión:** `POST /api/scans` acepta `mode` (`ssh` por defecto, `network`).
+  En `network`: (1) el permiso `network_scan` se re-valida contra `ms-usuarios`
+  (`GET /users/me`, `can_network_scan`) en cada solicitud, antes de cualquier
+  otro trabajo del modo, con la política fail closed de `require_admin`
+  (`404`/falso => `403`; error => `503`); no hay claim en el JWT ni caché, así
+  que revocar el permiso surte efecto en la siguiente solicitud; (2) denylist
+  fija y allowlist opcional (`NETWORK_SCAN_ALLOWED_CIDRS`) en
+  `src/network_scan.rs` (loopback, link-local, unique-local `fc00::/7` que
+  cubre el metadata IPv6 de AWS `fd00:ec2::254`, multicast, broadcast, sin
+  especificar), evaluadas sobre una única forma canónica de la IP (IPv4-mapped
+  e IPv4-compatible se tratan como su IPv4 y se publican así; `::` y `::1`
+  siguen siendo IPv6), con la denylist primero e inanulable; (3) no se resuelven credenciales SSH y el `ScanRequest` lleva
+  `scan_mode: "network"` sin campos de credenciales (el schema del Broker los
+  prohíbe). En `ssh` el payload es byte-idéntico al anterior (el campo se omite).
+- **`/api/me`:** expone `can_network_scan` leyéndolo de `ms-usuarios` en cada
+  llamada (un cambio del permiso se ve sin volver a iniciar sesión); si
+  `ms-usuarios` falla, responde `false` en vez de tumbar la ruta.
+- **Modo en el histórico:** `GET /api/scans` devuelve `mode` por entrada desde
+  `ScanOwnershipRegistry` (memoria). **Limitación aceptada, igual que `scanId`:**
+  tras reiniciar el Gateway `mode` se omite; la solución durable es que
+  `user-service` persista el modo en la entrada de histórico (fuera de esta
+  tarea).

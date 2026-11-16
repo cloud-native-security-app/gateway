@@ -57,6 +57,12 @@ fn every_gateway_constructor_validates_against_the_broker_schema() {
         SecurityEvent::scan_requested("user-sub-123", "corr-42", "198.51.100.4"),
         SecurityEvent::scan_requested("user-sub-123", "corr-42", "2001:db8::1"),
         SecurityEvent::scan_requested("user-sub-123", "corr-42", "::ffff:192.0.2.1"),
+        SecurityEvent::scan_requested_in_mode(
+            "user-sub-123",
+            "corr-42",
+            "198.51.100.4",
+            gateway::domain::ScanMode::Network,
+        ),
         SecurityEvent::scan_cancelled("user-sub-123", "corr-42"),
         SecurityEvent::auth_login("user-sub-123"),
         SecurityEvent::auth_logout("user-sub-123"),
