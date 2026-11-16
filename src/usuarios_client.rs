@@ -75,7 +75,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Role, ScanResult, Session};
+use crate::domain::{Role, ScanMode, ScanResult, Session};
 
 /// Nombre del header que transporta la identidad ya verificada de la sesión
 /// activa hacia `ms-usuarios`, en formato JSON (`{"sub", "email"}`).
@@ -194,6 +194,11 @@ pub struct ScanHistoryEntry {
     /// un `user-service` anterior que aún no lo envía.
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// Modo persistido del escaneo (`ssh`/`network`). `None` si `ms-usuarios`
+    /// es anterior a la persistencia del modo (feature `scan_history_mode`):
+    /// el Gateway recurre entonces a su registro en memoria.
+    #[serde(default)]
+    pub scan_mode: Option<ScanMode>,
 }
 
 /// Credenciales de red resueltas por `ms-usuarios` para un objetivo de
@@ -305,6 +310,10 @@ impl std::fmt::Debug for CreateNetworkCredentialRequest {
 #[derive(Debug, Serialize)]
 struct CreateScanHistoryRequest<'a> {
     target: &'a str,
+    /// Solo viaja para `network`: el cuerpo `ssh` queda idéntico al previo al
+    /// modo (`ms-usuarios` asume `ssh` si falta).
+    #[serde(skip_serializing_if = "ScanMode::is_ssh")]
+    scan_mode: ScanMode,
 }
 
 /// Cuerpo de `PATCH /scans/{scan_id}`. `result` solo viaja con `COMPLETADO`
@@ -577,11 +586,15 @@ impl UsuariosClient {
     /// el que debe usarse en una llamada posterior a
     /// [`Self::update_scan_status`] para esta misma entrada.
     ///
+    /// `mode` se persiste en el histórico (`scan_mode`, feature
+    /// `scan_history_mode`) para que sobreviva a un reinicio del Gateway.
+    ///
     /// Mismos errores que [`Self::get_profile`].
     pub async fn create_scan_history(
         &self,
         identity: &Session,
         target: &str,
+        mode: ScanMode,
     ) -> Result<ScanHistoryEntry, UsuariosClientError> {
         let identity_header = self.identity_header_value(identity)?;
         let request = self
@@ -592,7 +605,10 @@ impl UsuariosClient {
                 GATEWAY_SECRET_HEADER_NAME,
                 self.shared_secret.expose_secret(),
             )
-            .json(&CreateScanHistoryRequest { target });
+            .json(&CreateScanHistoryRequest {
+                target,
+                scan_mode: mode,
+            });
 
         self.send_and_decode(request).await
     }
@@ -1148,6 +1164,45 @@ mod tests {
 
         assert_eq!(entry.scan_id, "scan-1");
         assert_eq!(entry.status, ScanStatus::Pendiente);
+    }
+
+    #[test]
+    fn scan_history_entry_reads_scan_mode_and_tolerates_its_absence() {
+        let base = serde_json::json!({
+            "scan_id": "scan-1", "user_id": "u", "target": "192.0.2.10",
+            "status": "PENDIENTE",
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+        });
+        let mut with_mode = base.clone();
+        with_mode["scan_mode"] = serde_json::json!("network");
+
+        let network: ScanHistoryEntry = serde_json::from_value(with_mode).expect("con modo");
+        let legacy: ScanHistoryEntry = serde_json::from_value(base).expect("sin modo");
+
+        assert_eq!(network.scan_mode, Some(ScanMode::Network));
+        assert_eq!(legacy.scan_mode, None);
+    }
+
+    #[test]
+    fn create_scan_history_body_omits_scan_mode_for_ssh_and_sends_it_for_network() {
+        let ssh = CreateScanHistoryRequest {
+            target: "192.0.2.10",
+            scan_mode: ScanMode::Ssh,
+        };
+        let network = CreateScanHistoryRequest {
+            target: "192.0.2.10",
+            scan_mode: ScanMode::Network,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&ssh).unwrap(),
+            serde_json::json!({"target": "192.0.2.10"})
+        );
+        assert_eq!(
+            serde_json::to_value(&network).unwrap(),
+            serde_json::json!({"target": "192.0.2.10", "scan_mode": "network"})
+        );
     }
 
     #[test]

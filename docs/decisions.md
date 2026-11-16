@@ -224,8 +224,16 @@ que no son evidentes leyendo el código.
 - **`/api/me`:** expone `can_network_scan` leyéndolo de `ms-usuarios` en cada
   llamada (un cambio del permiso se ve sin volver a iniciar sesión); si
   `ms-usuarios` falla, responde `false` en vez de tumbar la ruta.
-- **Modo en el histórico:** `GET /api/scans` devuelve `mode` por entrada desde
-  `ScanOwnershipRegistry` (memoria). **Limitación aceptada, igual que `scanId`:**
-  tras reiniciar el Gateway `mode` se omite; la solución durable es que
-  `user-service` persista el modo en la entrada de histórico (fuera de esta
-  tarea).
+- **Modo en el histórico:** `GET /api/scans` devuelve `mode` por entrada. En
+  NS-03 salía solo de `ScanOwnershipRegistry` (memoria) y se perdía al reiniciar;
+  NS-08 lo persiste en `user-service` (ver D-19).
+
+## D-19 — `scan_mode` persistido en el histórico (NS-08)
+
+- **Decisión:** el Gateway envía `scan_mode` (`"network"`) en `POST /users/me/scans`
+  (en `ssh` se omite: el cuerpo no cambia y `user-service` asume `ssh`).
+  `GET /api/scans` toma `mode` de `scan_mode` del histórico; solo si falta
+  (`user-service` anterior) usa `ScanOwnershipRegistry`, y si tampoco, lo omite.
+  `scanId` sigue siendo solo memoria. Requiere desplegar `user-service` con la
+  columna antes que el Gateway (si no, un `scan_mode` desconocido se ignora y el
+  modo `network` vuelve a depender de la memoria).

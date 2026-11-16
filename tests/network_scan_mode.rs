@@ -72,6 +72,10 @@ struct UsuariosStub {
     profile_body: Arc<Mutex<Value>>,
     calls: Arc<Mutex<Vec<String>>>,
     history: Arc<Mutex<Vec<Value>>>,
+    /// Cuerpos exactos recibidos en `POST /users/me/scans`.
+    create_bodies: Arc<Mutex<Vec<Value>>>,
+    /// Simula un `ms-usuarios` anterior que no devuelve `scan_mode`.
+    legacy_history: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl UsuariosStub {
@@ -98,6 +102,8 @@ async fn spawn_usuarios_stub(profile_body: Value) -> (String, UsuariosStub) {
         profile_body: Arc::new(Mutex::new(profile_body)),
         calls: Arc::default(),
         history: Arc::default(),
+        create_bodies: Arc::default(),
+        legacy_history: Arc::default(),
     };
 
     async fn profile(State(s): State<UsuariosStub>) -> (StatusCode, Json<Value>) {
@@ -115,6 +121,7 @@ async fn spawn_usuarios_stub(profile_body: Value) -> (String, UsuariosStub) {
     }
     async fn create_history(State(s): State<UsuariosStub>, Json(body): Json<Value>) -> Json<Value> {
         let target = body["target"].as_str().unwrap_or_default().to_string();
+        s.create_bodies.lock().expect("lock").push(body.clone());
         s.calls
             .lock()
             .expect("lock")
@@ -129,6 +136,11 @@ async fn spawn_usuarios_stub(profile_body: Value) -> (String, UsuariosStub) {
             "updated_at": "2024-01-01T00:00:00Z",
             "failure_reason": null,
         });
+        let mut entry = entry;
+        if !s.legacy_history.load(Ordering::SeqCst) {
+            // Como el `user-service` real: persiste `scan_mode`, `ssh` por defecto.
+            entry["scan_mode"] = body.get("scan_mode").cloned().unwrap_or(json!("ssh"));
+        }
         history.push(entry.clone());
         Json(entry)
     }
@@ -789,6 +801,104 @@ async fn history_entries_expose_the_scan_mode() {
     };
     assert_eq!(mode_of("192.0.2.10"), "ssh");
     assert_eq!(mode_of("192.0.2.11"), "network");
+}
+
+#[tokio::test]
+async fn network_scan_sends_scan_mode_to_the_history_and_ssh_body_is_unchanged() {
+    let h = harness(true).await;
+    assert_eq!(
+        h.post(json!({"target": "192.0.2.10"})).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(h.post(network("192.0.2.11")).await.status(), StatusCode::OK);
+
+    let bodies = h.stub.create_bodies.lock().expect("lock").clone();
+    assert_eq!(bodies[0], json!({"target": "192.0.2.10"}));
+    assert_eq!(
+        bodies[1],
+        json!({"target": "192.0.2.11", "scan_mode": "network"})
+    );
+}
+
+#[tokio::test]
+async fn mode_survives_a_gateway_restart_because_it_comes_from_the_history() {
+    let (url, stub) = spawn_usuarios_stub(json!({"role": "user", "can_network_scan": true})).await;
+    let first = spawn_gateway(
+        url.clone(),
+        Arc::new(RecordingPublisher::default()),
+        Options::default(),
+    )
+    .await;
+    let post = reqwest::Client::new()
+        .post(format!("http://{}/api/scans", first.addr))
+        .header(reqwest::header::COOKIE, cookie())
+        .json(&network("192.0.2.11"))
+        .send()
+        .await
+        .expect("POST");
+    assert_eq!(post.status(), StatusCode::OK);
+    assert_eq!(stub.count("history"), 1);
+
+    // Reinicio: gateway nuevo, registro en memoria vacío, mismo `ms-usuarios`.
+    let restarted = spawn_gateway(
+        url,
+        Arc::new(RecordingPublisher::default()),
+        Options::default(),
+    )
+    .await;
+    let body: Value = reqwest::Client::new()
+        .get(format!("http://{}/api/scans", restarted.addr))
+        .header(reqwest::header::COOKIE, cookie())
+        .send()
+        .await
+        .expect("GET")
+        .json()
+        .await
+        .expect("json");
+
+    let entry = &body.as_array().expect("lista")[0];
+    assert_eq!(entry["mode"], "network");
+    assert!(entry.get("scanId").is_none(), "el scanId sí se pierde");
+}
+
+#[tokio::test]
+async fn mode_falls_back_to_the_registry_when_the_history_does_not_carry_it() {
+    let h = harness(true).await;
+    h.stub.legacy_history.store(true, Ordering::SeqCst);
+    assert_eq!(h.post(network("192.0.2.11")).await.status(), StatusCode::OK);
+
+    let body: Value = h.get("/api/scans").await.json().await.expect("json");
+
+    assert_eq!(body[0]["mode"], "network");
+}
+
+#[tokio::test]
+async fn mode_is_omitted_when_neither_history_nor_registry_know_it() {
+    let (url, stub) = spawn_usuarios_stub(json!({"role": "user", "can_network_scan": true})).await;
+    stub.legacy_history.store(true, Ordering::SeqCst);
+    stub.history.lock().expect("lock").push(json!({
+        "scan_id": "old-1", "user_id": "google-sub-123", "target": "192.0.2.9",
+        "status": "COMPLETADO", "requested_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z", "failure_reason": null,
+    }));
+    let gateway = spawn_gateway(
+        url,
+        Arc::new(RecordingPublisher::default()),
+        Options::default(),
+    )
+    .await;
+
+    let body: Value = reqwest::Client::new()
+        .get(format!("http://{}/api/scans", gateway.addr))
+        .header(reqwest::header::COOKIE, cookie())
+        .send()
+        .await
+        .expect("GET")
+        .json()
+        .await
+        .expect("json");
+
+    assert!(body[0].get("mode").is_none());
 }
 
 #[tokio::test]

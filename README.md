@@ -26,7 +26,7 @@ completo está en `GET /api/openapi.json`.
 |---|---|
 | `POST /api/scans` | Alta de escaneo; cuerpo `{"target", "mode"?}` con `mode` `"ssh"` (por defecto) o `"network"` (ver abajo); devuelve `{"scanId"}` |
 | `GET /api/me` | Identidad de la sesión (`sub`, `email`, `name`, `role`) y `can_network_scan` (booleano, leído de `ms-usuarios` en cada llamada; `false` si no responde) |
-| `GET /api/scans` | Histórico: `scanId` (si se conoce), `mode` (`ssh`/`network`, si se conoce), `target`, `status` (`PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO`), `requested_at`, `updated_at`, `failure_reason` (`null` si no hay) |
+| `GET /api/scans` | Histórico: `scanId` (si se conoce), `mode` (`ssh`/`network`, del histórico persistido en `ms-usuarios`), `target`, `status` (`PENDIENTE`, `EN_PROGRESO`, `COMPLETADO`, `FALLIDO`, `CANCELADO`), `requested_at`, `updated_at`, `failure_reason` (`null` si no hay) |
 | `GET /api/scans/{scan_id}/events` | Stream SSE `started`/`completed`/`failed` |
 | `POST /api/scans/{scan_id}/cancel` | `202`; `404` ajeno; `409` si ya es terminal (`COMPLETADO`/`FALLIDO`/`CANCELADO`) |
 | `GET /api/scans/{scan_id}/report` | `200` con el `ScanResult` (`host`, `ports`, `vulnerabilities`, `scanned_at`); `404` inexistente o ajeno; `409` si aún no hay reporte; `502`/`504` fallo de `ms-usuarios` |
@@ -49,8 +49,11 @@ publica un `ScanRequest` con `scan_mode: "network"` y sin
 `network_user`/`ssh_credentials_ref`/`has_sudo`, y el evento `scan.requested`
 lleva `scan_mode: "network"` (en `ssh` el evento no cambia). Si se rechaza, no
 se registra histórico ni se publica nada. Cuenta contra el mismo límite de tasa
-que los escaneos `ssh`. El `mode` del histórico vive solo en memoria del
-Gateway (ver `docs/decisions.md` D-18).
+que los escaneos `ssh`. El Gateway envía `scan_mode: "network"` al registrar el
+histórico en `ms-usuarios` (en `ssh` el cuerpo no cambia) y `GET /api/scans` lee
+`mode` de ese histórico, así que sobrevive a un reinicio; si `ms-usuarios` no lo
+devuelve usa la memoria del Gateway y, si tampoco, lo omite (ver
+`docs/decisions.md` D-18 y D-19).
 
 Al terminar un escaneo, el Gateway guarda en `ms-usuarios` el resultado completo
 (`COMPLETADO`) o el motivo (`FALLIDO`/`CANCELADO`). Si el usuario pidió cancelar
