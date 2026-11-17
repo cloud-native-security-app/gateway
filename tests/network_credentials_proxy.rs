@@ -299,6 +299,7 @@ async fn spawn_gateway_with_secret(
         security_events: Arc::new(NoopSecurityEventPublisher),
         admin_feed: Arc::new(AdminFeed::default()),
         network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
+        host_resolver: Arc::new(gateway::network_target::StaticHostResolver::new()),
     };
 
     let app = app_router(state);

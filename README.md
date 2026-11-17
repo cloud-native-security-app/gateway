@@ -31,18 +31,40 @@ completo está en `GET /api/openapi.json`.
 | `POST /api/scans/{scan_id}/cancel` | `202`; `404` ajeno; `409` si ya es terminal (`COMPLETADO`/`FALLIDO`/`CANCELADO`) |
 | `GET /api/scans/{scan_id}/report` | `200` con el `ScanResult` (`host`, `ports`, `vulnerabilities`, `scanned_at`); `404` inexistente o ajeno; `409` si aún no hay reporte; `502`/`504` fallo de `ms-usuarios` |
 
-### Modo `network` (solo IP)
+### Modo `network` (IP, nombre de host o URL)
 
 `POST /api/scans` con `"mode": "network"` pide a `ms-nmap` escanear la IP desde
 su propio contenedor, sin credenciales SSH. Sin `mode` (o con `"ssh"`) el
-comportamiento y el payload publicado no cambian.
+comportamiento y el payload publicado no cambian (el modo `ssh` sigue aceptando
+solo una IP). El cuerpo sigue siendo `{"target", "mode"}`; en `network`,
+`target` puede ser:
+
+- una **IP** (IPv4/IPv6, o un CIDR `/32`/`/128`): igual que siempre, sin
+  `target_host` ni `extra_port`;
+- un **nombre de host** (RFC 1123: etiquetas de letras, dígitos y guion, hasta
+  253 caracteres, sin punto final; se guarda en minúsculas);
+- una **URL `http://` o `https://`**: se toman host y puerto, y se ignoran
+  ruta, query y fragmento. No se admiten credenciales (`user@`) ni otros
+  esquemas. Si el host de la URL es una IP se trata como una IP más el puerto.
+
+Un nombre se resuelve en el Gateway (timeout `NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`),
+se evalúa **cada** dirección resuelta y se publica una sola, fijada: la primera
+IPv4 en el orden del resolvedor o, si no hay, la primera IPv6. `ms-nmap` nunca
+recibe el nombre como objetivo (ver `docs/decisions.md` D-20). El `ScanRequest`
+lleva `ip` (la fijada), `target_host` (solo con nombre o URL con nombre) y
+`extra_port` (solo si la URL trae un puerto explícito distinto de 80 y 443, que
+nmap ya escanea por defecto). El histórico guarda el nombre tal como se escribió
+(minúsculas, sin esquema ni ruta) o la IP; el evento `scan.requested` mantiene
+`target` = IP fijada y añade `target_host`.
 
 | Paso (en este orden) | Resultado |
 |---|---|
 | Permiso `network_scan` re-validado contra `ms-usuarios` en cada solicitud (`GET /users/me`, campo `can_network_scan`; sin caché) | `403` `{"error":"network_scan_not_permitted"}` si no lo tiene o el usuario no existe; `503` `{"error":"network_scan_permission_unavailable"}` si no se puede confirmar (fail closed) |
-| `target` es una única IP (como en `ssh`) | `400` |
+| `target` es una IP, un nombre de host o una URL `http`/`https` sin credenciales (se parsea antes de cualquier DNS) | `400` (también con credenciales en la URL, otro esquema, puerto `0`/fuera de rango o etiqueta inválida) |
 | Denylist fija: loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), unique-local IPv6 (`fc00::/7`, incluye el metadata `fd00:ec2::254`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, sin especificar (`0.0.0.0`, `::`) y sus formas IPv6 que envuelven un IPv4 (`::ffff:127.0.0.1`, `::127.0.0.1`) | `422` `{"error":"network_scan_target_rejected","reason":<código>}` con `target_loopback`, `target_link_local`, `target_unique_local`, `target_multicast`, `target_broadcast` o `target_unspecified` |
 | Allowlist `NETWORK_SCAN_ALLOWED_CIDRS`, si está definida | `422` con `reason` `target_outside_allowed_ranges` |
+| Nombre sin direcciones, con error de DNS o que supera el timeout | `422` con `reason` `target_unresolvable` |
+| Nombre con **alguna** dirección resuelta que incumple la denylist o la allowlist | `422` con `reason` `target_resolves_to_denied` (no indica cuál dirección) |
 
 No se resuelven credenciales SSH (no hay `422` por credencial ausente), se
 publica un `ScanRequest` con `scan_mode: "network"` y sin
@@ -202,6 +224,7 @@ un error tipado explícito, nunca con un panic:
 | `AWS_ENDPOINT_URL` | No | Endpoint alternativo de AWS, solo LocalStack. Si se define debe ser una URL válida |
 | `SECURITY_EVENTS_STREAM_NAME` | No | Nombre del Kinesis Data Stream de eventos de seguridad (`security-events`). Si no se define o está vacía, Gateway no publica eventos (un aviso informativo al arrancar). El panel de administración lo sirve `events-service`, no este proceso. Solo admite `[a-zA-Z0-9_.-]`, hasta 128 caracteres. Usa `AWS_REGION`/`AWS_ENDPOINT_URL` y las credenciales por defecto de AWS; un fallo de Kinesis solo se loggea y nunca altera una respuesta |
 | `ADMIN_EVENTS_ROLE_RECHECK_SECS` | No (por defecto `60`) | Cada cuántos segundos un stream SSE de `GET /api/admin/events` reconsulta el rol vigente del usuario en `ms-usuarios` y lo cierra si ya no es admin o no se puede verificar. Entero mayor que cero |
+| `NETWORK_SCAN_RESOLVE_TIMEOUT_SECS` | No (por defecto `5`) | Tiempo máximo, en segundos, de la resolución DNS de un objetivo `network` dado por nombre o URL; al agotarse responde `422` `target_unresolvable`. Entero mayor que cero |
 | `NETWORK_SCAN_ALLOWED_CIDRS` | No | Lista de CIDR separados por coma (`10.0.0.0/24,2001:db8::/32`) a los que se limita el modo `network` de `POST /api/scans`; un objetivo fuera de ellos recibe `422`. Vacía o sin definir = cualquier objetivo que pase la denylist fija (que ninguna allowlist puede anular). Un elemento que no sea un CIDR con prefijo hace fallar el arranque con `ConfigError::InvalidCidrList` (el valor no se imprime) |
 | `SCAN_REQUESTS_TOPIC_ARN` | Sí | ARN del topic SNS de solicitudes de escaneo (`arn:<partición>:sns:<región>:<cuenta>:<nombre>`) |
 | `SCAN_CANCELLATIONS_TOPIC_ARN` | Sí | ARN del topic SNS de cancelaciones de escaneo |

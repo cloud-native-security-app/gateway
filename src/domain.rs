@@ -98,6 +98,13 @@ pub enum ScanSubmissionError {
         /// Valor recibido que no superó la validación.
         target: String,
     },
+    /// `target` del modo `network` no es una IP, un nombre de host RFC 1123 ni
+    /// una URL `http`/`https` sin credenciales. Nunca repite el valor
+    /// recibido: podría llevar un usuario/contraseña (`user:pass@host`).
+    #[error(
+        "el objetivo no es una IP, un nombre de host ni una URL http/https válidos (sin credenciales)"
+    )]
+    InvalidNetworkTarget,
     /// `target` es un rango CIDR válido pero más amplio que un único host.
     #[error(
         "'{target}' es un rango: solo se admite una única IP (o un CIDR /32 para IPv4 o /128 para IPv6)"

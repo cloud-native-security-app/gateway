@@ -62,6 +62,16 @@ pub struct ScanRequest {
     /// [`crate::domain::ScanSubmission`] (siempre parseable como `IpAddr`,
     /// nunca un CIDR).
     pub ip: String,
+    /// Nombre de host tal como lo escribió el usuario, en minúsculas (solo
+    /// modo `network` con un nombre o URL; feature `network_scan_url_target`).
+    /// Sirve para mostrar y como host HTTP virtual: `ip` sigue siendo la
+    /// dirección fijada que se escanea.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_host: Option<String>,
+    /// Puerto de la URL que se escanea además de los de nmap por defecto
+    /// (solo modo `network`; ver [`crate::network_target::NetworkTarget`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_port: Option<u16>,
     /// Usuario de red resuelto por `ms-usuarios` para este objetivo (solo
     /// modo `ssh`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +103,8 @@ impl ScanRequest {
             correlation_id,
             scan_mode: ScanMode::Ssh,
             ip,
+            target_host: None,
+            extra_port: None,
             network_user: Some(network_user),
             ssh_credentials_ref: Some(ssh_credentials_ref),
             has_sudo: Some(has_sudo),
@@ -106,11 +118,25 @@ impl ScanRequest {
             correlation_id,
             scan_mode: ScanMode::Network,
             ip,
+            target_host: None,
+            extra_port: None,
             network_user: None,
             ssh_credentials_ref: None,
             has_sudo: None,
             requested_by,
         }
+    }
+
+    /// Añade el nombre de host y el puerto extra de un objetivo `network`
+    /// dado por nombre o URL.
+    pub fn with_network_target(
+        mut self,
+        target_host: Option<String>,
+        extra_port: Option<u16>,
+    ) -> Self {
+        self.target_host = target_host;
+        self.extra_port = extra_port;
+        self
     }
 }
 
@@ -120,6 +146,8 @@ impl std::fmt::Debug for ScanRequest {
             .field("correlation_id", &self.correlation_id)
             .field("scan_mode", &self.scan_mode)
             .field("ip", &self.ip)
+            .field("target_host", &self.target_host)
+            .field("extra_port", &self.extra_port)
             .field("network_user", &self.network_user)
             .field(
                 "ssh_credentials_ref",
@@ -267,6 +295,28 @@ mod tests {
             })
         );
         assert_eq!(request.scan_mode, crate::domain::ScanMode::Network);
+    }
+
+    #[test]
+    fn network_scan_request_carries_target_host_and_extra_port_only_when_set() {
+        let request = ScanRequest::network(
+            "corr-3".to_string(),
+            "192.0.2.10".to_string(),
+            "google-sub-123".to_string(),
+        )
+        .with_network_target(Some("app.example.com".to_string()), Some(8443));
+
+        assert_eq!(
+            serde_json::to_value(&request).expect("serializa"),
+            serde_json::json!({
+                "correlation_id": "corr-3",
+                "scan_mode": "network",
+                "ip": "192.0.2.10",
+                "target_host": "app.example.com",
+                "extra_port": 8443,
+                "requested_by": "google-sub-123",
+            })
+        );
     }
 
     #[test]

@@ -43,6 +43,9 @@ use crate::auth::{self, AuthError, LoginStateStore, OidcClient, SessionValidator
 use crate::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use crate::domain::{Role, ScanMode, ScanResult, ScanSubmission, ScanSubmissionError, Session};
 use crate::network_scan::{NetworkScanPolicy, TargetRejection};
+use crate::network_target::{
+    resolve_and_pin, HostRejection, HostResolver, NetworkTarget, TargetHost,
+};
 use crate::realtime::RealtimeRegistry;
 use crate::security_events::{emit, SecurityEvent, SecurityEventPublisher};
 use crate::usuarios_client::{
@@ -433,6 +436,11 @@ pub struct AppState {
     /// `network_scan_mode`, ver [`crate::network_scan`]): denylist fija más la
     /// allowlist `NETWORK_SCAN_ALLOWED_CIDRS`.
     pub network_scan_policy: Arc<NetworkScanPolicy>,
+    /// Resolvedor DNS de los objetivos `network` dados por nombre o URL
+    /// (feature `network_scan_url_target`, ver [`crate::network_target`]).
+    /// Guardado como `Arc<dyn HostResolver>` para inyectar un doble
+    /// determinista en los tests.
+    pub host_resolver: Arc<dyn HostResolver>,
 }
 
 /// Construye el router `axum` con las rutas públicas de autenticación:
@@ -812,10 +820,16 @@ async fn list_scan_history(
     Ok(Json(response))
 }
 
-/// Cuerpo de `POST /api/scans`: el objetivo (una única IP; se admite un CIDR /32 o /128, que se normaliza a la IP simple) del escaneo
-/// solicitado, sin validar todavía (ver [`ScanSubmission::parse`]).
+/// Cuerpo de `POST /api/scans`: el objetivo del escaneo solicitado, sin
+/// validar todavía (ver [`ScanSubmission::parse`] y [`NetworkTarget::parse`]).
 #[derive(Debug, Deserialize, ToSchema)]
 struct ScanSubmissionRequest {
+    /// Modo `ssh`: una única IP (se admite un CIDR /32 o /128, que se
+    /// normaliza a la IP simple). Modo `network`: una IP (igual que en `ssh`),
+    /// un nombre de host RFC 1123 (hasta 253 caracteres, sin punto final) o una
+    /// URL `http://`/`https://` (se toman host y puerto; ruta, query y
+    /// fragmento se ignoran; sin credenciales `user@`). Un nombre se resuelve en
+    /// el Gateway y se escanea una sola IP fijada.
     target: String,
     /// `ssh` (por defecto, comportamiento original: usa las credenciales SSH
     /// del usuario) o `network` (escaneo desde el contenedor de `ms-nmap`, sin
@@ -863,6 +877,10 @@ enum ScanSubmitError {
     /// `network`: `422` con el código de motivo.
     #[error(transparent)]
     NetworkTargetRejected(#[from] TargetRejection),
+    /// Objetivo `network` dado por nombre o URL que no se pudo resolver o
+    /// cuya resolución incluye una dirección no permitida: `422`.
+    #[error(transparent)]
+    NetworkHostRejected(#[from] HostRejection),
 }
 
 /// Valida el objetivo del escaneo (RF-02/RF-03), resuelve
@@ -890,7 +908,9 @@ enum ScanSubmitError {
 /// orden pasa a ser (1) permiso `network_scan` re-validado contra
 /// `ms-usuarios` en cada solicitud (`403`; `503` si no se puede confirmar,
 /// fail closed), antes de cualquier otro trabajo del modo; (2) formato del
-/// `target` (`400`); (3) [`NetworkScanPolicy`] (`422` con `reason`); (4) sin
+/// `target` (`400`); (3) resolución DNS de los nombres y [`NetworkScanPolicy`] sobre cada
+/// dirección (`422` con `reason`; una sola dirección rechazada rechaza el
+/// nombre); (4) sin
 /// resolver credenciales SSH, el histórico y la publicación como arriba, con
 /// un `ScanRequest` sin campos de credenciales. Nada se registra ni publica
 /// si se rechaza. Cuenta contra el mismo límite de tasa que el modo `ssh`.
@@ -902,10 +922,10 @@ enum ScanSubmitError {
     request_body = ScanSubmissionRequest,
     responses(
         (status = 200, description = "scanId de seguimiento generado, ya encolado en el Broker.", body = ScanSubmissionResponse),
-        (status = 400, description = "El objetivo (`target`) no es una única IP válida (los rangos no están soportados; solo IPv4/IPv6 o CIDR /32 o /128)."),
+        (status = 400, description = "Modo `ssh`: el objetivo (`target`) no es una única IP válida (los rangos no están soportados; solo IPv4/IPv6 o CIDR /32 o /128). Modo `network`: tampoco es un nombre de host RFC 1123 ni una URL `http`/`https` válidos (esquema distinto, credenciales `user@`, host vacío, etiqueta inválida o puerto fuera de 1..65535)."),
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
         (status = 403, description = "Modo `network` sin el permiso `network_scan` vigente en ms-usuarios. Cuerpo JSON `{\"error\": \"network_scan_not_permitted\"}`."),
-        (status = 422, description = "Modo `ssh`: ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo. Modo `network`: objetivo prohibido (loopback, link-local, unique-local, multicast, broadcast, sin especificar) o fuera de NETWORK_SCAN_ALLOWED_CIDRS; cuerpo JSON `{\"error\": \"network_scan_target_rejected\", \"reason\": <target_loopback|target_link_local|target_unique_local|target_multicast|target_broadcast|target_unspecified|target_outside_allowed_ranges>}`. Un `mode` desconocido también responde 422."),
+        (status = 422, description = "Modo `ssh`: ms-usuarios no tiene credenciales de red configuradas para este usuario/objetivo. Modo `network`: objetivo prohibido (loopback, link-local, unique-local, multicast, broadcast, sin especificar) o fuera de NETWORK_SCAN_ALLOWED_CIDRS; cuerpo JSON `{\"error\": \"network_scan_target_rejected\", \"reason\": <target_loopback|target_link_local|target_unique_local|target_multicast|target_broadcast|target_unspecified|target_outside_allowed_ranges|target_unresolvable|target_resolves_to_denied>}`; `target_unresolvable`: el nombre no tiene direcciones, falló el DNS o se agotó el tiempo (`NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`); `target_resolves_to_denied`: al menos una dirección resuelta incumple la denylist o la allowlist. Un `mode` desconocido también responde 422."),
         (status = 429, description = "Se superó el límite de solicitudes de escaneo permitidas para este usuario (RF-12)."),
         (status = 501, description = "La API de ms-usuarios para resolver las credenciales de red todavía no existe (ver docs/architecture.md §Dependencia pendiente)."),
         (status = 502, description = "Fallo al registrar el histórico en ms-usuarios o al publicar en el Broker."),
@@ -925,22 +945,11 @@ async fn submit_scan(
         verify_network_scan_permission(&state.usuarios_client, &session).await?;
     }
 
-    let submission = ScanSubmission::parse(&body.target)?;
-    let target = match mode {
-        ScanMode::Ssh => submission.target,
-        ScanMode::Network => {
-            // `ScanSubmission::parse` ya garantiza una IP. `check_target`
-            // evalúa y devuelve la forma canónica (IPv4-mapped/compatible
-            // pasa a IPv4), que es la que se publica: lo evaluado y lo
-            // escaneado son la misma dirección.
-            let ip = submission.target.parse::<std::net::IpAddr>().map_err(|_| {
-                ScanSubmissionError::InvalidTarget {
-                    target: submission.target.clone(),
-                }
-            })?;
-            state.network_scan_policy.check_target(ip)?.to_string()
-        }
+    let plan = match mode {
+        ScanMode::Ssh => ScanTargetPlan::literal(ScanSubmission::parse(&body.target)?.target),
+        ScanMode::Network => plan_network_target(&state, &body.target).await?,
     };
+    let target = plan.ip.clone();
 
     let scan_id = uuid::Uuid::new_v4().to_string();
 
@@ -957,7 +966,7 @@ async fn submit_scan(
 
     let history_entry = state
         .usuarios_client
-        .create_scan_history(&session, &target, mode)
+        .create_scan_history(&session, &plan.history_target, mode)
         .await?;
 
     // Feature `scan_outcome_relay`: registra a quién pertenece este
@@ -982,7 +991,8 @@ async fn submit_scan(
             credentials.has_sudo,
             session.sub.clone(),
         ),
-        None => ScanRequest::network(scan_id.clone(), target, session.sub.clone()),
+        None => ScanRequest::network(scan_id.clone(), target, session.sub.clone())
+            .with_network_target(plan.target_host.clone(), plan.extra_port),
     };
 
     if let Err(broker_err) = state
@@ -1008,10 +1018,74 @@ async fn submit_scan(
     // solicitud, y sin esperar ni propagar nada.
     emit(
         &state.security_events,
-        SecurityEvent::scan_requested_in_mode(&session.sub, &scan_id, &scan_request.ip, mode),
+        SecurityEvent::scan_requested_for_host(
+            &session.sub,
+            &scan_id,
+            &scan_request.ip,
+            mode,
+            plan.target_host.as_deref(),
+        ),
     );
 
     Ok(Json(ScanSubmissionResponse { scan_id }))
+}
+
+/// Objetivo de un `POST /api/scans` ya validado: lo que se publica, lo que se
+/// guarda en el histórico y lo que solo sirve para mostrar.
+struct ScanTargetPlan {
+    /// IP que se publica como `ip` (en `network`, la dirección fijada).
+    ip: String,
+    /// Valor del histórico: el nombre de host tal como se escribió (en
+    /// minúsculas, sin esquema ni ruta) o la IP.
+    history_target: String,
+    /// `target_host` del `ScanRequest` y del evento (solo nombre/URL con nombre).
+    target_host: Option<String>,
+    /// `extra_port` del `ScanRequest` (solo URL con puerto no estándar).
+    extra_port: Option<u16>,
+}
+
+impl ScanTargetPlan {
+    fn literal(ip: String) -> Self {
+        Self {
+            history_target: ip.clone(),
+            ip,
+            target_host: None,
+            extra_port: None,
+        }
+    }
+}
+
+/// Modo `network`: parsea `raw` (IP, nombre o URL `http`/`https`), resuelve
+/// los nombres y aplica la política a **todas** las direcciones. Va después
+/// del permiso `network_scan`, así que quien no lo tiene nunca provoca una
+/// consulta DNS.
+async fn plan_network_target(
+    state: &AppState,
+    raw: &str,
+) -> Result<ScanTargetPlan, ScanSubmitError> {
+    let target = NetworkTarget::parse(raw)?;
+    let (ip, target_host) = match target.host {
+        // `check_target` evalúa y devuelve la forma canónica (IPv4-mapped/
+        // compatible pasa a IPv4), que es la que se publica: lo evaluado y lo
+        // escaneado son la misma dirección.
+        TargetHost::Ip(ip) => (state.network_scan_policy.check_target(ip)?, None),
+        TargetHost::Name(name) => {
+            let pinned = resolve_and_pin(
+                state.host_resolver.as_ref(),
+                &state.network_scan_policy,
+                &name,
+            )
+            .await?;
+            (pinned, Some(name))
+        }
+    };
+    let ip = ip.to_string();
+    Ok(ScanTargetPlan {
+        history_target: target_host.clone().unwrap_or_else(|| ip.clone()),
+        ip,
+        target_host,
+        extra_port: target.extra_port,
+    })
 }
 
 /// Re-valida contra `ms-usuarios`, en cada solicitud y sin caché, que la
@@ -1952,6 +2026,20 @@ impl IntoResponse for CallbackError {
     }
 }
 
+/// `422` del modo `network`, con el código de motivo y nada más (nunca qué
+/// dirección resuelta fue la rechazada).
+fn network_target_rejected(reason: &'static str) -> Response {
+    tracing::debug!(reason, "objetivo network rechazado");
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "network_scan_target_rejected",
+            "reason": reason,
+        })),
+    )
+        .into_response()
+}
+
 impl IntoResponse for ScanSubmitError {
     fn into_response(self) -> Response {
         match self {
@@ -1983,18 +2071,10 @@ impl IntoResponse for ScanSubmitError {
             )
                 .into_response(),
             ScanSubmitError::NetworkTargetRejected(rejection) => {
-                tracing::debug!(
-                    reason = rejection.reason_code(),
-                    "objetivo network rechazado"
-                );
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({
-                        "error": "network_scan_target_rejected",
-                        "reason": rejection.reason_code(),
-                    })),
-                )
-                    .into_response()
+                network_target_rejected(rejection.reason_code())
+            }
+            ScanSubmitError::NetworkHostRejected(rejection) => {
+                network_target_rejected(rejection.reason_code())
             }
         }
     }

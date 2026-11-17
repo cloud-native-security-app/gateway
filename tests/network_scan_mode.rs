@@ -24,6 +24,7 @@ use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_CO
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
 use gateway::network_scan::NetworkScanPolicy;
+use gateway::network_target::{HostResolver, ResolveError, StaticHostResolver};
 use gateway::realtime::RealtimeRegistry;
 use gateway::security_events::{
     NoopSecurityEventPublisher, RecordingSecurityEventPublisher, SecurityEventPublisher,
@@ -199,6 +200,16 @@ struct Options {
     policy: NetworkScanPolicy,
     rate_limit: u32,
     events: Arc<dyn SecurityEventPublisher>,
+    resolver: Arc<dyn HostResolver>,
+}
+
+impl Options {
+    fn with_resolver(resolver: &Arc<StaticHostResolver>) -> Self {
+        Self {
+            resolver: resolver.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Options {
@@ -207,6 +218,7 @@ impl Default for Options {
             policy: NetworkScanPolicy::unrestricted(),
             rate_limit: 1000,
             events: Arc::new(NoopSecurityEventPublisher),
+            resolver: Arc::new(StaticHostResolver::new()),
         }
     }
 }
@@ -251,6 +263,7 @@ async fn spawn_gateway(
         security_events: options.events,
         admin_feed: Arc::new(AdminFeed::default()),
         network_scan_policy: Arc::new(options.policy),
+        host_resolver: options.resolver,
     };
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -561,7 +574,7 @@ async fn denylisted_targets_get_422_with_a_reason_code_and_nothing_is_published(
 #[tokio::test]
 async fn malformed_network_target_is_still_a_400() {
     let h = harness(true).await;
-    for target in ["not-an-ip", "10.0.0.0/24", ""] {
+    for target in ["10.0.0.0/24", ""] {
         let response = h.post(network(target)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target:?}");
     }
@@ -606,6 +619,367 @@ async fn unset_allowlist_accepts_any_target_after_the_denylist() {
         StatusCode::OK
     );
     assert_eq!(h.post(network("10.9.9.9")).await.status(), StatusCode::OK);
+}
+
+// --- Nombre de host y URL (UT-03) --------------------------------------------
+
+fn permitted(resolver: &Arc<StaticHostResolver>) -> Options {
+    Options::with_resolver(resolver)
+}
+
+const PERMITTED_PROFILE: fn() -> Value = || json!({"role": "user", "can_network_scan": true});
+
+fn assert_valid_scan_request(published: &Value) {
+    if let Some(validator) = broker_schema("scan-request.schema.json") {
+        let errors: Vec<_> = validator
+            .iter_errors(published)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "no valida contra el contrato: {errors:?}"
+        );
+    }
+}
+
+async fn assert_rejected(h: &Harness, target: &str, reason: &str) {
+    let (published_before, history_before) = (h.published().len(), h.stub.count("history"));
+    let response = h.post(network(target)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{target}"
+    );
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body,
+        json!({"error": "network_scan_target_rejected", "reason": reason}),
+        "{target}"
+    );
+    assert_eq!(h.published().len(), published_before, "no se publica nada");
+    assert_eq!(h.stub.count("history"), history_before, "sin histórico");
+}
+
+#[tokio::test]
+async fn hostname_resolving_to_an_allowed_address_publishes_the_pinned_ip_and_the_host() {
+    let resolver = Arc::new(
+        StaticHostResolver::new().with_answer("app.example.com", &["2001:db8::9", "192.0.2.20"]),
+    );
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    let response = h.post(network("App.Example.com")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json");
+    let published = h.published();
+    assert_eq!(
+        published,
+        vec![json!({
+            "correlation_id": body["scanId"],
+            "scan_mode": "network",
+            "ip": "192.0.2.20",
+            "target_host": "app.example.com",
+            "requested_by": "google-sub-123",
+        })]
+    );
+    assert_valid_scan_request(&published[0]);
+    assert_eq!(resolver.calls(), vec!["app.example.com".to_string()]);
+    assert_eq!(h.stub.count("resolve"), 0);
+}
+
+#[tokio::test]
+async fn url_with_a_non_default_port_publishes_extra_port() {
+    let resolver =
+        Arc::new(StaticHostResolver::new().with_answer("app.example.com", &["192.0.2.20"]));
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    let response = h
+        .post(network("https://app.example.com:8443/login?x=1#top"))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let published = h.published();
+    assert_eq!(published[0]["ip"], "192.0.2.20");
+    assert_eq!(published[0]["target_host"], "app.example.com");
+    assert_eq!(published[0]["extra_port"], 8443);
+    assert_valid_scan_request(&published[0]);
+}
+
+#[tokio::test]
+async fn url_with_a_default_or_missing_port_publishes_no_extra_port() {
+    let resolver =
+        Arc::new(StaticHostResolver::new().with_answer("app.example.com", &["192.0.2.20"]));
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    for target in [
+        "https://app.example.com",
+        "http://app.example.com/path",
+        "https://app.example.com:443",
+        "http://app.example.com:80",
+    ] {
+        assert_eq!(h.post(network(target)).await.status(), StatusCode::OK);
+    }
+
+    let published = h.published();
+    assert_eq!(published.len(), 4);
+    for message in &published {
+        assert!(message.get("extra_port").is_none(), "{message}");
+        assert_eq!(message["target_host"], "app.example.com");
+        assert_valid_scan_request(message);
+    }
+}
+
+#[tokio::test]
+async fn url_with_an_ip_literal_host_publishes_the_ip_and_the_port_without_a_host() {
+    let resolver = Arc::new(StaticHostResolver::new());
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    assert_eq!(
+        h.post(network("http://192.0.2.10:8080/x")).await.status(),
+        StatusCode::OK
+    );
+
+    let published = h.published();
+    assert_eq!(published[0]["ip"], "192.0.2.10");
+    assert_eq!(published[0]["extra_port"], 8080);
+    assert!(published[0].get("target_host").is_none());
+    assert_valid_scan_request(&published[0]);
+    assert!(resolver.calls().is_empty(), "una IP no se resuelve");
+    assert_eq!(h.stub.count("history:192.0.2.10"), 1);
+}
+
+#[tokio::test]
+async fn a_url_to_a_denied_ip_literal_is_rejected_like_the_bare_ip() {
+    let h = harness(true).await;
+    assert_rejected(&h, "http://127.0.0.1:8080/", "target_loopback").await;
+    assert_rejected(&h, "https://[::1]/", "target_loopback").await;
+    assert_rejected(&h, "http://2130706433/", "target_loopback").await;
+}
+
+#[tokio::test]
+async fn ipv6_only_hostname_pins_the_ipv6_address() {
+    let resolver = Arc::new(
+        StaticHostResolver::new().with_answer("v6.example.com", &["2001:db8::2", "2001:db8::1"]),
+    );
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    assert_eq!(
+        h.post(network("v6.example.com")).await.status(),
+        StatusCode::OK
+    );
+
+    let published = h.published();
+    assert_eq!(published[0]["ip"], "2001:db8::2");
+    assert_valid_scan_request(&published[0]);
+}
+
+#[tokio::test]
+async fn any_denied_resolved_address_rejects_the_name_and_nothing_is_published() {
+    let resolver = Arc::new(
+        StaticHostResolver::new()
+            .with_answer("mixed.example.com", &["192.0.2.20", "127.0.0.1"])
+            .with_answer("meta.example.com", &["169.254.169.254", "192.0.2.20"]),
+    );
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    assert_rejected(&h, "mixed.example.com", "target_resolves_to_denied").await;
+    assert_rejected(
+        &h,
+        "https://meta.example.com:8443/",
+        "target_resolves_to_denied",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resolved_address_outside_the_allowlist_is_rejected() {
+    let resolver = Arc::new(
+        StaticHostResolver::new()
+            .with_answer("in.example.com", &["10.0.0.7"])
+            .with_answer("out.example.com", &["192.0.2.20"]),
+    );
+    let h = harness_with(
+        PERMITTED_PROFILE(),
+        Options {
+            policy: NetworkScanPolicy::new(vec!["10.0.0.0/24".parse().unwrap()]),
+            ..permitted(&resolver)
+        },
+    )
+    .await;
+
+    assert_eq!(
+        h.post(network("in.example.com")).await.status(),
+        StatusCode::OK
+    );
+    assert_rejected(&h, "out.example.com", "target_resolves_to_denied").await;
+}
+
+#[tokio::test]
+async fn unresolvable_names_get_422_and_nothing_is_published() {
+    let resolver = Arc::new(
+        StaticHostResolver::new()
+            .with_answer("empty.example.com", &[])
+            .with_failure("slow.example.com", ResolveError::Timeout),
+    );
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    for target in [
+        "empty.example.com",
+        "slow.example.com",
+        "nxdomain.example.com",
+    ] {
+        assert_rejected(&h, target, "target_unresolvable").await;
+    }
+}
+
+#[tokio::test]
+async fn malformed_hostnames_and_urls_are_a_400_and_never_reach_the_resolver() {
+    let resolver = Arc::new(StaticHostResolver::new());
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    for target in [
+        "https://user:secret@app.example.com/",
+        "http://user@app.example.com",
+        "ftp://app.example.com",
+        "bad_label.example.com",
+        "-bad.example.com",
+        "app.example.com.",
+        "http://",
+        "https://app.example.com:0",
+    ] {
+        let response = h.post(network(target)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
+        let text = response.text().await.expect("texto");
+        assert!(!text.contains("secret"), "{target}: {text}");
+    }
+    assert!(h.published().is_empty());
+    assert!(resolver.calls().is_empty());
+    assert_eq!(h.stub.count("history"), 0);
+}
+
+#[tokio::test]
+async fn unauthorized_users_get_403_before_any_dns_lookup() {
+    let resolver =
+        Arc::new(StaticHostResolver::new().with_answer("app.example.com", &["192.0.2.20"]));
+    let h = harness_with(
+        json!({"role": "user", "can_network_scan": false}),
+        permitted(&resolver),
+    )
+    .await;
+
+    for target in [
+        "app.example.com",
+        "https://app.example.com:8443/",
+        "bad_host",
+    ] {
+        assert_eq!(
+            h.post(network(target)).await.status(),
+            StatusCode::FORBIDDEN,
+            "{target}"
+        );
+    }
+    assert!(resolver.calls().is_empty(), "sin DNS para quien no puede");
+    h.assert_nothing_happened();
+}
+
+#[tokio::test]
+async fn history_stores_the_hostname_as_typed_for_names_and_urls_and_the_ip_for_ips() {
+    let resolver = Arc::new(
+        StaticHostResolver::new()
+            .with_answer("app.example.com", &["192.0.2.20"])
+            .with_answer("other.example.com", &["192.0.2.21"]),
+    );
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    for target in [
+        "App.Example.com",
+        "https://Other.Example.com:8443/path?q=1",
+        "192.0.2.30",
+        "http://192.0.2.31:8080/x",
+    ] {
+        assert_eq!(h.post(network(target)).await.status(), StatusCode::OK);
+    }
+
+    let stored: Vec<String> = h
+        .stub
+        .create_bodies
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|body| body["target"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        stored,
+        vec![
+            "app.example.com",
+            "other.example.com",
+            "192.0.2.30",
+            "192.0.2.31"
+        ]
+    );
+    let listed: Value = h.get("/api/scans").await.json().await.expect("json");
+    assert_eq!(listed[0]["target"], "app.example.com");
+    assert_eq!(listed[0]["mode"], "network");
+}
+
+#[tokio::test]
+async fn scan_requested_event_keeps_the_pinned_ip_and_adds_the_host() {
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let resolver =
+        Arc::new(StaticHostResolver::new().with_answer("app.example.com", &["192.0.2.20"]));
+    let h = harness_with(
+        PERMITTED_PROFILE(),
+        Options {
+            events: events.clone(),
+            ..permitted(&resolver)
+        },
+    )
+    .await;
+
+    assert_eq!(
+        h.post(network("https://app.example.com:8443/"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(h.post(network("192.0.2.11")).await.status(), StatusCode::OK);
+
+    let emitted = events.wait_for(2).await;
+    let find = |target: &str| {
+        emitted
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .find(|event| event["payload"]["target"] == target)
+            .unwrap_or_else(|| panic!("no hay evento para {target}"))
+    };
+    let named = find("192.0.2.20");
+    let plain = find("192.0.2.11");
+    assert_eq!(
+        named["payload"],
+        json!({"target": "192.0.2.20", "scan_mode": "network", "target_host": "app.example.com"})
+    );
+    assert_eq!(
+        plain["payload"],
+        json!({"target": "192.0.2.11", "scan_mode": "network"})
+    );
+    if let Some(validator) = broker_schema("security-event.schema.json") {
+        assert!(validator.is_valid(&named));
+        assert!(validator.is_valid(&plain));
+    }
+}
+
+#[tokio::test]
+async fn ssh_mode_ignores_names_and_urls_exactly_as_before() {
+    let resolver =
+        Arc::new(StaticHostResolver::new().with_answer("app.example.com", &["192.0.2.20"]));
+    let h = harness_with(PERMITTED_PROFILE(), permitted(&resolver)).await;
+
+    for target in ["app.example.com", "https://app.example.com:8443/"] {
+        let response = h.post(json!({"target": target})).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{target}");
+    }
+    assert!(resolver.calls().is_empty());
+    assert!(h.published().is_empty());
 }
 
 // --- ssh sin cambios --------------------------------------------------------
@@ -919,4 +1293,12 @@ async fn openapi_documents_mode_403_422_503_and_can_network_scan() {
             "falta {status} en POST /api/scans"
         );
     }
+    let unprocessable = responses["422"]["description"].as_str().unwrap();
+    for reason in ["target_unresolvable", "target_resolves_to_denied"] {
+        assert!(unprocessable.contains(reason), "422 sin {reason}");
+    }
+    let target = schemas["ScanSubmissionRequest"]["properties"]["target"]["description"]
+        .as_str()
+        .expect("target documentado");
+    assert!(target.contains("URL") && target.contains("nombre de host"));
 }
