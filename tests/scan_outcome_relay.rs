@@ -448,7 +448,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     .await
     .expect("no debe colgarse esperando el primer evento (started)")
     .expect("debe llegar el evento started");
-    assert!(first.contains(r#"\"status\":\"started\""#));
+    assert!(first.contains(r#""status":"started""#), "{first}");
 
     let second = tokio::time::timeout(
         Duration::from_secs(15),
@@ -457,7 +457,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     .await
     .expect("no debe colgarse esperando el segundo evento (completed, saltando el malformado)")
     .expect("debe llegar el evento completed");
-    assert!(second.contains(r#"\"status\":\"completed\""#));
+    assert!(second.contains(r#""status":"completed""#), "{second}");
 
     let after_terminal = tokio::time::timeout(
         Duration::from_secs(5),
