@@ -9,7 +9,8 @@
 //! `docs/decisions.md` D-20.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -178,12 +179,24 @@ impl SystemHostResolver {
 impl HostResolver for SystemHostResolver {
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
         // El puerto 0 es solo el exigido por la API; nunca se usa.
-        let lookup = tokio::time::timeout(self.timeout, tokio::net::lookup_host((host, 0)))
-            .await
-            .map_err(|_| ResolveError::Timeout)?;
-        let addrs = lookup.map_err(|_| ResolveError::Failed)?;
-        Ok(addrs.map(|addr| addr.ip()).collect())
+        lookup_with_timeout(self.timeout, tokio::net::lookup_host((host, 0))).await
     }
+}
+
+/// Espera `lookup` como mucho `timeout`: vencido el plazo es
+/// [`ResolveError::Timeout`]; un error de resolución es [`ResolveError::Failed`].
+async fn lookup_with_timeout<I>(
+    timeout: Duration,
+    lookup: impl Future<Output = std::io::Result<I>>,
+) -> Result<Vec<IpAddr>, ResolveError>
+where
+    I: Iterator<Item = SocketAddr>,
+{
+    let addrs = tokio::time::timeout(timeout, lookup)
+        .await
+        .map_err(|_| ResolveError::Timeout)?
+        .map_err(|_| ResolveError::Failed)?;
+    Ok(addrs.map(|addr| addr.ip()).collect())
 }
 
 /// Resolvedor determinista: respuestas fijas por nombre, y registro de las
@@ -531,11 +544,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_resolver_times_out_instead_of_hanging() {
-        let resolver = SystemHostResolver::new(Duration::ZERO);
+    async fn a_lookup_that_never_answers_times_out_instead_of_hanging() {
+        // Un lookup que nunca responde: el resultado depende solo del
+        // timeout, no de la velocidad del DNS de la máquina que corre el test.
+        let never = std::future::pending::<std::io::Result<std::vec::IntoIter<SocketAddr>>>();
         assert_eq!(
-            resolver.resolve("localhost").await,
+            lookup_with_timeout(Duration::from_millis(20), never).await,
             Err(ResolveError::Timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_maps_to_failed() {
+        let failed = std::future::ready(Err::<std::vec::IntoIter<SocketAddr>, _>(
+            std::io::Error::other("nxdomain"),
+        ));
+        assert_eq!(
+            lookup_with_timeout(Duration::from_secs(5), failed).await,
+            Err(ResolveError::Failed)
         );
     }
 }
