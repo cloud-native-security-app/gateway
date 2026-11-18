@@ -829,4 +829,87 @@ mod tests {
             assert!(serde_json::from_value::<ScanOutcomeEvent>(json).is_err());
         }
     }
+
+    /// Matriz completa `ScanOutcomeEvent` x `cancel_requested`: `cancelled`
+    /// solo nace de `failed` + cancelación pedida; el resto conserva su
+    /// estado, y `correlation_id`/`reason`/`result` pasan intactos.
+    #[test]
+    fn live_event_from_outcome_maps_every_outcome_and_cancel_flag() {
+        let result = ScanResult {
+            host: "10.0.0.5".to_string(),
+            ports: vec![],
+            vulnerabilities: vec![],
+            scanned_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let started = ScanOutcomeEvent::Started {
+            correlation_id: "scan-1".to_string(),
+        };
+        let completed = ScanOutcomeEvent::Completed {
+            correlation_id: "scan-1".to_string(),
+            result: result.clone(),
+        };
+        let failed = ScanOutcomeEvent::Failed {
+            correlation_id: "scan-1".to_string(),
+            reason: "cancelado por el usuario".to_string(),
+        };
+        let cid = || "scan-1".to_string();
+
+        let cases = [
+            (
+                &started,
+                false,
+                ScanLiveEvent::Started {
+                    correlation_id: cid(),
+                },
+            ),
+            (
+                &started,
+                true,
+                ScanLiveEvent::Started {
+                    correlation_id: cid(),
+                },
+            ),
+            (
+                &completed,
+                false,
+                ScanLiveEvent::Completed {
+                    correlation_id: cid(),
+                    result: result.clone(),
+                },
+            ),
+            (
+                &completed,
+                true,
+                ScanLiveEvent::Completed {
+                    correlation_id: cid(),
+                    result: result.clone(),
+                },
+            ),
+            (
+                &failed,
+                false,
+                ScanLiveEvent::Failed {
+                    correlation_id: cid(),
+                    reason: "cancelado por el usuario".to_string(),
+                },
+            ),
+            (
+                &failed,
+                true,
+                ScanLiveEvent::Cancelled {
+                    correlation_id: cid(),
+                    reason: "cancelado por el usuario".to_string(),
+                },
+            ),
+        ];
+
+        for (outcome, cancel_requested, expected) in cases {
+            let live = ScanLiveEvent::from_outcome(outcome, cancel_requested);
+            assert_eq!(
+                live, expected,
+                "outcome={outcome:?} cancel_requested={cancel_requested}"
+            );
+            assert_eq!(live.correlation_id(), "scan-1");
+        }
+    }
 }
