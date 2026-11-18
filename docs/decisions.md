@@ -190,7 +190,7 @@ que no son evidentes leyendo el código.
   - `GET /api/scans/{scan_id}/report` traduce el `scanId` del Gateway al de
     `ms-usuarios` con `ScanOwnershipRegistry`, que sigue siendo en memoria: tras
     un reinicio responde `404` aunque el reporte exista.
-  - El shape SSE no cambia (`started`/`completed`/`failed`).
+  - El shape SSE no cambia; desde D-21 el navegador recibe `cancelled` en lugar de `failed` tras una cancelación pedida.
 
 ## D-17 — Puerto y protocolo opcionales en `VulnFinding` y `finding.critical`
 
@@ -265,3 +265,31 @@ que no son evidentes leyendo el código.
 - **Aceptado, sin cambio:** la denylist no bloquea RFC 1918 (el objetivo del
   laboratorio es una dirección privada de VPC), así que un nombre que resuelve a
   una IP privada se permite igual que escribir esa IP.
+
+## D-21 — SSE resiliente: keep-alive, reenvío del último evento y `cancelled` (SC-01)
+
+- **Problema (lab):** el ALB cerraba el stream tras 60 s sin bytes; al
+  reconectar, un evento terminal publicado durante el corte se perdía (el
+  registro lo descartaba sin receptores) y la página quedaba cargando; una
+  cancelación llegaba como `failed`.
+- **Decisión:**
+  - `GET /api/scans/{id}/events` envía un comentario SSE (`: ...`) cada 15 s
+    (`KEEP_ALIVE_INTERVAL`); `EventSource` lo ignora.
+  - `RealtimeRegistry` recuerda el último evento de cada `scan_id` aunque nadie
+    escuche. Un suscriptor nuevo recibe primero ese evento y luego los vivos; si
+    es terminal, lo recibe y el stream se cierra. Un `Mutex` único protege
+    canales y caché, y publicar y "leer último + suscribirse" son atómicos: no se
+    pierde ni se duplica ningún evento. Un duplicado `started` posterior a un
+    terminal no lo sobrescribe.
+  - **Cotas:** 1024 scans recordados (se descarta el más antiguo) y los
+    terminales expiran a los 15 min (purga al publicar y al suscribirse); los no
+    terminales solo tienen el tope de tamaño. Ambos valores son parámetros de
+    `RealtimeRegistry::with_limits`.
+  - `failed` con cancelación pedida (`mark_cancel_requested`) llega al
+    navegador como `cancelled` (`ScanLiveEvent`, mismo JSON, conserva `reason`).
+    El contrato del Broker y lo enviado a `ms-usuarios` (`CANCELADO`) no cambian.
+- **Limitaciones aceptadas:** todo vive en memoria (tras un reinicio no hay
+  reenvío ni marca de cancelación; el front debe consultar el histórico); un
+  `scan_id` sin evento recordado queda abierto sin emitir nada.
+- **Compatibilidad:** el shape no cambia; solo hay un valor de `status` más.
+

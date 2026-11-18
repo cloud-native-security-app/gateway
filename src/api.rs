@@ -46,7 +46,7 @@ use crate::network_scan::{NetworkScanPolicy, TargetRejection};
 use crate::network_target::{
     resolve_and_pin, HostRejection, HostResolver, NetworkTarget, TargetHost,
 };
-use crate::realtime::RealtimeRegistry;
+use crate::realtime::{sse_with_keep_alive, RealtimeRegistry, KEEP_ALIVE_INTERVAL};
 use crate::security_events::{emit, SecurityEvent, SecurityEventPublisher};
 use crate::usuarios_client::{
     role_from_profile, CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry,
@@ -1141,10 +1141,10 @@ impl IntoResponse for ScanEventsError {
 }
 
 /// Abre un stream SSE (`text/event-stream`) que emite cada
-/// [`crate::domain::ScanOutcomeEvent`] nuevo de `scan_id` a medida que el
+/// [`crate::domain::ScanLiveEvent`] nuevo de `scan_id` a medida que el
 /// consumidor de `gateway.scan-outcomes` los recibe (RF-07/RF-08), hasta
-/// alcanzar un estado terminal (`completed`/`failed`), momento en el que el
-/// stream se cierra ordenadamente (ver [`crate::realtime::RealtimeRegistry::subscribe_stream`]).
+/// alcanzar un estado terminal (`completed`/`failed`/`cancelled`), momento en
+/// el que el stream se cierra ordenadamente (ver [`crate::realtime::RealtimeRegistry::subscribe_stream`]).
 ///
 /// Solo la sesión que generó `scan_id` (en `submit_scan`, el handler de
 /// `POST /api/scans`) puede suscribirse: `scan_id` ausente en
@@ -1156,7 +1156,17 @@ impl IntoResponse for ScanEventsError {
 /// no modela un stream SSE con la misma riqueza que un cuerpo JSON
 /// estructurado; el `body` documentado abajo es una aproximación (texto
 /// plano `text/event-stream`), no un schema de cada
-/// [`crate::domain::ScanOutcomeEvent`] posible.
+/// [`crate::domain::ScanLiveEvent`] posible.
+///
+/// Resiliencia (feature `scan_sse_resilience`): cada 15 s se envía un
+/// comentario SSE (`: ...`, invisible para `EventSource`) para que el
+/// balanceador no cierre el stream por inactividad. Al conectarse (o
+/// reconectarse) el primer evento es el último conocido del escaneo, si lo
+/// hay; si ya era terminal, el stream lo emite y se cierra. Un `scan_id` sin
+/// eventos recordados (aún sin empezar, expirado a los 15 min de terminar o
+/// tras un reinicio del Gateway) no emite nada y queda abierto. Si el usuario
+/// pidió cancelar el escaneo, el fallo de `ms-nmap` llega como `cancelled`
+/// (mismo JSON que `failed`).
 #[utoipa::path(
     get,
     path = "/api/scans/{scan_id}/events",
@@ -1166,7 +1176,7 @@ impl IntoResponse for ScanEventsError {
         ("scan_id" = String, Path, description = "scanId propio de este Gateway generado por `POST /api/scans`.")
     ),
     responses(
-        (status = 200, description = "Stream `text/event-stream` con cada ScanOutcomeEvent nuevo de scan_id, hasta un estado terminal (completed/failed).", content_type = "text/event-stream", body = String),
+        (status = 200, description = "Stream `text/event-stream` con cada ScanOutcomeEvent nuevo de scan_id, hasta un estado terminal (completed/failed/cancelled). Empieza con el último evento conocido del escaneo, si lo hay; envía comentarios keep-alive cada 15 s.", content_type = "text/event-stream", body = String),
         (status = 401, description = "Sesión ausente, con firma inválida, o expirada."),
         (status = 404, description = "El scan_id no existe o pertenece a otra sesión.")
     )
@@ -1185,7 +1195,10 @@ async fn scan_events(
         return Err(ScanEventsError::NotFound);
     }
 
-    Ok(Sse::new(state.realtime.subscribe_stream(scan_id)))
+    Ok(sse_with_keep_alive(
+        state.realtime.subscribe_stream(scan_id),
+        KEEP_ALIVE_INTERVAL,
+    ))
 }
 
 /// Errores de `POST /api/scans/{scan_id}/cancel`.
