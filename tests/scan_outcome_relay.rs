@@ -448,7 +448,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     .await
     .expect("no debe colgarse esperando el primer evento (started)")
     .expect("debe llegar el evento started");
-    assert!(first.contains("\"status\":\"started\""));
+    assert!(first.contains(r#"\"status\":\"started\""#));
 
     let second = tokio::time::timeout(
         Duration::from_secs(15),
@@ -457,7 +457,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
     .await
     .expect("no debe colgarse esperando el segundo evento (completed, saltando el malformado)")
     .expect("debe llegar el evento completed");
-    assert!(second.contains("\"status\":\"completed\""));
+    assert!(second.contains(r#"\"status\":\"completed\""#));
 
     let after_terminal = tokio::time::timeout(
         Duration::from_secs(5),
@@ -522,6 +522,7 @@ async fn consumes_scan_outcomes_from_a_real_queue_and_relays_them_via_sse_in_ord
 struct RelayUnderTest {
     relay: ScanOutcomeRelay,
     ownership: Arc<ScanOwnershipRegistry>,
+    realtime: Arc<RealtimeRegistry>,
     calls: CapturedStatusUpdates,
 }
 
@@ -529,14 +530,16 @@ async fn relay_with_registered_scan(scan_id: &str) -> RelayUnderTest {
     let (usuarios_base_url, calls) = spawn_usuarios_status_stub().await;
     let ownership = Arc::new(ScanOwnershipRegistry::new());
     ownership.register_ssh(scan_id, "ms-1".to_string(), session_for("alice"));
+    let realtime = Arc::new(RealtimeRegistry::new());
     let relay = ScanOutcomeRelay::new(
         Arc::new(lab_usuarios_client(usuarios_base_url)),
         ownership.clone(),
-        Arc::new(RealtimeRegistry::new()),
+        realtime.clone(),
     );
     RelayUnderTest {
         relay,
         ownership,
+        realtime,
         calls,
     }
 }
@@ -713,4 +716,40 @@ async fn relay_marks_completado_without_a_result_when_ms_usuarios_rejects_it_as_
     assert_eq!(sent.len(), 2);
     assert!(sent[0].1.get("result").is_some());
     assert_eq!(sent[1].1, json!({"status": "COMPLETADO"}));
+}
+
+/// Primer evento SSE (formateado) que recibe un suscriptor tardío de `scan_id`.
+async fn replayed_sse_event(realtime: &Arc<RealtimeRegistry>, scan_id: &str) -> String {
+    use futures_util::StreamExt;
+    let mut stream = std::pin::pin!(realtime.subscribe_stream(scan_id.to_string()));
+    let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("no debe colgarse")
+        .expect("debe reenviarse el último evento")
+        .expect("Infallible");
+    format!("{event:?}")
+}
+
+#[tokio::test]
+async fn sse_shows_cancelled_when_failed_arrives_after_a_cancel_request() {
+    let t = relay_with_registered_scan("scan-1").await;
+    t.ownership.mark_cancel_requested("scan-1");
+
+    t.relay
+        .handle(failed_event("scan-1", "scan cancelled by user"))
+        .await;
+
+    let sse = replayed_sse_event(&t.realtime, "scan-1").await;
+    assert!(sse.contains(r#"\"status\":\"cancelled\""#), "{sse}");
+    assert!(sse.contains("scan cancelled by user"), "{sse}");
+}
+
+#[tokio::test]
+async fn sse_keeps_failed_when_no_cancel_was_requested() {
+    let t = relay_with_registered_scan("scan-1").await;
+
+    t.relay.handle(failed_event("scan-1", "host caído")).await;
+
+    let sse = replayed_sse_event(&t.realtime, "scan-1").await;
+    assert!(sse.contains(r#"\"status\":\"failed\""#), "{sse}");
 }

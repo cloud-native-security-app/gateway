@@ -248,6 +248,95 @@ impl ScanOutcomeEvent {
     }
 }
 
+/// Evento que ve el navegador por SSE (`GET /api/scans/{id}/events`): mismo
+/// JSON que [`ScanOutcomeEvent`] (`status` + `correlation_id` + `result`/
+/// `reason`) con un valor más, `cancelled`.
+///
+/// `ms-nmap` reporta una cancelación como `failed`; si el usuario pidió
+/// cancelar ese escaneo por este Gateway, [`Self::from_outcome`] lo traduce a
+/// `cancelled` (conserva el `reason`). Es solo la vista del navegador: el
+/// contrato del Broker (`scan-outcome.schema.json`) y lo que se envía a
+/// `ms-usuarios` no cambian. Solo se serializa (nunca se recibe).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ScanLiveEvent {
+    /// El escaneo comenzó a ejecutarse.
+    Started {
+        /// `scanId` propio de este Gateway.
+        correlation_id: String,
+    },
+    /// El escaneo terminó con un resultado utilizable.
+    Completed {
+        /// `scanId` propio de este Gateway.
+        correlation_id: String,
+        /// Resultado completo del escaneo.
+        result: ScanResult,
+    },
+    /// El escaneo terminó con un error.
+    Failed {
+        /// `scanId` propio de este Gateway.
+        correlation_id: String,
+        /// Motivo del fallo, tal como lo reporta `ms-nmap`.
+        reason: String,
+    },
+    /// El usuario canceló el escaneo (`ms-nmap` lo reportó como `failed`).
+    Cancelled {
+        /// `scanId` propio de este Gateway.
+        correlation_id: String,
+        /// Motivo reportado por `ms-nmap`, sin interpretar.
+        reason: String,
+    },
+}
+
+impl ScanLiveEvent {
+    /// Traduce un evento del Broker. `cancel_requested` solo afecta a
+    /// `failed`: pasa a `cancelled`.
+    pub fn from_outcome(event: &ScanOutcomeEvent, cancel_requested: bool) -> Self {
+        match event {
+            ScanOutcomeEvent::Started { correlation_id } => Self::Started {
+                correlation_id: correlation_id.clone(),
+            },
+            ScanOutcomeEvent::Completed {
+                correlation_id,
+                result,
+            } => Self::Completed {
+                correlation_id: correlation_id.clone(),
+                result: result.clone(),
+            },
+            ScanOutcomeEvent::Failed {
+                correlation_id,
+                reason,
+            } if cancel_requested => Self::Cancelled {
+                correlation_id: correlation_id.clone(),
+                reason: reason.clone(),
+            },
+            ScanOutcomeEvent::Failed {
+                correlation_id,
+                reason,
+            } => Self::Failed {
+                correlation_id: correlation_id.clone(),
+                reason: reason.clone(),
+            },
+        }
+    }
+
+    /// `scanId` de este evento.
+    pub fn correlation_id(&self) -> &str {
+        match self {
+            Self::Started { correlation_id }
+            | Self::Completed { correlation_id, .. }
+            | Self::Failed { correlation_id, .. }
+            | Self::Cancelled { correlation_id, .. } => correlation_id,
+        }
+    }
+
+    /// `true` para `completed`/`failed`/`cancelled`: el stream se cierra
+    /// tras emitirlo.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Started { .. })
+    }
+}
+
 /// Resultado completo de un escaneo (`ScanOutcomeEvent::Completed::result`).
 /// Shape copiado literalmente de `broker/contracts/scan-outcome.schema.json`
 /// (`$defs/scanResult`).

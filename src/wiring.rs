@@ -13,7 +13,7 @@ use crate::api::{AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
 use crate::auth::{LoginStateStore, OidcClient};
 use crate::broker::{BrokerError, ScanOutcomeHandler, ScanRequestPublisher};
 use crate::config::Config;
-use crate::domain::ScanOutcomeEvent;
+use crate::domain::{ScanLiveEvent, ScanOutcomeEvent};
 use crate::events_client::{EventsClient, EventsClientError};
 use crate::kinesis::KinesisSecurityEventPublisher;
 use crate::network_scan::NetworkScanPolicy;
@@ -242,8 +242,9 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
 ///   cancelado queda `FALLIDO` con el motivo de cancelación de `ms-nmap`
 ///   (degradación aceptada).
 ///
-/// El evento SSE conserva su forma (`started`/`completed`/`failed`): no
-/// distingue cancelaciones.
+/// El evento SSE conserva su forma, pero ese mismo `failed` tras una
+/// cancelación pedida llega al navegador como `cancelled`
+/// ([`ScanLiveEvent::from_outcome`]).
 pub struct ScanOutcomeRelay {
     usuarios_client: Arc<UsuariosClient>,
     scan_ownership: Arc<ScanOwnershipRegistry>,
@@ -268,9 +269,14 @@ impl ScanOutcomeRelay {
 #[async_trait::async_trait]
 impl ScanOutcomeHandler for ScanOutcomeRelay {
     async fn handle(&self, event: ScanOutcomeEvent) {
-        self.realtime.publish(&event);
-
         let scan_id = event.correlation_id();
+        // El navegador ve `cancelled` donde `ms-nmap` reportó `failed` tras
+        // una cancelación pedida por este Gateway.
+        self.realtime.publish_live(ScanLiveEvent::from_outcome(
+            &event,
+            self.scan_ownership.is_cancel_requested(scan_id),
+        ));
+
         let Some(ownership) = self.scan_ownership.lookup(scan_id) else {
             tracing::warn!(
                 scan_id,
