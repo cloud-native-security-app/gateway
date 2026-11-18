@@ -90,8 +90,14 @@ const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS
 /// `POST /api/scans` (feature `network_scan_mode`). Vacía o ausente = cualquier
 /// objetivo que pase la denylist fija de [`crate::network_scan`].
 const ENV_NETWORK_SCAN_ALLOWED_CIDRS: &str = "NETWORK_SCAN_ALLOWED_CIDRS";
+/// Tiempo máximo, en segundos, de la resolución DNS de un objetivo `network`
+/// dado por nombre o URL (feature `network_scan_url_target`). Opcional, por
+/// defecto [`DEFAULT_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`]; mayor que cero.
+const ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS: &str = "NETWORK_SCAN_RESOLVE_TIMEOUT_SECS";
 /// Valor por defecto de `ADMIN_EVENTS_ROLE_RECHECK_SECS`.
 const DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS: u64 = 60;
+/// Valor por defecto de `NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`.
+const DEFAULT_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS: u64 = 5;
 /// Largo máximo de un nombre de stream de Kinesis.
 const MAX_STREAM_NAME_CHARS: usize = 128;
 
@@ -184,6 +190,10 @@ pub struct Config {
     /// (`NETWORK_SCAN_ALLOWED_CIDRS`, feature `network_scan_mode`). Vacío =
     /// sin restricción más allá de la denylist fija.
     pub network_scan_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Tiempo máximo de la resolución DNS de un objetivo `network` dado por
+    /// nombre o URL (`NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`, feature
+    /// `network_scan_url_target`).
+    pub network_scan_resolve_timeout_secs: u64,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -355,8 +365,18 @@ fn parse_allowed_cidrs(
 /// blanco usa [`DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS`]; si no, un entero
 /// mayor que cero. Función pura para probarla sin tocar el entorno.
 fn parse_role_recheck_secs(name: &'static str, raw: Option<&str>) -> Result<u64, ConfigError> {
+    parse_positive_secs(name, raw, DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS)
+}
+
+/// Como [`parse_role_recheck_secs`] pero con el valor por defecto `default`:
+/// ausente o en blanco lo usa; si no, un entero mayor que cero.
+fn parse_positive_secs(
+    name: &'static str,
+    raw: Option<&str>,
+    default: u64,
+) -> Result<u64, ConfigError> {
     let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS);
+        return Ok(default);
     };
     let secs = value
         .parse::<u64>()
@@ -461,6 +481,14 @@ impl Config {
             env::var(ENV_NETWORK_SCAN_ALLOWED_CIDRS).ok().as_deref(),
         )?;
 
+        let network_scan_resolve_timeout_secs = parse_positive_secs(
+            ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS,
+            env::var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS)
+                .ok()
+                .as_deref(),
+            DEFAULT_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS,
+        )?;
+
         Ok(Self {
             http_host,
             http_port,
@@ -487,6 +515,7 @@ impl Config {
             security_events_stream_name,
             admin_events_role_recheck_secs,
             network_scan_allowed_cidrs,
+            network_scan_resolve_timeout_secs,
         })
     }
 }
@@ -540,6 +569,7 @@ mod tests {
         env::remove_var(ENV_SECURITY_EVENTS_STREAM_NAME);
         env::remove_var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS);
         env::remove_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS);
+        env::remove_var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS);
     }
 
     fn set_all_valid_vars() {
@@ -1013,6 +1043,26 @@ mod tests {
                 "{bad:?} debe rechazarse"
             );
         }
+    }
+
+    #[test]
+    fn network_scan_resolve_timeout_defaults_to_five_and_is_loaded_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        let config = Config::from_env().expect("config válida debe cargar");
+        assert_eq!(config.network_scan_resolve_timeout_secs, 5);
+
+        env::set_var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS, " 2 ");
+        let config = Config::from_env().expect("config válida debe cargar");
+        assert_eq!(config.network_scan_resolve_timeout_secs, 2);
+
+        for bad in ["0", "-1", "soon"] {
+            env::set_var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS, bad);
+            assert!(Config::from_env().is_err(), "{bad:?} debe rechazarse");
+        }
+
+        clear_all_vars();
     }
 
     #[test]

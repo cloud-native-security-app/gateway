@@ -231,6 +231,20 @@ impl SecurityEvent {
         target: &str,
         mode: ScanMode,
     ) -> Result<Self, InvalidSecurityEvent> {
+        Self::scan_requested_for_host(actor_sub, scan_id, target, mode, None)
+    }
+
+    /// Como [`Self::scan_requested_in_mode`], añadiendo `target_host` (el
+    /// nombre de host que el usuario escribió, opcional en el schema) cuando
+    /// el objetivo `network` se dio por nombre o URL. `target` sigue siendo
+    /// la IP fijada que se escaneó.
+    pub fn scan_requested_for_host(
+        actor_sub: &str,
+        scan_id: &str,
+        target: &str,
+        mode: ScanMode,
+        target_host: Option<&str>,
+    ) -> Result<Self, InvalidSecurityEvent> {
         let ip: IpAddr = target.parse().map_err(|_| InvalidSecurityEvent {
             event_type: EventType::ScanRequested.as_str(),
             field: "target",
@@ -242,6 +256,21 @@ impl SecurityEvent {
                     event_type: EventType::ScanRequested.as_str(),
                     field: "scan_mode",
                 })?;
+        }
+        if let Some(host) = target_host {
+            // Misma cota y alfabeto que el schema (RFC 1123); el patrón
+            // completo por etiqueta ya lo garantiza el parseo del objetivo.
+            let schema_safe = (1..=253).contains(&host.len())
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+            if !schema_safe {
+                return Err(InvalidSecurityEvent {
+                    event_type: EventType::ScanRequested.as_str(),
+                    field: "target_host",
+                });
+            }
+            payload["target_host"] = json!(host);
         }
         Self::new(
             EventType::ScanRequested,
@@ -691,6 +720,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_requested_for_host_adds_target_host_and_keeps_the_pinned_ip() {
+        use crate::domain::ScanMode;
+
+        let event = serde_json::to_value(
+            SecurityEvent::scan_requested_for_host(
+                "s",
+                "c",
+                "192.0.2.10",
+                ScanMode::Network,
+                Some("app.example.com"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            event["payload"],
+            json!({"target": "192.0.2.10", "scan_mode": "network", "target_host": "app.example.com"})
+        );
+    }
+
+    #[test]
     fn constructors_refuse_values_the_schema_would_reject() {
         assert!(SecurityEvent::auth_login("").is_err());
         assert!(SecurityEvent::auth_login(&"x".repeat(129)).is_err());
@@ -698,6 +748,16 @@ mod tests {
         assert!(SecurityEvent::scan_cancelled("s", "").is_err());
         assert!(SecurityEvent::scan_requested("s", "c", "10.0.0.0/24").is_err());
         assert!(SecurityEvent::scan_requested("s", "c", "example.com").is_err());
+        for bad_host in ["", "bad host", "ñandú.cl", &"a".repeat(254)] {
+            assert!(SecurityEvent::scan_requested_for_host(
+                "s",
+                "c",
+                "192.0.2.10",
+                crate::domain::ScanMode::Network,
+                Some(bad_host)
+            )
+            .is_err());
+        }
         assert!(SecurityEvent::ratelimit_hit("s", "api/scans", 1, 1).is_err());
         assert!(SecurityEvent::ratelimit_hit("s", "/a b", 1, 1).is_err());
         assert!(SecurityEvent::ratelimit_hit("s", &format!("/{}", "a".repeat(200)), 1, 1).is_err());

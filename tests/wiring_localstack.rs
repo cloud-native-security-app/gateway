@@ -98,6 +98,7 @@ fn gateway_config(
         security_events_stream_name,
         admin_events_role_recheck_secs: 60,
         network_scan_allowed_cidrs: Vec::new(),
+        network_scan_resolve_timeout_secs: 5,
     }
 }
 

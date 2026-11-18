@@ -68,9 +68,13 @@
   fija (loopback, link-local incl. `169.254.169.254`, unique-local IPv6 `fc00::/7` incl. el metadata `fd00:ec2::254`, multicast, broadcast,
   sin especificar, y sus formas IPv4-mapped/compatibles de IPv6) y, si
   `NETWORK_SCAN_ALLOWED_CIDRS` está definida, todo objetivo fuera de ella. La
-  allowlist nunca anula la denylist. No viaja ninguna credencial SSH. **No
-  cubre:** nombres DNS (solo se aceptan IP), rangos de red interna propios (p.
-  ej. VPC), ni NAT64 (`64:ff9b::/96`): se contienen con la allowlist y los
+  allowlist nunca anula la denylist. No viaja ninguna credencial SSH. Un nombre de host o
+  una URL `http`/`https` (sin credenciales) se resuelve en el Gateway, **todas**
+  las direcciones pasan la misma política (una rechazada rechaza el nombre,
+  `422` `target_resolves_to_denied`) y se publica solo una IP fijada, de modo
+  que `ms-nmap` nunca resuelve el nombre (anti DNS rebinding, D-20). **No
+  cubre:** rangos de red interna propios (p. ej. VPC; un nombre que resuelve a
+  una IP privada se permite igual que esa IP), ni NAT64 (`64:ff9b::/96`): se contienen con la allowlist y los
   security groups.
 - **Rutas de administración y su feed en tiempo real** (feature
   `admin_realtime_feed`, KAP-09): `GET /api/admin/metrics` y el SSE `GET

@@ -284,6 +284,7 @@ pub async fn spawn_gateway(events_base_url: &str, role_recheck_interval: Duratio
         security_events: Arc::new(NoopSecurityEventPublisher),
         admin_feed: feed,
         network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
+        host_resolver: Arc::new(gateway::network_target::StaticHostResolver::new()),
     };
     let addr = serve(app_router(state)).await;
     Gateway {

@@ -237,3 +237,31 @@ que no son evidentes leyendo el código.
   `scanId` sigue siendo solo memoria. Requiere desplegar `user-service` con la
   columna antes que el Gateway (si no, un `scan_mode` desconocido se ignora y el
   modo `network` vuelve a depender de la memoria).
+
+## D-20 — Objetivo `network` por nombre de host o URL (UT-03)
+
+- **Decisión:** en modo `network`, `target` puede ser una IP, un nombre de host
+  RFC 1123 o una URL `http`/`https` (`src/network_target.rs`). El Gateway
+  resuelve el nombre (`tokio::net::lookup_host` con timeout, tras el puerto
+  `HostResolver`), canonicaliza y evalúa **todas** las direcciones con la
+  política existente, y publica una sola IP fijada (primera IPv4 en el orden del
+  resolvedor, si no la primera IPv6) como `ip`. Cualquier dirección rechazada
+  rechaza el nombre (`422` `target_resolves_to_denied`); sin direcciones, error
+  o timeout es `422` `target_unresolvable`.
+- **Anti DNS rebinding:** `ms-nmap` nunca resuelve el nombre; escanea la IP que
+  el Gateway evaluó, así que no hay una segunda resolución que pueda devolver
+  una dirección distinta de la validada. `target_host` viaja solo para mostrar y
+  como host HTTP virtual; el patrón RFC 1123 del contrato también deja fuera un
+  `-` inicial del argv de nmap.
+- **`extra_port`:** se envía solo si la URL trae un puerto explícito distinto de
+  80 y 443, ya incluidos en el conjunto por defecto de nmap; un nombre o URL sin
+  puerto no lo lleva. Un puerto `0` es `400`.
+- **Orden:** el permiso `network_scan` se valida antes de parsear o resolver, así
+  que quien no lo tiene no provoca consultas DNS. Credenciales en la URL (`user@`)
+  son `400` y el error nunca repite el valor recibido.
+- **Histórico y eventos:** el histórico guarda el nombre tal como se escribió
+  (minúsculas, sin esquema ni ruta) o la IP; `scan.requested` mantiene
+  `target` = IP fijada y añade `target_host`.
+- **Aceptado, sin cambio:** la denylist no bloquea RFC 1918 (el objetivo del
+  laboratorio es una dirección privada de VPC), así que un nombre que resuelve a
+  una IP privada se permite igual que escribir esa IP.

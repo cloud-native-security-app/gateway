@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 axum = "0.7"
 axum-extra = { version = "0.9.6", default-features = false, features = ["cookie"] }
 cookie = { version = "0.18.2", default-features = false }

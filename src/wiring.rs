@@ -17,6 +17,7 @@ use crate::domain::ScanOutcomeEvent;
 use crate::events_client::{EventsClient, EventsClientError};
 use crate::kinesis::KinesisSecurityEventPublisher;
 use crate::network_scan::NetworkScanPolicy;
+use crate::network_target::SystemHostResolver;
 use crate::realtime::RealtimeRegistry;
 use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
 use crate::sns::SnsScanPublisher;
@@ -193,6 +194,9 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         security_events,
         admin_feed,
         network_scan_policy: Arc::new(NetworkScanPolicy::new(config.network_scan_allowed_cidrs)),
+        host_resolver: Arc::new(SystemHostResolver::new(Duration::from_secs(
+            config.network_scan_resolve_timeout_secs,
+        ))),
     };
 
     Ok(Wiring {
