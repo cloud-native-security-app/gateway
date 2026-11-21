@@ -311,6 +311,50 @@ async fn sse_events_rejects_an_unknown_scan_id() {
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+/// La ruta real `GET /api/scans/{id}/events` (no solo el helper
+/// `sse_with_keep_alive`) debe emitir comentarios `:` en un stream callado.
+/// Con el reloj pausado, tokio avanza el tiempo virtual cuando todo está
+/// ocioso, así que los 15 s de producción no cuestan espera real.
+#[tokio::test(start_paused = true)]
+async fn sse_events_route_emits_keep_alive_comments_on_a_quiet_stream() {
+    let usuarios_base_url = unreachable_usuarios_base_url().await;
+    let gateway = spawn_gateway(lab_usuarios_client(usuarios_base_url)).await;
+
+    gateway.scan_ownership.register_ssh(
+        "scan-quiet",
+        "ms-usuarios-1".to_string(),
+        session_for("alice"),
+    );
+
+    let response = http_client()
+        .get(format!(
+            "http://{}/api/scans/scan-quiet/events",
+            gateway.addr
+        ))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("GET /api/scans/.../events debe responder");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let mut stream = response.bytes_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(20), stream.next())
+        .await
+        .expect("debe llegar un keep-alive antes de 20 s (15 s en producción)")
+        .expect("el stream sigue abierto")
+        .expect("chunk");
+    assert!(
+        chunk.starts_with(b":"),
+        "el keep-alive es un comentario SSE: {chunk:?}"
+    );
+}
+
 /// Lee del stream de bytes hasta completar el próximo evento SSE (`\n\n`) y
 /// devuelve la concatenación de sus líneas `data: `, o `None` si el stream
 /// terminó sin más eventos.
