@@ -234,9 +234,15 @@ fn siem_ingest_route_documents_the_bearer_scheme_only_for_itself() {
 
     let post = &spec["paths"]["/api/integrations/siem/alerts"]["post"];
     assert_eq!(post["security"], serde_json::json!([{"siem_bearer": []}]));
-    for status in ["202", "400", "401", "404", "413", "422", "429", "503"] {
+    for status in ["202", "400", "401", "413", "422", "429", "503"] {
         assert!(post["responses"][status].is_object(), "missing {status}");
     }
+    // D-23: with the feature off the route is unmounted and answers 401 like
+    // any unknown path, so no 404 is documented.
+    assert!(
+        post["responses"]["404"].is_null(),
+        "404 must not be documented"
+    );
 
     for (path, item) in spec["paths"].as_object().unwrap() {
         if path == "/api/integrations/siem/alerts" {
@@ -247,4 +253,74 @@ fn siem_ingest_route_documents_the_bearer_scheme_only_for_itself() {
             "{path} must not reference the SIEM bearer scheme"
         );
     }
+}
+
+/// Task SR-06: the admin schemas mirror the SIEM fields of events-service.
+#[test]
+fn admin_schemas_document_the_siem_fields() {
+    let spec = generated_spec_as_json();
+    let schemas = &spec["components"]["schemas"];
+    let required = |name: &str| -> Vec<String> {
+        schemas[name]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} has no required list"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+
+    for (schema, field) in [
+        ("Kpis", "siem_alerts"),
+        ("Kpis", "siem_alerts_by_severity"),
+        ("AdminSnapshot", "siem_enabled"),
+        ("AdminSnapshot", "siem_alerts"),
+        ("SeriesBucket", "siem_alerts_by_severity"),
+    ] {
+        assert!(
+            schemas[schema]["properties"][field].is_object(),
+            "{schema} must declare `{field}`"
+        );
+        assert!(
+            required(schema).contains(&field.to_string()),
+            "{schema}.{field} is required"
+        );
+    }
+    // `siem_alert` is nullable and optional, like `critical_finding`.
+    assert!(schemas["AdminDelta"]["properties"]["siem_alert"].is_object());
+
+    let mut counts = required("SiemSeverityCounts");
+    counts.sort();
+    assert_eq!(counts, ["critical", "high", "low", "medium"]);
+
+    let mut alert = required("SiemAlert");
+    alert.sort();
+    assert_eq!(
+        alert,
+        [
+            "agent",
+            "description",
+            "event_id",
+            "occurred_at",
+            "rule_id",
+            "rule_level",
+            "severity"
+        ]
+    );
+    let props = &schemas["SiemAlert"]["properties"];
+    for nullable in ["src_ip", "dest_ip", "signature"] {
+        assert!(props[nullable].is_object(), "SiemAlert.{nullable}");
+    }
+    assert_eq!(props["rule_level"]["maximum"], 15);
+    assert_eq!(
+        props["severity"]["$ref"],
+        "#/components/schemas/SiemSeverity"
+    );
+    assert_eq!(
+        schemas["SiemSeverity"]["enum"],
+        serde_json::json!(["low", "medium", "high", "critical"])
+    );
+    assert_eq!(props["description"]["maxLength"], 256);
+    let mut agent = required("SiemAgent");
+    agent.sort();
+    assert_eq!(agent, ["id", "name"]);
 }

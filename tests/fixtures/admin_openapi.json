@@ -93,7 +93,7 @@
             },
             {
               "$ref": "#/components/schemas/EventEntry",
-              "description": "Evento que se añade al registro; ausente si el delta es solo por un\nregistro malformado."
+              "description": "Evento que se añade al registro; ausente si el delta es solo por un\nregistro malformado.\n\nEs `null` en el delta de una alerta SIEM: esa alerta viaja en\n`siem_alert`, no en el registro de eventos."
             }
           ]
         },
@@ -117,6 +117,17 @@
           "format": "int64",
           "minimum": 0,
           "type": "integer"
+        },
+        "siem_alert": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/components/schemas/SiemAlert",
+              "description": "Alerta SIEM nueva, si el evento era `siem.alert`."
+            }
+          ]
         }
       },
       "required": [
@@ -190,6 +201,17 @@
           "$ref": "#/components/schemas/AdminSeries",
           "description": "Serie por minuto de los últimos 15 minutos."
         },
+        "siem_alerts": {
+          "description": "Alertas SIEM, la más reciente primero (máx. 8, `MAX_SIEM_ALERTS` en\n`events-service`); vacío con el SIEM apagado. No se repiten en\n`recent_events`.",
+          "items": {
+            "$ref": "#/components/schemas/SiemAlert"
+          },
+          "type": "array"
+        },
+        "siem_enabled": {
+          "description": "Si el SIEM está habilitado (`SIEM_ENABLED`); el front muestra la\npestaña de alertas solo entonces.",
+          "type": "boolean"
+        },
         "window_seconds": {
           "description": "Ancho de la ventana de los KPIs, en segundos.",
           "format": "int64",
@@ -205,7 +227,9 @@
         "scans_in_flight",
         "critical_findings",
         "recent_events",
-        "series"
+        "series",
+        "siem_enabled",
+        "siem_alerts"
       ],
       "type": "object"
     },
@@ -393,6 +417,16 @@
           "format": "int64",
           "minimum": 0,
           "type": "integer"
+        },
+        "siem_alerts": {
+          "description": "`siem.alert` en la ventana (0 con el SIEM apagado).",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "siem_alerts_by_severity": {
+          "$ref": "#/components/schemas/SiemSeverityCounts",
+          "description": "`siem.alert` en la ventana por severidad."
         }
       },
       "required": [
@@ -401,7 +435,9 @@
         "failed_last_window",
         "active_users",
         "rate_limit_hits",
-        "malformed_records"
+        "malformed_records",
+        "siem_alerts",
+        "siem_alerts_by_severity"
       ],
       "type": "object"
     },
@@ -470,12 +506,157 @@
         "minute": {
           "description": "Inicio del minuto (RFC 3339, UTC).",
           "type": "string"
+        },
+        "siem_alerts_by_severity": {
+          "additionalProperties": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "`siem.alert` por severidad (`low`, `medium`, `high`, `critical`);\nsolo las severidades con alertas.",
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
         }
       },
       "required": [
         "minute",
         "by_type",
-        "findings_by_severity"
+        "findings_by_severity",
+        "siem_alerts_by_severity"
+      ],
+      "type": "object"
+    },
+    "SiemAgent": {
+      "description": "Agente Wazuh que originó una alerta.",
+      "properties": {
+        "id": {
+          "description": "`agent.id` de Wazuh.",
+          "type": "string"
+        },
+        "name": {
+          "description": "`agent.name` de Wazuh.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SiemAlert": {
+      "description": "Alerta SIEM (`siem.alert`). Solo viaja en `siem_alerts` (snapshot) y\n`siem_alert` (delta); no forma parte de `recent_events`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/components/schemas/SiemAgent",
+          "description": "Agente que la reportó."
+        },
+        "description": {
+          "description": "Descripción de la regla (máx. 256).",
+          "maxLength": 256,
+          "type": "string"
+        },
+        "dest_ip": {
+          "description": "IP de destino, si la hay.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event_id": {
+          "description": "`event_id` del evento (identificador estable para el cliente).",
+          "type": "string"
+        },
+        "occurred_at": {
+          "description": "Instante del evento según el productor.",
+          "type": "string"
+        },
+        "rule_id": {
+          "description": "`rule.id` de Wazuh.",
+          "type": "string"
+        },
+        "rule_level": {
+          "description": "`rule.level` de Wazuh (0..15).",
+          "format": "int32",
+          "maximum": 15,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "severity": {
+          "$ref": "#/components/schemas/SiemSeverity",
+          "description": "`low`, `medium`, `high` o `critical`."
+        },
+        "signature": {
+          "description": "Firma de Suricata, si la alerta viene de Suricata.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "src_ip": {
+          "description": "IP de origen, si la hay.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "event_id",
+        "occurred_at",
+        "severity",
+        "rule_id",
+        "rule_level",
+        "description",
+        "agent"
+      ],
+      "type": "object"
+    },
+    "SiemSeverity": {
+      "description": "Severidad de una alerta SIEM.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "SiemSeverityCounts": {
+      "description": "Alertas SIEM por severidad (las cuatro claves siempre presentes).",
+      "properties": {
+        "critical": {
+          "description": "Severidad `critical`.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "high": {
+          "description": "Severidad `high`.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "low": {
+          "description": "Severidad `low`.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "medium": {
+          "description": "Severidad `medium`.",
+          "format": "int64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "low",
+        "medium",
+        "high",
+        "critical"
       ],
       "type": "object"
     }

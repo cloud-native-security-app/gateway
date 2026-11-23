@@ -186,8 +186,7 @@ async fn guard(State(ingest): State<SiemIngest>, request: Request, next: Next) -
     responses(
         (status = 202, description = "Alert accepted and published; body is `{\"event_id\": ...}`."),
         (status = 400, description = "The body is not valid JSON."),
-        (status = 401, description = "Missing or wrong bearer token."),
-        (status = 404, description = "The feature is off (`SIEM_INGEST_TOKEN` unset): the route does not exist."),
+        (status = 401, description = "Missing or wrong bearer token; also what an unmounted route answers (feature off, `SIEM_INGEST_TOKEN` unset), like any unknown path."),
         (status = 413, description = "The body is larger than 64 KiB."),
         (status = 422, description = "The alert does not map to the contract (invalid level or ids, missing fields); the body names the field, never the value."),
         (status = 429, description = "Rate limit exceeded; see `Retry-After`."),
