@@ -17,8 +17,8 @@ use std::time::Duration;
 use gateway::api::ScanSubmissionRateLimiter;
 use gateway::domain::Role;
 use gateway::security_events::{
-    EventSource, EventType, RecordingSecurityEventPublisher, SecurityEvent, SecurityEventError,
-    SecurityEventPublisher,
+    EventSource, EventType, NoopSecurityEventPublisher, RecordingSecurityEventPublisher,
+    SecurityEvent, SecurityEventError, SecurityEventPublisher,
 };
 use gateway::siem_ingest::{siem_router, SiemIngest, MAX_BODY_BYTES, ROUTE_PATH};
 use jsonschema::Validator;
@@ -450,6 +450,32 @@ async fn publish_failure_after_retries_is_503() {
         3,
         "the existing retry policy makes 3 attempts"
     );
+}
+
+#[tokio::test]
+async fn no_real_event_stream_is_503_and_authentication_still_comes_first() {
+    let ingest = SiemIngest::new(
+        SecretString::from(TOKEN.to_string()),
+        Arc::new(NoopSecurityEventPublisher),
+        limiter(100),
+    );
+    let addr = serve(ingest).await;
+    let url = format!("http://{addr}{ROUTE_PATH}");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(&url)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(SSHD_FIXTURE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"], "event_stream_not_configured");
+
+    let unauthenticated = client.post(&url).body(SSHD_FIXTURE).send().await.unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ------------------------------------------------------------ secrecy

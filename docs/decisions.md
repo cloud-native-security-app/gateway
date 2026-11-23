@@ -337,8 +337,12 @@ que no son evidentes leyendo el código.
 - **Publishing is awaited:** unlike `emit`, the handler waits for the Kinesis
   publish (the AP-07 retry policy, 5 s cap) and answers `202`, or `503` so the
   integration can retry. Delivery stays at-least-once.
-- **Limitations accepted:** the limiter is in memory and per instance; with
-  `SECURITY_EVENTS_STREAM_NAME` unset the publisher is a no-op and alerts are
-  accepted and discarded (startup warning); fixtures are representative
+- **No event stream configured:** with `SIEM_INGEST_TOKEN` set but
+  `SECURITY_EVENTS_STREAM_NAME` unset the publisher is a no-op. The gateway
+  still starts (with a warning), but an authenticated alert gets `503`
+  (`event_stream_not_configured`) and nothing is published, instead of a
+  misleading `202`. `SecurityEventPublisher::discards_events` tells the route.
+- **Limitations accepted:** the limiter is in memory and per instance;
+  fixtures are representative
   samples written from the Wazuh alert format, not captured from a live system.
 

@@ -186,7 +186,7 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         if config.security_events_stream_name.is_none() {
             tracing::warn!(
                 "SIEM_INGEST_TOKEN is set but SECURITY_EVENTS_STREAM_NAME is not: \
-                 SIEM alerts will be accepted and discarded"
+                 SIEM alerts will be refused with 503"
             );
         }
         tracing::info!("SIEM alert ingestion is enabled");

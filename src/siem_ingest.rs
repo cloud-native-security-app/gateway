@@ -16,7 +16,8 @@
 //!   length can leak, which is acceptable for a random fixed-length secret.
 //!   The token is never logged and [`SiemIngest`]'s `Debug` redacts it.
 //! - **Order of checks:** token (401) -> rate limit (429) -> body size (413)
-//!   -> JSON (400) -> alert shape (422) -> publish (202 / 503). The rate limit
+//!   -> no-op publisher (503) -> JSON (400) -> alert shape (422) -> publish
+//!   (202 / 503). The rate limit
 //!   comes after authentication so unauthenticated noise cannot consume the
 //!   integration's quota.
 //! - **One alert per request.** `integratord` calls the integration script
@@ -190,11 +191,21 @@ async fn guard(State(ingest): State<SiemIngest>, request: Request, next: Next) -
         (status = 413, description = "The body is larger than 64 KiB."),
         (status = 422, description = "The alert does not map to the contract (invalid level or ids, missing fields); the body names the field, never the value."),
         (status = 429, description = "Rate limit exceeded; see `Retry-After`."),
-        (status = 503, description = "The event could not be published after retries; the integration may retry.")
+        (status = 503, description = "The event could not be published after retries, or no security events stream is configured (`SECURITY_EVENTS_STREAM_NAME` unset); the integration may retry.")
     ),
     security(("siem_bearer" = []))
 )]
 pub async fn ingest_alert(State(ingest): State<SiemIngest>, body: Bytes) -> Response {
+    // With no real stream behind the publisher an alert would be accepted and
+    // silently dropped; refuse it instead so the integration retries later.
+    if ingest.publisher.discards_events() {
+        tracing::error!("siem ingest: alert refused, no security events stream is configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "event_stream_not_configured" })),
+        )
+            .into_response();
+    }
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(raw) => raw,
         Err(_) => {

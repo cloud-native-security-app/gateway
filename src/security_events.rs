@@ -191,6 +191,13 @@ pub enum SecurityEventError {
 pub trait SecurityEventPublisher: Send + Sync {
     /// Publica `event`, devolviendo éxito solo cuando el destino lo aceptó.
     async fn publish(&self, event: &SecurityEvent) -> Result<(), SecurityEventError>;
+
+    /// `true` when this adapter drops every event (no real stream behind it).
+    /// Callers that must not report success for a dropped event (the SIEM
+    /// ingestion route) check it before accepting work.
+    fn discards_events(&self) -> bool {
+        false
+    }
 }
 
 impl SecurityEvent {
@@ -709,6 +716,10 @@ pub struct NoopSecurityEventPublisher;
 impl SecurityEventPublisher for NoopSecurityEventPublisher {
     async fn publish(&self, _event: &SecurityEvent) -> Result<(), SecurityEventError> {
         Ok(())
+    }
+
+    fn discards_events(&self) -> bool {
+        true
     }
 }
 
