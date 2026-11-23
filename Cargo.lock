@@ -1548,6 +1548,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "subtle",
  "testcontainers",
  "thiserror 2.0.20",
  "time",

@@ -306,3 +306,39 @@ que no son evidentes leyendo el código.
 - **Reporte:** `GET /api/scans/{scan_id}/report` no cambia; devuelve el
   `ScanResult` almacenado, sin estado de correo.
 
+## D-23 — SIEM alert ingestion route (SR-02)
+
+- **Route:** `POST /api/integrations/siem/alerts`, one Wazuh alert per request
+  (the shape `integratord` hands to a custom integration). It maps `rule.id`,
+  `rule.level`, `rule.description`, `agent.id`/`agent.name`, `data.srcip`|`src_ip`,
+  `data.dstip`|`dest_ip` and `data.alert.signature` (Suricata via Wazuh) to the
+  `siem.alert` payload of broker D-18 and publishes it with `source` `wazuh`
+  and partition key `agent.id`. The raw log line is never forwarded.
+- **Off by default, mounted only with `SIEM_INGEST_TOKEN`:** without a token
+  the route is not in the router, so it is exactly as (non-)existent as any
+  other unknown path. In this gateway that is not a bare `404`: the session
+  layer is the catch-all, so unknown paths answer `401` without a session.
+  The route copies that behavior instead of special-casing a `404`.
+- **Machine-to-machine:** it sits outside `require_session` (no user) and has
+  no CSRF check (no cookie is read). A valid user session is not a credential
+  for it. The token is compared in constant time (`subtle`); only its length
+  can leak. It is never logged and `Config`/`SiemIngest` redact it in `Debug`.
+- **Order of checks:** token (`401`) -> rate limit (`429`, `Retry-After`) ->
+  body size (`413`, 64 KiB) -> JSON (`400`) -> alert shape (`422`, names the
+  field, never the value) -> publish. The limiter (the existing fixed-window
+  `ScanSubmissionRateLimiter`, 120 per 60 s, one fixed key for the route) runs
+  after authentication so unauthenticated traffic cannot use up the quota.
+  Behind the ALB a per-IP key would be the balancer's address.
+- **Mapping rules:** `rule.level` must be an integer 0..15 (D-18 bands give
+  `severity`); `rule.id` may be a string or an integer; ids must match
+  `^[A-Za-z0-9_.-]{1,64}$`; `description`/`signature` are cut to 256 and
+  `agent.name` to 128 characters (on a char boundary); IPs that do not parse
+  are dropped.
+- **Publishing is awaited:** unlike `emit`, the handler waits for the Kinesis
+  publish (the AP-07 retry policy, 5 s cap) and answers `202`, or `503` so the
+  integration can retry. Delivery stays at-least-once.
+- **Limitations accepted:** the limiter is in memory and per instance; with
+  `SECURITY_EVENTS_STREAM_NAME` unset the publisher is a no-op and alerts are
+  accepted and discarded (startup warning); fixtures are representative
+  samples written from the Wazuh alert format, not captured from a live system.
+

@@ -1,0 +1,42 @@
+{
+  "_note": "Representative sample written from knowledge of the Wazuh alert format; NOT captured from a live system.",
+  "timestamp": "2026-11-09T12:30:00.123+0000",
+  "rule": {
+    "level": 5,
+    "description": "sshd: attempt to login using a non-existent user",
+    "id": "5710",
+    "mitre": {
+      "id": ["T1110.001", "T1021.004"],
+      "tactic": ["Credential Access", "Lateral Movement"],
+      "technique": ["Password Guessing", "SSH"]
+    },
+    "firedtimes": 2,
+    "mail": false,
+    "groups": ["syslog", "sshd", "authentication_failed", "invalid_login"]
+  },
+  "agent": {
+    "id": "001",
+    "name": "lab-target",
+    "ip": "10.0.1.15"
+  },
+  "manager": {
+    "name": "wazuh-manager"
+  },
+  "id": "1731155400.123456",
+  "full_log": "Nov  9 12:30:00 lab-target sshd[1234]: Invalid user admin from 203.0.113.7 port 52144",
+  "predecoder": {
+    "program_name": "sshd",
+    "timestamp": "Nov  9 12:30:00",
+    "hostname": "lab-target"
+  },
+  "decoder": {
+    "parent": "sshd",
+    "name": "sshd"
+  },
+  "data": {
+    "srcip": "203.0.113.7",
+    "srcport": "52144",
+    "srcuser": "admin"
+  },
+  "location": "/var/log/secure"
+}

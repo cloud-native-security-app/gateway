@@ -51,6 +51,12 @@ const MAX_ROUTE_CHARS: usize = 200;
 const MAX_QUEUE_CHARS: usize = 80;
 /// Máximo de caracteres de un `reason_code`.
 const MAX_REASON_CODE_CHARS: usize = 64;
+/// Max characters of `rule_id` and `agent.id` in `siem.alert`.
+const MAX_SIEM_ID_CHARS: usize = 64;
+/// Max characters of `description` and `signature` in `siem.alert`.
+pub const MAX_SIEM_TEXT_CHARS: usize = 256;
+/// Max characters of `agent.name` in `siem.alert`.
+pub const MAX_SIEM_AGENT_NAME_CHARS: usize = 128;
 
 /// Tipo de un [`SecurityEvent`]; cubre los 11 valores del contrato aunque
 /// este Gateway solo produce algunos (los demás los producen `nmap-service` y
@@ -90,6 +96,10 @@ pub enum EventType {
     /// `user-service` registró una acción de auditoría.
     #[serde(rename = "audit.recorded")]
     AuditRecorded,
+    /// A SIEM (Wazuh, with Suricata behind it) raised an alert, relayed by
+    /// this Gateway from `POST /api/integrations/siem/alerts`.
+    #[serde(rename = "siem.alert")]
+    SiemAlert,
 }
 
 impl EventType {
@@ -107,6 +117,7 @@ impl EventType {
             Self::RatelimitHit => "ratelimit.hit",
             Self::MessageDeadlettered => "message.deadlettered",
             Self::AuditRecorded => "audit.recorded",
+            Self::SiemAlert => "siem.alert",
         }
     }
 }
@@ -123,6 +134,9 @@ pub enum EventSource {
     /// `user-service`.
     #[serde(rename = "user-service")]
     UserService,
+    /// A Wazuh SIEM (`siem.alert`, relayed by this Gateway).
+    #[serde(rename = "wazuh")]
+    Wazuh,
 }
 
 /// Evento de seguridad inmutable: el sobre del contrato
@@ -186,6 +200,22 @@ impl SecurityEvent {
         scan_id: Option<&str>,
         payload: Value,
     ) -> Result<Self, InvalidSecurityEvent> {
+        Self::new_from(
+            EventSource::Gateway,
+            event_type,
+            actor_sub,
+            scan_id,
+            payload,
+        )
+    }
+
+    fn new_from(
+        source: EventSource,
+        event_type: EventType,
+        actor_sub: Option<&str>,
+        scan_id: Option<&str>,
+        payload: Value,
+    ) -> Result<Self, InvalidSecurityEvent> {
         let invalid = |field| InvalidSecurityEvent {
             event_type: event_type.as_str(),
             field,
@@ -204,7 +234,7 @@ impl SecurityEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             event_type,
             occurred_at: now_rfc3339(),
-            source: EventSource::Gateway,
+            source,
             actor_sub: actor_sub.map(str::to_string),
             scan_id: scan_id.map(str::to_string),
             payload,
@@ -365,6 +395,58 @@ impl SecurityEvent {
         )
     }
 
+    /// `siem.alert`: an already normalized Wazuh alert (see
+    /// [`SiemAlertFields`]) with `source` `wazuh` and neither `actor_sub` nor
+    /// `scan_id` (the schema forbids both). `severity` is derived from
+    /// `rule_level` with the D-18 bands ([`siem_severity`]); the constructor
+    /// rejects what the schema would (id pattern, lengths, level).
+    pub fn siem_alert(fields: &SiemAlertFields<'_>) -> Result<Self, InvalidSecurityEvent> {
+        let invalid = |field| InvalidSecurityEvent {
+            event_type: EventType::SiemAlert.as_str(),
+            field,
+        };
+        let severity = siem_severity(fields.rule_level).ok_or_else(|| invalid("rule_level"))?;
+        if !valid_siem_id(fields.rule_id) {
+            return Err(invalid("rule_id"));
+        }
+        if !valid_siem_id(fields.agent_id) {
+            return Err(invalid("agent.id"));
+        }
+        let bounded = |value: &str, max: usize| (1..=max).contains(&value.chars().count());
+        if !bounded(fields.description, MAX_SIEM_TEXT_CHARS) {
+            return Err(invalid("description"));
+        }
+        if !bounded(fields.agent_name, MAX_SIEM_AGENT_NAME_CHARS) {
+            return Err(invalid("agent.name"));
+        }
+        let mut payload = json!({
+            "rule_id": fields.rule_id,
+            "rule_level": fields.rule_level,
+            "severity": severity,
+            "description": fields.description,
+            "agent": { "id": fields.agent_id, "name": fields.agent_name },
+        });
+        if let Some(ip) = fields.src_ip {
+            payload["src_ip"] = json!(schema_safe_ip(ip));
+        }
+        if let Some(ip) = fields.dest_ip {
+            payload["dest_ip"] = json!(schema_safe_ip(ip));
+        }
+        if let Some(signature) = fields.signature {
+            if !bounded(signature, MAX_SIEM_TEXT_CHARS) {
+                return Err(invalid("signature"));
+            }
+            payload["signature"] = json!(signature);
+        }
+        Self::new_from(
+            EventSource::Wazuh,
+            EventType::SiemAlert,
+            None,
+            None,
+            payload,
+        )
+    }
+
     /// UUID v4 único de este evento (los consumidores deduplican por él:
     /// Kinesis entrega al menos una vez).
     pub fn event_id(&self) -> &str {
@@ -406,14 +488,60 @@ impl SecurityEvent {
         &self.payload
     }
 
-    /// Clave de partición de Kinesis: `scan_id` (mantiene en orden todos los
-    /// eventos de un escaneo), si no `actor_sub`, si no `event_id`.
+    /// Kinesis partition key: `scan_id` (keeps all events of a scan in
+    /// order), else `actor_sub`, else `event_id`. For `siem.alert` it is
+    /// `agent.id` (keeps one agent's alerts in order).
     pub fn partition_key(&self) -> &str {
+        if self.event_type == EventType::SiemAlert {
+            if let Some(agent_id) = self.payload["agent"]["id"].as_str() {
+                return agent_id;
+            }
+        }
         self.scan_id
             .as_deref()
             .or(self.actor_sub.as_deref())
             .unwrap_or(&self.event_id)
     }
+}
+
+/// Normalized fields of a `siem.alert` for [`SecurityEvent::siem_alert`].
+#[derive(Debug, Clone, Copy)]
+pub struct SiemAlertFields<'a> {
+    /// Wazuh `rule.id` (`^[A-Za-z0-9_.-]{1,64}$`).
+    pub rule_id: &'a str,
+    /// Wazuh `rule.level`, 0..=15.
+    pub rule_level: u8,
+    /// Rule text (1..=256 characters).
+    pub description: &'a str,
+    /// Wazuh `agent.id` (same pattern as `rule_id`).
+    pub agent_id: &'a str,
+    /// Wazuh `agent.name` (1..=128 characters).
+    pub agent_name: &'a str,
+    /// Source IP, when the alert has one that parsed.
+    pub src_ip: Option<IpAddr>,
+    /// Destination IP, when the alert has one that parsed.
+    pub dest_ip: Option<IpAddr>,
+    /// Suricata `data.alert.signature` (1..=256 characters).
+    pub signature: Option<&'a str>,
+}
+
+/// `siem.alert` severity derived from `rule_level` (D-18): 0-6 `low`, 7-9
+/// `medium`, 10-12 `high`, 13-15 `critical`; `None` outside 0..=15.
+pub fn siem_severity(rule_level: u8) -> Option<&'static str> {
+    match rule_level {
+        0..=6 => Some("low"),
+        7..=9 => Some("medium"),
+        10..=12 => Some("high"),
+        13..=15 => Some("critical"),
+        _ => None,
+    }
+}
+
+fn valid_siem_id(value: &str) -> bool {
+    (1..=MAX_SIEM_ID_CHARS).contains(&value.chars().count())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 fn valid_id(value: &str) -> bool {

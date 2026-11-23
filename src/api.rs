@@ -34,7 +34,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
 use utoipa::{IntoParams, Modify, OpenApi as _, ToSchema};
 
 use crate::admin::AdminFeed;
@@ -48,6 +48,7 @@ use crate::network_target::{
 };
 use crate::realtime::{sse_with_keep_alive, RealtimeRegistry, KEEP_ALIVE_INTERVAL};
 use crate::security_events::{emit, SecurityEvent, SecurityEventPublisher};
+use crate::siem_ingest::{siem_router, SiemIngest};
 use crate::usuarios_client::{
     role_from_profile, CreateNetworkCredentialRequest, NetworkCredential, ScanHistoryEntry,
     ScanStatus, UserProfile, UsuariosClient, UsuariosClientError,
@@ -1604,6 +1605,14 @@ pub const ROUTES: &[RouteSpec] = &[
         path: "/api/openapi.json",
         protected: false,
     },
+    // Machine to machine: no session (own bearer token), and only mounted
+    // when `SIEM_INGEST_TOKEN` is set (otherwise it answers like an unknown
+    // path).
+    RouteSpec {
+        method: "POST",
+        path: "/api/integrations/siem/alerts",
+        protected: false,
+    },
 ];
 
 /// Construye el router `axum` completo de este Gateway: las rutas públicas
@@ -1627,12 +1636,26 @@ pub const ROUTES: &[RouteSpec] = &[
 /// `protected_router`) y también las respuestas que la propia `CorsLayer`
 /// genera sin llegar a ninguna ruta (preflight `OPTIONS`).
 pub fn app_router(state: AppState) -> Router {
+    app_router_with_siem(state, None)
+}
+
+/// Like [`app_router`], also mounting `POST /api/integrations/siem/alerts`
+/// ([`crate::siem_ingest`]) when `siem` is `Some`. With `None` the route is not
+/// in the router, so it answers like any unknown path. The route sits
+/// **outside** `require_session` (machine to machine, guarded by its own
+/// token) but inside the `CorsLayer` and `default_no_store`.
+pub fn app_router_with_siem(state: AppState, siem: Option<SiemIngest>) -> Router {
     let cors = cors_layer(state.front_origin.clone());
 
-    auth_router(state.clone())
+    let router = auth_router(state.clone())
         .merge(health_router())
         .merge(openapi_router())
-        .merge(protected_router(state))
+        .merge(protected_router(state));
+    let router = match siem {
+        Some(siem) => router.merge(siem_router(siem)),
+        None => router,
+    };
+    router
         .layer(cors)
         .layer(middleware::map_response(default_no_store))
 }
@@ -1724,6 +1747,21 @@ impl Modify for SessionCookieSecurity {
     }
 }
 
+/// Defines the `siem_bearer` security scheme (`Authorization: Bearer
+/// <SIEM_INGEST_TOKEN>`), referenced only by the alert ingestion route.
+struct SiemBearerSecurity;
+
+impl Modify for SiemBearerSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "siem_bearer",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+        }
+    }
+}
+
 /// Especificación OpenAPI de este Gateway (RNF-08): agrega la anotación
 /// `#[utoipa::path(...)]` de cada handler público listado en [`ROUTES`] —
 /// una ruta añadida a `ROUTES`/`app_router` sin registrarse aquí queda fuera
@@ -1750,6 +1788,7 @@ impl Modify for SessionCookieSecurity {
         delete_network_credential,
         crate::admin_routes::admin_metrics,
         crate::admin_routes::admin_events,
+        crate::siem_ingest::ingest_alert,
     ),
     components(schemas(
         crate::admin::AdminSnapshot,
@@ -1787,9 +1826,10 @@ impl Modify for SessionCookieSecurity {
         (name = "session", description = "Identidad y perfil de la sesión activa."),
         (name = "scans", description = "Envío, histórico, cancelación y seguimiento en tiempo real de escaneos."),
         (name = "network-credentials", description = "Credenciales de red del usuario, proxeadas hacia ms-usuarios."),
+        (name = "siem", description = "Wazuh alert ingestion (machine to machine, bearer token; off without SIEM_INGEST_TOKEN)."),
         (name = "admin", description = "Métricas y eventos de seguridad en tiempo real, solo para administradores.")
     ),
-    modifiers(&SessionCookieSecurity)
+    modifiers(&SessionCookieSecurity, &SiemBearerSecurity)
 )]
 pub struct ApiDoc;
 
