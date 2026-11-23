@@ -19,6 +19,71 @@ use utoipa::ToSchema;
 
 use crate::events_client::EventsClient;
 
+/// Agente Wazuh que originó una alerta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SiemAgent {
+    /// `agent.id` de Wazuh.
+    pub id: String,
+    /// `agent.name` de Wazuh.
+    pub name: String,
+}
+
+/// Alerta SIEM (`siem.alert`). Solo viaja en `siem_alerts` (snapshot) y
+/// `siem_alert` (delta); no forma parte de `recent_events`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SiemAlert {
+    /// `event_id` del evento (identificador estable para el cliente).
+    pub event_id: String,
+    /// Instante del evento según el productor.
+    pub occurred_at: String,
+    /// `low`, `medium`, `high` o `critical`.
+    #[schema(example = "high")]
+    pub severity: SiemSeverity,
+    /// `rule.id` de Wazuh.
+    pub rule_id: String,
+    /// `rule.level` de Wazuh (0..15).
+    #[schema(maximum = 15)]
+    pub rule_level: u8,
+    /// Descripción de la regla (máx. 256).
+    #[schema(max_length = 256)]
+    pub description: String,
+    /// Agente que la reportó.
+    pub agent: SiemAgent,
+    /// IP de origen, si la hay.
+    pub src_ip: Option<String>,
+    /// IP de destino, si la hay.
+    pub dest_ip: Option<String>,
+    /// Firma de Suricata, si la alerta viene de Suricata.
+    pub signature: Option<String>,
+}
+
+/// Severidad de una alerta SIEM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SiemSeverity {
+    /// Niveles 0-6.
+    Low,
+    /// Niveles 7-9.
+    Medium,
+    /// Niveles 10-12.
+    High,
+    /// Niveles 13-15.
+    Critical,
+}
+
+/// Alertas SIEM por severidad (las cuatro claves siempre presentes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
+pub struct SiemSeverityCounts {
+    /// Severidad `low`.
+    pub low: u64,
+    /// Severidad `medium`.
+    pub medium: u64,
+    /// Severidad `high`.
+    pub high: u64,
+    /// Severidad `critical`.
+    pub critical: u64,
+}
+
 /// Estado de un escaneo en curso.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +176,10 @@ pub struct Kpis {
     pub rate_limit_hits: u64,
     /// Registros descartados por malformados desde que arrancó el proceso.
     pub malformed_records: u64,
+    /// `siem.alert` en la ventana (0 con el SIEM apagado).
+    pub siem_alerts: u64,
+    /// `siem.alert` en la ventana por severidad.
+    pub siem_alerts_by_severity: SiemSeverityCounts,
 }
 
 /// Vista completa del estado, que sirve `GET /api/admin/metrics` y el primer
@@ -133,6 +202,13 @@ pub struct AdminSnapshot {
     pub recent_events: Vec<EventEntry>,
     /// Serie por minuto de los últimos 15 minutos.
     pub series: AdminSeries,
+    /// Si el SIEM está habilitado (`SIEM_ENABLED`); el front muestra la
+    /// pestaña de alertas solo entonces.
+    pub siem_enabled: bool,
+    /// Alertas SIEM, la más reciente primero (máx. 8, `MAX_SIEM_ALERTS` en
+    /// `events-service`); vacío con el SIEM apagado. No se repiten en
+    /// `recent_events`.
+    pub siem_alerts: Vec<SiemAlert>,
 }
 
 /// Serie temporal: exactamente 15 cubetas de un minuto (UTC), la más antigua
@@ -155,6 +231,9 @@ pub struct SeriesBucket {
     pub by_type: std::collections::BTreeMap<String, u64>,
     /// `finding.critical` por severidad (`high` o `critical`).
     pub findings_by_severity: std::collections::BTreeMap<String, u64>,
+    /// `siem.alert` por severidad (`low`, `medium`, `high`, `critical`);
+    /// solo las severidades con alertas.
+    pub siem_alerts_by_severity: std::collections::BTreeMap<String, u64>,
 }
 
 /// Cambio de un escaneo en curso.
@@ -174,6 +253,9 @@ pub struct AdminDelta {
     pub seq: u64,
     /// Evento que se añade al registro; ausente si el delta es solo por un
     /// registro malformado.
+    ///
+    /// Es `null` en el delta de una alerta SIEM: esa alerta viaja en
+    /// `siem_alert`, no en el registro de eventos.
     pub event: Option<EventEntry>,
     /// KPIs completos tras aplicar el cambio.
     pub kpis: Kpis,
@@ -181,6 +263,8 @@ pub struct AdminDelta {
     pub scan_change: Option<ScanChange>,
     /// Hallazgo crítico nuevo, si el evento era `finding.critical`.
     pub critical_finding: Option<CriticalFinding>,
+    /// Alerta SIEM nueva, si el evento era `siem.alert`.
+    pub siem_alert: Option<SiemAlert>,
 }
 
 /// Estado compartido de las rutas de administración: el cliente hacia
