@@ -199,6 +199,17 @@ pub struct ScanHistoryEntry {
     /// el Gateway recurre entonces a su registro en memoria.
     #[serde(default)]
     pub scan_mode: Option<ScanMode>,
+    /// Raw `report_email_status` of `ms-usuarios` (`pending`, `sent`,
+    /// `failed`, `disabled` or `null`). Kept as a string on purpose: a status
+    /// added later by `ms-usuarios` must not make the whole history fail to
+    /// decode. `default` tolerates an older `ms-usuarios` without the field.
+    /// The gateway-facing meaning is derived in `crate::api`.
+    #[serde(default)]
+    pub report_email_status: Option<String>,
+    /// Timestamp (RFC 3339) of the report email delivery, `None` unless the
+    /// status is `sent`. Same tolerance as `report_email_status`.
+    #[serde(default)]
+    pub report_emailed_at: Option<String>,
 }
 
 /// Credenciales de red resueltas por `ms-usuarios` para un objetivo de

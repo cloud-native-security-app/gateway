@@ -331,6 +331,138 @@ async fn scan_history_returns_the_entries_of_the_active_session_with_and_without
     assert_eq!(unknown["failure_reason"], json!("cancelado por el usuario"));
 }
 
+/// Feature `report_email_status`: the gateway exposes the email status of a
+/// scan as `email_status` / `emailed_at`.
+///
+/// Mapping under test:
+/// - not `COMPLETADO` -> both fields absent (no email is expected);
+/// - `COMPLETADO` with upstream `null` or a missing field (older user-service,
+///   send not claimed yet) -> `pending`;
+/// - `COMPLETADO` with a known upstream status -> that status;
+/// - `COMPLETADO` with an unknown upstream status -> `pending` (never fail the
+///   whole history, never claim `sent`);
+/// - `emailed_at` is only passed through when the status is `sent`.
+#[tokio::test]
+async fn scan_history_exposes_the_report_email_status() {
+    fn entry(id: &str, status: &str, extra: Value) -> Value {
+        let mut base = json!({
+            "scan_id": id,
+            "user_id": "alice",
+            "target": "192.0.2.10",
+            "status": status,
+            "requested_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:05:00Z",
+            "failure_reason": null,
+        });
+        base.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        base
+    }
+    let history = json!([
+        entry(
+            "sent",
+            "COMPLETADO",
+            json!({
+                "report_email_status": "sent",
+                "report_emailed_at": "2024-01-01T00:06:00Z",
+            })
+        ),
+        entry(
+            "failed",
+            "COMPLETADO",
+            json!({
+                "report_email_status": "failed", "report_emailed_at": null,
+            })
+        ),
+        entry(
+            "disabled",
+            "COMPLETADO",
+            json!({
+                "report_email_status": "disabled", "report_emailed_at": null,
+            })
+        ),
+        entry(
+            "pending",
+            "COMPLETADO",
+            json!({
+                "report_email_status": "pending", "report_emailed_at": null,
+            })
+        ),
+        entry(
+            "unclaimed",
+            "COMPLETADO",
+            json!({
+                "report_email_status": null, "report_emailed_at": null,
+            })
+        ),
+        entry("older-user-service", "COMPLETADO", json!({})),
+        entry(
+            "unknown",
+            "COMPLETADO",
+            json!({
+                "report_email_status": "bounced", "report_emailed_at": null,
+            })
+        ),
+        entry(
+            "running",
+            "EN_PROGRESO",
+            json!({
+                "report_email_status": null, "report_emailed_at": null,
+            })
+        ),
+        entry("failed-scan", "FALLIDO", json!({})),
+    ]);
+    let usuarios_base_url = spawn_usuarios_history_stub(history).await;
+    let gateway = spawn_gateway(usuarios_base_url, Arc::new(NeverPublishesToBroker)).await;
+
+    let response = http_client()
+        .get(format!("http://{}/api/scans", gateway.addr))
+        .header(
+            reqwest::header::COOKIE,
+            format!(
+                "{SESSION_COOKIE_NAME}={}",
+                session_cookie_value_for("alice")
+            ),
+        )
+        .send()
+        .await
+        .expect("GET /api/scans debe responder");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("cuerpo JSON válido");
+    let entries = body.as_array().expect("debe ser un array JSON");
+
+    let expect = |index: usize, status: Option<&str>, emailed_at: Option<&str>| {
+        let item = &entries[index];
+        assert_eq!(
+            item.get("email_status").and_then(Value::as_str),
+            status,
+            "email_status of entry {index}: {item}"
+        );
+        assert_eq!(
+            item.get("emailed_at").and_then(Value::as_str),
+            emailed_at,
+            "emailed_at of entry {index}: {item}"
+        );
+        assert!(
+            item.get("report_email_status").is_none(),
+            "upstream names must not leak: {item}"
+        );
+    };
+    expect(0, Some("sent"), Some("2024-01-01T00:06:00Z"));
+    expect(1, Some("failed"), None);
+    expect(2, Some("disabled"), None);
+    expect(3, Some("pending"), None);
+    expect(4, Some("pending"), None);
+    expect(5, Some("pending"), None);
+    expect(6, Some("pending"), None);
+    expect(7, None, None);
+    expect(8, None, None);
+    // Existing fields are unchanged.
+    assert_eq!(entries[0]["status"], json!("COMPLETADO"));
+    assert_eq!(entries[0]["target"], json!("192.0.2.10"));
+}
+
 #[tokio::test]
 async fn cancel_scan_owned_by_another_session_returns_not_found() {
     let usuarios_base_url = unreachable_usuarios_base_url().await;

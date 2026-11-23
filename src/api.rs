@@ -764,6 +764,54 @@ struct ScanHistoryEntryResponse {
     /// los escaneos `network`.
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ScanMode>,
+    /// Status of the report email of a completed scan (`pending`, `sent`,
+    /// `failed`, `disabled`). Absent when no email is expected (the scan is
+    /// not `COMPLETADO`). See [`report_email_status_for`] for the mapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_status: Option<ReportEmailStatus>,
+    /// When the report email was sent (RFC 3339). Present only when
+    /// `email_status` is `sent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emailed_at: Option<String>,
+}
+
+/// Status of the report email of a completed scan, as the front sees it.
+/// Mirrors `user-service`'s `ReportEmailStatus` (lowercase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum ReportEmailStatus {
+    /// The send was claimed and is in progress, or has not been claimed yet.
+    Pending,
+    /// The email was delivered to the SMTP server.
+    Sent,
+    /// Every retry failed.
+    Failed,
+    /// SMTP is not configured, nothing was sent.
+    Disabled,
+}
+
+/// Maps the upstream `report_email_status` of a history entry to the status
+/// exposed to the front.
+///
+/// - Scan not `COMPLETADO`: `None` (no email is expected, whatever upstream says).
+/// - `COMPLETADO` with a null or missing upstream status: `pending` (the send
+///   has not been claimed yet, or an older `ms-usuarios`).
+/// - `COMPLETADO` with a known status: that status.
+/// - `COMPLETADO` with an unknown status: `pending`. It never claims `sent`
+///   and never fails the history.
+fn report_email_status_for(
+    scan_status: ScanStatus,
+    upstream: Option<&str>,
+) -> Option<ReportEmailStatus> {
+    if scan_status != ScanStatus::Completado {
+        return None;
+    }
+    Some(match upstream {
+        Some("sent") => ReportEmailStatus::Sent,
+        Some("failed") => ReportEmailStatus::Failed,
+        Some("disabled") => ReportEmailStatus::Disabled,
+        _ => ReportEmailStatus::Pending,
+    })
 }
 
 impl ScanHistoryEntryResponse {
@@ -773,7 +821,15 @@ impl ScanHistoryEntryResponse {
     /// diseño de este tipo).
     fn from_history_entry(entry: ScanHistoryEntry, ownership: &ScanOwnershipRegistry) -> Self {
         let known = ownership.find_by_ms_usuarios_scan_id(&entry.scan_id);
+        let email_status =
+            report_email_status_for(entry.status, entry.report_email_status.as_deref());
+        let emailed_at = match email_status {
+            Some(ReportEmailStatus::Sent) => entry.report_emailed_at,
+            _ => None,
+        };
         Self {
+            email_status,
+            emailed_at,
             // El modo persistido en `ms-usuarios` manda; el registro en memoria
             // solo cubre un `ms-usuarios` que aún no lo devuelve.
             mode: entry
@@ -1712,6 +1768,7 @@ impl Modify for SessionCookieSecurity {
         ScanSubmissionRequest,
         ScanSubmissionResponse,
         ScanHistoryEntryResponse,
+        ReportEmailStatus,
         ScanResult,
         crate::domain::PortFinding,
         crate::domain::VulnFinding,
