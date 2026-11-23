@@ -233,6 +233,12 @@ async fn enumerates_routes_and_verifies_which_carry_the_session_middleware() {
     );
 
     for route in ROUTES {
+        // Machine-to-machine routes use their own bearer token, not the
+        // session, and exist only when enabled; `tests/siem_ingest.rs`
+        // covers their authentication.
+        if route.path.starts_with("/api/integrations/") {
+            continue;
+        }
         let method = reqwest::Method::from_bytes(route.method.as_bytes())
             .expect("método HTTP válido en ROUTES");
         let response = http

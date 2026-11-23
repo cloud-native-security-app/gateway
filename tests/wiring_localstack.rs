@@ -99,6 +99,7 @@ fn gateway_config(
         admin_events_role_recheck_secs: 60,
         network_scan_allowed_cidrs: Vec::new(),
         network_scan_resolve_timeout_secs: 5,
+        siem_ingest_token: None,
     }
 }
 

@@ -222,3 +222,29 @@ fn scan_history_entry_schema_documents_the_report_email_status() {
         "the new fields are additive and optional: {required:?}"
     );
 }
+
+/// Task SR-02: the SIEM ingestion route documents its bearer scheme, and no
+/// other route references it.
+#[test]
+fn siem_ingest_route_documents_the_bearer_scheme_only_for_itself() {
+    let spec = generated_spec_as_json();
+    let scheme = &spec["components"]["securitySchemes"]["siem_bearer"];
+    assert_eq!(scheme["type"], "http");
+    assert_eq!(scheme["scheme"], "bearer");
+
+    let post = &spec["paths"]["/api/integrations/siem/alerts"]["post"];
+    assert_eq!(post["security"], serde_json::json!([{"siem_bearer": []}]));
+    for status in ["202", "400", "401", "404", "413", "422", "429", "503"] {
+        assert!(post["responses"][status].is_object(), "missing {status}");
+    }
+
+    for (path, item) in spec["paths"].as_object().unwrap() {
+        if path == "/api/integrations/siem/alerts" {
+            continue;
+        }
+        assert!(
+            !item.to_string().contains("siem_bearer"),
+            "{path} must not reference the SIEM bearer scheme"
+        );
+    }
+}

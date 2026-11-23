@@ -18,7 +18,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
 use gateway::admin::AdminFeed;
-use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
+use gateway::api::{
+    app_router_with_siem, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter,
+};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
@@ -229,6 +231,15 @@ pub async fn unreachable_base_url() -> String {
 /// Gateway completo (router real) cuyo `events-service` es `events_base_url`,
 /// con `ms-usuarios` stub de roles por identidad.
 pub async fn spawn_gateway(events_base_url: &str, role_recheck_interval: Duration) -> Gateway {
+    spawn_gateway_with_siem(events_base_url, role_recheck_interval, None).await
+}
+
+/// Como [`spawn_gateway`], montando la ruta de ingesta SIEM si `siem` es `Some`.
+pub async fn spawn_gateway_with_siem(
+    events_base_url: &str,
+    role_recheck_interval: Duration,
+    siem: Option<gateway::siem_ingest::SiemIngest>,
+) -> Gateway {
     let feed = Arc::new(AdminFeed::new(
         Arc::new(
             EventsClient::with_connect_timeout(
@@ -286,7 +297,7 @@ pub async fn spawn_gateway(events_base_url: &str, role_recheck_interval: Duratio
         network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
         host_resolver: Arc::new(gateway::network_target::StaticHostResolver::new()),
     };
-    let addr = serve(app_router(state)).await;
+    let addr = serve(app_router_with_siem(state, siem)).await;
     Gateway {
         addr,
         usuarios: usuarios_stub,

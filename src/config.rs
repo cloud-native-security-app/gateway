@@ -89,6 +89,9 @@ const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS
 /// Allowlist opcional de CIDR (separados por coma) para el modo `network` de
 /// `POST /api/scans` (feature `network_scan_mode`). Vacía o ausente = cualquier
 /// objetivo que pase la denylist fija de [`crate::network_scan`].
+/// Bearer token of `POST /api/integrations/siem/alerts` (feature
+/// `siem_ingest`). Unset or blank leaves the route off (it answers 404).
+const ENV_SIEM_INGEST_TOKEN: &str = "SIEM_INGEST_TOKEN";
 const ENV_NETWORK_SCAN_ALLOWED_CIDRS: &str = "NETWORK_SCAN_ALLOWED_CIDRS";
 /// Tiempo máximo, en segundos, de la resolución DNS de un objetivo `network`
 /// dado por nombre o URL (feature `network_scan_url_target`). Opcional, por
@@ -194,6 +197,10 @@ pub struct Config {
     /// nombre o URL (`NETWORK_SCAN_RESOLVE_TIMEOUT_SECS`, feature
     /// `network_scan_url_target`).
     pub network_scan_resolve_timeout_secs: u64,
+    /// Bearer token of the SIEM alert ingestion route (`SIEM_INGEST_TOKEN`,
+    /// task SR-02). `None` (unset or blank) keeps the route off. Redacted in
+    /// `Debug`; never logged.
+    pub siem_ingest_token: Option<SecretString>,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -489,6 +496,12 @@ impl Config {
             DEFAULT_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS,
         )?;
 
+        let siem_ingest_token = env::var(ENV_SIEM_INGEST_TOKEN)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(SecretString::from);
+
         Ok(Self {
             http_host,
             http_port,
@@ -516,6 +529,7 @@ impl Config {
             admin_events_role_recheck_secs,
             network_scan_allowed_cidrs,
             network_scan_resolve_timeout_secs,
+            siem_ingest_token,
         })
     }
 }
@@ -569,6 +583,7 @@ mod tests {
         env::remove_var(ENV_SECURITY_EVENTS_STREAM_NAME);
         env::remove_var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS);
         env::remove_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS);
+        env::remove_var(ENV_SIEM_INGEST_TOKEN);
         env::remove_var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS);
     }
 
@@ -1063,6 +1078,42 @@ mod tests {
         }
 
         clear_all_vars();
+    }
+
+    #[test]
+    fn siem_ingest_token_unset_or_blank_means_off_and_is_trimmed_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+
+        assert!(Config::from_env().unwrap().siem_ingest_token.is_none());
+        for blank in ["", "   "] {
+            env::set_var(ENV_SIEM_INGEST_TOKEN, blank);
+            assert!(Config::from_env().unwrap().siem_ingest_token.is_none());
+        }
+        env::set_var(ENV_SIEM_INGEST_TOKEN, "  s3cret-token \n");
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.siem_ingest_token.as_ref().unwrap().expose_secret(),
+            "s3cret-token"
+        );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn debug_does_not_leak_the_siem_ingest_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SIEM_INGEST_TOKEN, "siem-token-must-not-leak");
+
+        let debug_output = format!("{:?}", Config::from_env().unwrap());
+
+        clear_all_vars();
+
+        assert!(!debug_output.contains("siem-token-must-not-leak"));
+        assert!(debug_output.contains("siem_ingest_token"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::network_scan::NetworkScanPolicy;
 use crate::network_target::SystemHostResolver;
 use crate::realtime::RealtimeRegistry;
 use crate::security_events::{NoopSecurityEventPublisher, SecurityEventPublisher};
+use crate::siem_ingest::SiemIngest;
 use crate::sns::SnsScanPublisher;
 use crate::sqs::SqsScanOutcomeConsumer;
 use crate::usuarios_client::{ScanStatus, UsuariosClient, UsuariosClientError};
@@ -74,6 +75,9 @@ pub struct Wiring {
     pub scan_outcome_consumer: SqsScanOutcomeConsumer,
     /// `handler` con el que se debe lanzar [`Self::scan_outcome_consumer`].
     pub scan_outcome_handler: Arc<dyn ScanOutcomeHandler>,
+    /// State of `POST /api/integrations/siem/alerts`; `None` (no
+    /// `SIEM_INGEST_TOKEN`) leaves the route unmounted.
+    pub siem_ingest: Option<SiemIngest>,
 }
 
 /// Construye la composición completa de este Gateway a partir de `config`
@@ -177,6 +181,18 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         Arc::clone(&realtime),
     ));
 
+    // Without a token the SIEM ingestion route is not mounted at all.
+    let siem_ingest = config.siem_ingest_token.map(|token| {
+        if config.security_events_stream_name.is_none() {
+            tracing::warn!(
+                "SIEM_INGEST_TOKEN is set but SECURITY_EVENTS_STREAM_NAME is not: \
+                 SIEM alerts will be refused with 503"
+            );
+        }
+        tracing::info!("SIEM alert ingestion is enabled");
+        SiemIngest::with_default_limits(token, Arc::clone(&security_events))
+    });
+
     let state = AppState {
         oidc_client: Arc::new(oidc_client),
         login_states: Arc::new(LoginStateStore::new()),
@@ -203,6 +219,7 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
         state,
         scan_outcome_consumer,
         scan_outcome_handler,
+        siem_ingest,
     })
 }
 

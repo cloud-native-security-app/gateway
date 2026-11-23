@@ -1,0 +1,46 @@
+{
+  "_note": "Representative sample written from knowledge of the Wazuh alert format for Suricata eve.json events; NOT captured from a live system.",
+  "timestamp": "2026-11-09T12:31:10.456+0000",
+  "rule": {
+    "level": 3,
+    "description": "Suricata: Alert - ET SCAN Potential SSH Scan",
+    "id": "86601",
+    "firedtimes": 1,
+    "mail": false,
+    "groups": ["ids", "suricata"]
+  },
+  "agent": {
+    "id": "001",
+    "name": "lab-target",
+    "ip": "10.0.1.15"
+  },
+  "manager": {
+    "name": "wazuh-manager"
+  },
+  "id": "1731155470.234567",
+  "full_log": "{\"timestamp\":\"2026-11-09T12:31:10.456789+0000\",\"flow_id\":1234567890123456,\"in_iface\":\"eth0\",\"event_type\":\"alert\",\"src_ip\":\"203.0.113.7\",\"src_port\":45678,\"dest_ip\":\"198.51.100.4\",\"dest_port\":22,\"proto\":\"TCP\",\"alert\":{\"action\":\"allowed\",\"gid\":1,\"signature_id\":2001219,\"rev\":20,\"signature\":\"ET SCAN Potential SSH Scan\",\"category\":\"Attempted Information Leak\",\"severity\":2}}",
+  "decoder": {
+    "name": "json"
+  },
+  "data": {
+    "timestamp": "2026-11-09T12:31:10.456789+0000",
+    "flow_id": "1234567890123456",
+    "in_iface": "eth0",
+    "event_type": "alert",
+    "src_ip": "203.0.113.7",
+    "src_port": "45678",
+    "dest_ip": "198.51.100.4",
+    "dest_port": "22",
+    "proto": "TCP",
+    "alert": {
+      "action": "allowed",
+      "gid": "1",
+      "signature_id": "2001219",
+      "rev": "20",
+      "signature": "ET SCAN Potential SSH Scan",
+      "category": "Attempted Information Leak",
+      "severity": "2"
+    }
+  },
+  "location": "/var/log/suricata/eve.json"
+}

@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use gateway::security_events::SecurityEvent;
+use gateway::security_events::{SecurityEvent, SiemAlertFields};
 use jsonschema::Validator;
 use serde_json::Value;
 
@@ -69,6 +69,26 @@ fn every_gateway_constructor_validates_against_the_broker_schema() {
         SecurityEvent::ratelimit_hit("user-sub-123", "/api/scans", 10, 60),
         SecurityEvent::ratelimit_hit("user-sub-123", "/api/scans?x=1#frag", 10, 60),
         SecurityEvent::message_deadlettered("gateway-scan-outcomes", "malformed_message"),
+        SecurityEvent::siem_alert(&SiemAlertFields {
+            rule_id: "86601",
+            rule_level: 12,
+            description: "Suricata: Alert - ET SCAN Potential SSH Scan",
+            agent_id: "001",
+            agent_name: "lab-target",
+            src_ip: "203.0.113.7".parse().ok(),
+            dest_ip: "2001:db8::4".parse().ok(),
+            signature: Some("ET SCAN Potential SSH Scan"),
+        }),
+        SecurityEvent::siem_alert(&SiemAlertFields {
+            rule_id: "5710",
+            rule_level: 0,
+            description: "d",
+            agent_id: "000",
+            agent_name: "n",
+            src_ip: None,
+            dest_ip: None,
+            signature: None,
+        }),
     ];
     for event in events {
         assert_valid(

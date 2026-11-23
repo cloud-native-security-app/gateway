@@ -20,6 +20,7 @@ pub mod network_scan;
 pub mod network_target;
 pub mod realtime;
 pub mod security_events;
+pub mod siem_ingest;
 pub mod sns;
 pub mod sqs;
 pub mod usuarios_client;
@@ -107,7 +108,7 @@ pub async fn run() -> Result<(), RunError> {
             .run(built.scan_outcome_handler, shutdown.clone()),
     );
 
-    let app = api::app_router(built.state);
+    let app = api::app_router_with_siem(built.state, built.siem_ingest);
     let listener = match TcpListener::bind((http_host.as_str(), http_port)).await {
         Ok(listener) => listener,
         Err(source) => {

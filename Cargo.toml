@@ -74,6 +74,9 @@ tokio-util = "0.7"
 # (`src/security_events.rs`, feature `security_event_publisher`); ya está
 # resuelta transitivamente, se declara explícita para poder nombrarla.
 time = { version = "0.3", features = ["formatting"] }
+# Constant-time comparison of the `POST /api/integrations/siem/alerts` bearer
+# token (`src/siem_ingest.rs`). Already in the lock as a transitive dependency.
+subtle = "2.6"
 
 [dev-dependencies]
 testcontainers = "0.20"
