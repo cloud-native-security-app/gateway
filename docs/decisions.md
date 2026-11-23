@@ -293,3 +293,16 @@ que no son evidentes leyendo el código.
   `scan_id` sin evento recordado queda abierto sin emitir nada.
 - **Compatibilidad:** el shape no cambia; solo hay un valor de `status` más.
 
+## D-22 — Estado del correo del reporte en el histórico (EM-03)
+
+- **Decisión:** `GET /api/scans` añade `email_status` (`pending`, `sent`,
+  `failed`, `disabled`) y `emailed_at` (RFC 3339, solo con `sent`), derivados de
+  `report_email_status`/`report_emailed_at` de `user-service`. Los campos son
+  aditivos y se omiten cuando no aplican. No se expone el destinatario.
+- **Mapeo:** escaneo no `COMPLETADO` -> ambos ausentes. `COMPLETADO` con estado
+  `null` o ausente (envío aún no reclamado, o `user-service` anterior) ->
+  `pending`. Estado desconocido -> `pending` (nunca `sent`, nunca falla el
+  histórico: el cliente lo lee como `String`).
+- **Reporte:** `GET /api/scans/{scan_id}/report` no cambia; devuelve el
+  `ScanResult` almacenado, sin estado de correo.
+

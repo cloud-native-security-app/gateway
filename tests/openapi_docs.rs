@@ -194,3 +194,31 @@ fn admin_paths_and_schemas_match_the_pre_extraction_snapshot() {
     }
     assert_eq!(serde_json::Value::Object(schemas), expected["schemas"]);
 }
+
+/// Feature `report_email_status`: `GET /api/scans` documents the email status
+/// of a scan (`email_status` enum and nullable `emailed_at`).
+#[test]
+fn scan_history_entry_schema_documents_the_report_email_status() {
+    let spec = generated_spec_as_json();
+    let entry = &spec["components"]["schemas"]["ScanHistoryEntryResponse"];
+    assert!(
+        entry["properties"]["email_status"].is_object(),
+        "ScanHistoryEntryResponse must declare `email_status`: {entry}"
+    );
+    assert!(
+        entry["properties"]["emailed_at"].is_object(),
+        "ScanHistoryEntryResponse must declare `emailed_at`: {entry}"
+    );
+    let status = &spec["components"]["schemas"]["ReportEmailStatus"];
+    assert_eq!(
+        status["enum"],
+        serde_json::json!(["pending", "sent", "failed", "disabled"])
+    );
+    let required = entry["required"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !required
+            .iter()
+            .any(|name| name == "email_status" || name == "emailed_at"),
+        "the new fields are additive and optional: {required:?}"
+    );
+}
