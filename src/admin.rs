@@ -41,8 +41,8 @@ pub struct SiemAlert {
     pub severity: SiemSeverity,
     /// `rule.id` de Wazuh.
     pub rule_id: String,
-    /// `rule.level` de Wazuh (0..15).
-    #[schema(maximum = 15)]
+    /// `rule.level` de Wazuh (0..16).
+    #[schema(maximum = 16)]
     pub rule_level: u8,
     /// Descripción de la regla (máx. 256).
     #[schema(max_length = 256)]
@@ -67,7 +67,7 @@ pub enum SiemSeverity {
     Medium,
     /// Niveles 10-12.
     High,
-    /// Niveles 13-15.
+    /// Niveles 13-16.
     Critical,
 }
 

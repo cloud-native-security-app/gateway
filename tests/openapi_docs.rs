@@ -310,7 +310,7 @@ fn admin_schemas_document_the_siem_fields() {
     for nullable in ["src_ip", "dest_ip", "signature"] {
         assert!(props[nullable].is_object(), "SiemAlert.{nullable}");
     }
-    assert_eq!(props["rule_level"]["maximum"], 15);
+    assert_eq!(props["rule_level"]["maximum"], 16);
     assert_eq!(
         props["severity"]["$ref"],
         "#/components/schemas/SiemSeverity"

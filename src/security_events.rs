@@ -516,7 +516,7 @@ impl SecurityEvent {
 pub struct SiemAlertFields<'a> {
     /// Wazuh `rule.id` (`^[A-Za-z0-9_.-]{1,64}$`).
     pub rule_id: &'a str,
-    /// Wazuh `rule.level`, 0..=15.
+    /// Wazuh `rule.level`, 0..=16.
     pub rule_level: u8,
     /// Rule text (1..=256 characters).
     pub description: &'a str,
@@ -533,13 +533,14 @@ pub struct SiemAlertFields<'a> {
 }
 
 /// `siem.alert` severity derived from `rule_level` (D-18): 0-6 `low`, 7-9
-/// `medium`, 10-12 `high`, 13-15 `critical`; `None` outside 0..=15.
+/// `medium`, 10-12 `high`, 13-16 `critical`; `None` outside 0..=16. Wazuh
+/// reserves level 16 for custom rules.
 pub fn siem_severity(rule_level: u8) -> Option<&'static str> {
     match rule_level {
         0..=6 => Some("low"),
         7..=9 => Some("medium"),
         10..=12 => Some("high"),
-        13..=15 => Some("critical"),
+        13..=16 => Some("critical"),
         _ => None,
     }
 }
