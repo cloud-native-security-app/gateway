@@ -578,9 +578,9 @@
           "type": "string"
         },
         "rule_level": {
-          "description": "`rule.level` de Wazuh (0..15).",
+          "description": "`rule.level` de Wazuh (0..16).",
           "format": "int32",
-          "maximum": 15,
+          "maximum": 16,
           "minimum": 0,
           "type": "integer"
         },

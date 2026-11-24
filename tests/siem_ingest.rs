@@ -253,6 +253,7 @@ async fn severity_follows_the_d18_bands_at_every_edge() {
         (12, "high"),
         (13, "critical"),
         (15, "critical"),
+        (16, "critical"),
     ];
     for (level, _) in cases {
         let response = h.post_alert(&alert(json!(level))).await;
@@ -317,7 +318,7 @@ async fn invalid_alerts_are_rejected_without_publishing() {
     );
 
     let mut cases: Vec<(&str, Value)> = vec![
-        ("level 16", alert(json!(16))),
+        ("level 17", alert(json!(17))),
         ("level -1", alert(json!(-1))),
         ("level text", alert(json!("high"))),
         ("level float", alert(json!(5.5))),

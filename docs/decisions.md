@@ -329,8 +329,8 @@ que no son evidentes leyendo el código.
   `FixedWindowLimiter`, 120 per 60 s, one fixed key for the route) runs
   after authentication so unauthenticated traffic cannot use up the quota.
   Behind the ALB a per-IP key would be the balancer's address.
-- **Mapping rules:** `rule.level` must be an integer 0..15 (D-18 bands give
-  `severity`); `rule.id` may be a string or an integer; ids must match
+- **Mapping rules:** `rule.level` must be an integer 0..16 (D-18 bands give
+  `severity`; 16 accepted since RF-17); `rule.id` may be a string or an integer; ids must match
   `^[A-Za-z0-9_.-]{1,64}$`; `description`/`signature` are cut to 256 and
   `agent.name` to 128 characters (on a char boundary); IPs that do not parse
   are dropped.

@@ -183,7 +183,7 @@ async fn guard(State(ingest): State<SiemIngest>, request: Request, next: Next) -
     request_body(
         content = serde_json::Value,
         content_type = "application/json",
-        description = "One Wazuh alert object (not a batch). Used fields: rule.id, rule.level (0..15), rule.description, agent.id, agent.name, data.srcip|src_ip, data.dstip|dest_ip, data.alert.signature."
+        description = "One Wazuh alert object (not a batch). Used fields: rule.id, rule.level (0..16), rule.description, agent.id, agent.name, data.srcip|src_ip, data.dstip|dest_ip, data.alert.signature."
     ),
     responses(
         (status = 202, description = "Alert accepted and published; body is `{\"event_id\": ...}`."),
@@ -263,7 +263,7 @@ pub async fn ingest_alert(State(ingest): State<SiemIngest>, body: Bytes) -> Resp
 /// first field that is missing or invalid (never its value).
 ///
 /// - `rule.id`: string or integer; must match `^[A-Za-z0-9_.-]{1,64}$`.
-/// - `rule.level`: integer 0..=15 (severity is derived, D-18).
+/// - `rule.level`: integer 0..=16 (severity is derived, D-18).
 /// - `rule.description`, `agent.name`: text, truncated to the contract bounds.
 /// - `data.srcip` / `data.src_ip` and `data.dstip` / `data.dest_ip`: the
 ///   first value that parses as an IP; unparsable values are ignored.
@@ -279,7 +279,7 @@ pub fn map_wazuh_alert(raw: &Value) -> Result<SecurityEvent, &'static str> {
         .get("level")
         .and_then(Value::as_u64)
         .and_then(|l| u8::try_from(l).ok())
-        .filter(|l| *l <= 15)
+        .filter(|l| *l <= 16)
         .ok_or("rule.level")?;
     let description =
         text(rule.get("description"), MAX_SIEM_TEXT_CHARS).ok_or("rule.description")?;
@@ -337,11 +337,11 @@ mod tests {
 
     #[test]
     fn rule_id_may_be_a_number_and_level_is_strictly_an_integer_in_range() {
-        let event = map_wazuh_alert(&alert(json!(15))).expect("valid");
+        let event = map_wazuh_alert(&alert(json!(16))).expect("valid");
         assert_eq!(event.payload()["rule_id"], "5710");
         assert_eq!(event.partition_key(), "000");
         for bad in [
-            json!(16),
+            json!(17),
             json!(-1),
             json!("5"),
             json!(5.0),
