@@ -100,6 +100,7 @@ fn gateway_config(
         network_scan_allowed_cidrs: Vec::new(),
         network_scan_resolve_timeout_secs: 5,
         siem_ingest_token: None,
+        siem_ingest_rate_limit: 120,
     }
 }
 

@@ -189,8 +189,15 @@ pub async fn build(config: Config) -> Result<Wiring, WiringError> {
                  SIEM alerts will be refused with 503"
             );
         }
-        tracing::info!("SIEM alert ingestion is enabled");
-        SiemIngest::with_default_limits(token, Arc::clone(&security_events))
+        tracing::info!(
+            rate_limit_per_minute = config.siem_ingest_rate_limit,
+            "SIEM alert ingestion is enabled"
+        );
+        SiemIngest::with_rate_limit(
+            token,
+            Arc::clone(&security_events),
+            config.siem_ingest_rate_limit,
+        )
     });
 
     let state = AppState {

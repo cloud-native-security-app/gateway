@@ -99,17 +99,19 @@ impl SiemIngest {
         }
     }
 
-    /// Builds the route state with the default quota
-    /// ([`DEFAULT_RATE_LIMIT_MAX_REQUESTS`] per [`DEFAULT_RATE_LIMIT_WINDOW`]).
-    pub fn with_default_limits(
+    /// Builds the route state accepting `max_requests` alerts per
+    /// [`DEFAULT_RATE_LIMIT_WINDOW`] (`SIEM_INGEST_RATE_LIMIT`; the default is
+    /// [`DEFAULT_RATE_LIMIT_MAX_REQUESTS`]).
+    pub fn with_rate_limit(
         token: SecretString,
         publisher: Arc<dyn SecurityEventPublisher>,
+        max_requests: u32,
     ) -> Self {
         Self::new(
             token,
             publisher,
             Arc::new(ScanSubmissionRateLimiter::new(
-                DEFAULT_RATE_LIMIT_MAX_REQUESTS,
+                max_requests,
                 DEFAULT_RATE_LIMIT_WINDOW,
             )),
         )

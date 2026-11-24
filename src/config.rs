@@ -6,6 +6,8 @@ use std::num::ParseIntError;
 
 use secrecy::SecretString;
 
+use crate::siem_ingest::DEFAULT_RATE_LIMIT_MAX_REQUESTS;
+
 /// Nombre de la variable de entorno con el host donde escucha el servidor
 /// HTTP de este Gateway.
 const ENV_HTTP_HOST: &str = "HTTP_HOST";
@@ -92,6 +94,11 @@ const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS
 /// Bearer token of `POST /api/integrations/siem/alerts` (feature
 /// `siem_ingest`). Unset or blank leaves the route off (it answers 404).
 const ENV_SIEM_INGEST_TOKEN: &str = "SIEM_INGEST_TOKEN";
+/// Alerts accepted per [`crate::siem_ingest::DEFAULT_RATE_LIMIT_WINDOW`] by
+/// `POST /api/integrations/siem/alerts` (RF-06). Optional, default
+/// [`crate::siem_ingest::DEFAULT_RATE_LIMIT_MAX_REQUESTS`]; a positive `u32`.
+/// Read only when `SIEM_INGEST_TOKEN` is set.
+const ENV_SIEM_INGEST_RATE_LIMIT: &str = "SIEM_INGEST_RATE_LIMIT";
 const ENV_NETWORK_SCAN_ALLOWED_CIDRS: &str = "NETWORK_SCAN_ALLOWED_CIDRS";
 /// Tiempo máximo, en segundos, de la resolución DNS de un objetivo `network`
 /// dado por nombre o URL (feature `network_scan_url_target`). Opcional, por
@@ -201,6 +208,10 @@ pub struct Config {
     /// task SR-02). `None` (unset or blank) keeps the route off. Redacted in
     /// `Debug`; never logged.
     pub siem_ingest_token: Option<SecretString>,
+    /// Alerts the SIEM ingestion route accepts per minute
+    /// (`SIEM_INGEST_RATE_LIMIT`, task RF-06). Only read when
+    /// `siem_ingest_token` is set; otherwise the default.
+    pub siem_ingest_rate_limit: u32,
 }
 
 /// Errores posibles al cargar la configuración del servicio desde variables
@@ -394,6 +405,26 @@ fn parse_positive_secs(
     Ok(secs)
 }
 
+/// Parses `SIEM_INGEST_RATE_LIMIT`: unset or blank is the default; otherwise a
+/// `u32` greater than zero.
+fn parse_siem_ingest_rate_limit(raw: Option<&str>) -> Result<u32, ConfigError> {
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_RATE_LIMIT_MAX_REQUESTS);
+    };
+    let limit = value
+        .parse::<u32>()
+        .map_err(|source| ConfigError::InvalidNumber {
+            name: ENV_SIEM_INGEST_RATE_LIMIT,
+            source,
+        })?;
+    if limit == 0 {
+        return Err(ConfigError::NotPositive {
+            name: ENV_SIEM_INGEST_RATE_LIMIT,
+        });
+    }
+    Ok(limit)
+}
+
 /// Lee una variable de entorno requerida y la envuelve en [`SecretString`].
 ///
 /// Devuelve [`ConfigError::Missing`] si la variable no está definida o no es
@@ -502,6 +533,14 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(SecretString::from);
 
+        // Only validated when the route is on: a stray value must not stop a
+        // gateway that does not serve it.
+        let siem_ingest_rate_limit = if siem_ingest_token.is_some() {
+            parse_siem_ingest_rate_limit(env::var(ENV_SIEM_INGEST_RATE_LIMIT).ok().as_deref())?
+        } else {
+            DEFAULT_RATE_LIMIT_MAX_REQUESTS
+        };
+
         Ok(Self {
             http_host,
             http_port,
@@ -530,6 +569,7 @@ impl Config {
             network_scan_allowed_cidrs,
             network_scan_resolve_timeout_secs,
             siem_ingest_token,
+            siem_ingest_rate_limit,
         })
     }
 }
@@ -584,6 +624,7 @@ mod tests {
         env::remove_var(ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS);
         env::remove_var(ENV_NETWORK_SCAN_ALLOWED_CIDRS);
         env::remove_var(ENV_SIEM_INGEST_TOKEN);
+        env::remove_var(ENV_SIEM_INGEST_RATE_LIMIT);
         env::remove_var(ENV_NETWORK_SCAN_RESOLVE_TIMEOUT_SECS);
     }
 
@@ -1097,6 +1138,81 @@ mod tests {
             config.siem_ingest_token.as_ref().unwrap().expose_secret(),
             "s3cret-token"
         );
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn siem_ingest_rate_limit_defaults_to_120_when_unset_or_blank() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SIEM_INGEST_TOKEN, "s3cret-token");
+
+        assert_eq!(Config::from_env().unwrap().siem_ingest_rate_limit, 120);
+        for blank in ["", "   "] {
+            env::set_var(ENV_SIEM_INGEST_RATE_LIMIT, blank);
+            assert_eq!(Config::from_env().unwrap().siem_ingest_rate_limit, 120);
+        }
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn siem_ingest_rate_limit_accepts_a_positive_integer_and_trims_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SIEM_INGEST_TOKEN, "s3cret-token");
+
+        for (raw, expected) in [("1", 1), (" 600 ", 600), ("4294967295", u32::MAX)] {
+            env::set_var(ENV_SIEM_INGEST_RATE_LIMIT, raw);
+            assert_eq!(
+                Config::from_env().unwrap().siem_ingest_rate_limit,
+                expected,
+                "{raw:?}"
+            );
+        }
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn siem_ingest_rate_limit_rejects_invalid_values_naming_the_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SIEM_INGEST_TOKEN, "s3cret-token");
+
+        for bad in [
+            "0",
+            "-1",
+            "soon",
+            "1.5",
+            "4294967296",
+            "99999999999999999999",
+        ] {
+            env::set_var(ENV_SIEM_INGEST_RATE_LIMIT, bad);
+            let error = Config::from_env().expect_err(bad).to_string();
+            assert!(
+                error.contains("SIEM_INGEST_RATE_LIMIT"),
+                "{bad:?} debe rechazarse nombrando la variable, fue: {error}"
+            );
+        }
+
+        clear_all_vars();
+    }
+
+    #[test]
+    fn siem_ingest_rate_limit_is_only_validated_when_the_route_is_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_all_vars();
+        set_all_valid_vars();
+        env::set_var(ENV_SIEM_INGEST_RATE_LIMIT, "soon");
+
+        let config = Config::from_env().expect("sin token la ruta está apagada");
+        assert!(config.siem_ingest_token.is_none());
+        assert_eq!(config.siem_ingest_rate_limit, 120);
 
         clear_all_vars();
     }
