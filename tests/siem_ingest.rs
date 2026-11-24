@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gateway::api::ScanSubmissionRateLimiter;
+use gateway::api::FixedWindowLimiter;
 use gateway::domain::Role;
 use gateway::security_events::{
     EventSource, EventType, NoopSecurityEventPublisher, RecordingSecurityEventPublisher,
@@ -71,8 +71,8 @@ async fn serve(ingest: SiemIngest) -> SocketAddr {
     addr
 }
 
-fn limiter(max: u32) -> Arc<ScanSubmissionRateLimiter> {
-    Arc::new(ScanSubmissionRateLimiter::new(max, Duration::from_secs(60)))
+fn limiter(max: u32) -> Arc<FixedWindowLimiter> {
+    Arc::new(FixedWindowLimiter::new(max, Duration::from_secs(60)))
 }
 
 async fn harness_with_limit(max: u32) -> Harness {
@@ -411,6 +411,35 @@ async fn rate_limit_answers_429_after_the_quota_and_only_authenticated_calls_cou
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(limited.headers().contains_key("retry-after"));
     assert_eq!(h.published().len(), 2);
+}
+
+#[tokio::test]
+async fn a_configured_rate_limit_is_honored_and_the_default_is_120_per_minute() {
+    assert_eq!(gateway::siem_ingest::DEFAULT_RATE_LIMIT_MAX_REQUESTS, 120);
+    assert_eq!(
+        gateway::siem_ingest::DEFAULT_RATE_LIMIT_WINDOW,
+        Duration::from_secs(60)
+    );
+
+    let events = Arc::new(RecordingSecurityEventPublisher::new());
+    let ingest =
+        SiemIngest::with_rate_limit(SecretString::from(TOKEN.to_string()), events.clone(), 3);
+    let h = Harness {
+        addr: serve(ingest).await,
+        events,
+    };
+
+    for _ in 0..3 {
+        assert_eq!(
+            h.post(Some(TOKEN), SSHD_FIXTURE).await.status(),
+            StatusCode::ACCEPTED
+        );
+    }
+    assert_eq!(
+        h.post(Some(TOKEN), SSHD_FIXTURE).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(h.published().len(), 3);
 }
 
 // --------------------------------------------------------------- publish

@@ -18,7 +18,7 @@ use axum::http::HeaderValue;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use gateway::admin::AdminFeed;
-use gateway::api::{app_router, AppState, ScanOwnershipRegistry, ScanSubmissionRateLimiter};
+use gateway::api::{app_router, AppState, FixedWindowLimiter, ScanOwnershipRegistry};
 use gateway::auth::{issue_session_token, LoginStateStore, OidcClient, SESSION_COOKIE_NAME};
 use gateway::broker::{BrokerError, ScanCancellation, ScanRequest, ScanRequestPublisher};
 use gateway::domain::{Role, Session};
@@ -259,10 +259,7 @@ async fn spawn_gateway_with_events(
         broker_publisher,
         scan_ownership: Arc::new(ScanOwnershipRegistry::new()),
         realtime: Arc::new(RealtimeRegistry::new()),
-        scan_submission_rate_limiter: Arc::new(ScanSubmissionRateLimiter::new(
-            max_requests,
-            window,
-        )),
+        scan_submission_rate_limiter: Arc::new(FixedWindowLimiter::new(max_requests, window)),
         security_events,
         admin_feed: Arc::new(AdminFeed::default()),
         network_scan_policy: Arc::new(gateway::network_scan::NetworkScanPolicy::unrestricted()),
