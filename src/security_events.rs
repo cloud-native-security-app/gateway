@@ -1003,6 +1003,8 @@ mod tests {
         steps: Mutex<std::collections::VecDeque<Step>>,
         attempts: Mutex<u32>,
         published: Mutex<Vec<String>>,
+        /// `event_id` of every attempt, published or not.
+        seen: Mutex<Vec<String>>,
     }
 
     impl Scripted {
@@ -1011,6 +1013,7 @@ mod tests {
                 steps: Mutex::new(steps.iter().copied().collect()),
                 attempts: Mutex::new(0),
                 published: Mutex::new(Vec::new()),
+                seen: Mutex::new(Vec::new()),
             })
         }
         fn attempts(&self) -> u32 {
@@ -1019,12 +1022,16 @@ mod tests {
         fn published(&self) -> Vec<String> {
             self.published.lock().unwrap().clone()
         }
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl SecurityEventPublisher for Scripted {
         async fn publish(&self, event: &SecurityEvent) -> Result<(), SecurityEventError> {
             *self.attempts.lock().unwrap() += 1;
+            self.seen.lock().unwrap().push(event.event_id().to_string());
             let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Fail);
             match step {
                 Step::Ok => {
@@ -1053,6 +1060,29 @@ mod tests {
         let event = SecurityEvent::auth_login("a").unwrap();
         assert!(publish_with_retry(publisher.as_ref(), &event, &max_jitter_policy()).await);
         assert_eq!(publisher.attempts(), 2);
+        assert_eq!(publisher.published(), [event.event_id()]);
+    }
+
+    /// A retried `siem.alert` keeps one `event_id` across attempts, so a hung
+    /// attempt that still lands and its retry can be deduplicated downstream
+    /// (RF-04, RF-05).
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_siem_alert_keeps_one_event_id_across_attempts() {
+        let publisher = Scripted::new(&[Step::Hang, Step::Fail, Step::Ok]);
+        let event = SecurityEvent::siem_alert(&SiemAlertFields {
+            rule_id: "86601",
+            rule_level: 10,
+            description: "Suricata: Alert - ET SCAN Nmap",
+            agent_id: "001",
+            agent_name: "target-1",
+            src_ip: None,
+            dest_ip: None,
+            signature: Some("ET SCAN Nmap"),
+        })
+        .unwrap();
+        assert!(publish_with_retry(publisher.as_ref(), &event, &max_jitter_policy()).await);
+        assert_eq!(publisher.attempts(), 3);
+        assert_eq!(publisher.seen(), vec![event.event_id().to_string(); 3]);
         assert_eq!(publisher.published(), [event.event_id()]);
     }
 
