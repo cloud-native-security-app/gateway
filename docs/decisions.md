@@ -326,7 +326,7 @@ que no son evidentes leyendo el código.
 - **Order of checks:** token (`401`) -> rate limit (`429`, `Retry-After`) ->
   body size (`413`, 64 KiB) -> JSON (`400`) -> alert shape (`422`, names the
   field, never the value) -> publish. The limiter (the existing fixed-window
-  `ScanSubmissionRateLimiter`, 120 per 60 s, one fixed key for the route) runs
+  `FixedWindowLimiter`, 120 per 60 s, one fixed key for the route) runs
   after authentication so unauthenticated traffic cannot use up the quota.
   Behind the ALB a per-IP key would be the balancer's address.
 - **Mapping rules:** `rule.level` must be an integer 0..15 (D-18 bands give

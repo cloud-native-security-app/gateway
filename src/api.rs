@@ -8,7 +8,7 @@
 //! protegidas por el middleware de sesión de
 //! [`crate::auth::require_session`]. `POST
 //! /api/scans` lleva además un rate limiter por usuario (feature
-//! `rate_limiting`, ver [`ScanSubmissionRateLimiter`]). Cada handler lleva
+//! `rate_limiting`, ver [`FixedWindowLimiter`]). Cada handler lleva
 //! además su anotación `#[utoipa::path(...)]` (feature `openapi_docs`,
 //! RNF-08): [`ApiDoc`] las agrega en la especificación que sirve `GET
 //! /api/openapi.json` (ver [`openapi_router`]), generada desde el propio
@@ -226,7 +226,7 @@ impl Default for ScanOwnershipRegistry {
 }
 
 /// Contador de ventana fija de un único usuario, usado por
-/// [`ScanSubmissionRateLimiter`].
+/// [`FixedWindowLimiter`].
 struct RateLimitWindow {
     /// Momento en que empezó la ventana actualmente en curso.
     started_at: Instant,
@@ -234,8 +234,9 @@ struct RateLimitWindow {
     count: u32,
 }
 
-/// Limitador de tasa en memoria de `POST /api/scans` (RF-12, feature
-/// `rate_limiting`): ventana fija de `window` por usuario, con la identidad
+/// Limitador de tasa en memoria de ventana fija, genérico por clave. Lo usan
+/// `POST /api/scans` (RF-12, feature `rate_limiting`, clave = sesión) y la
+/// ruta de ingesta SIEM (clave fija). Ventana fija de `window` por usuario, con la identidad
 /// de la sesión (`sub`) como clave — nunca la IP del cliente, que puede
 /// compartirse tras un NAT/proxy (ver `docs/security-scope.md`
 /// §"Rate limiting y superficie pública").
@@ -252,13 +253,13 @@ struct RateLimitWindow {
 /// memoria, no compartido entre instancias de Gateway, no sobrevive un
 /// reinicio) — a discutir un store compartido si Gateway llega a
 /// desplegarse con más de una instancia.
-pub struct ScanSubmissionRateLimiter {
+pub struct FixedWindowLimiter {
     max_requests: u32,
     window: Duration,
     entries: Mutex<HashMap<String, RateLimitWindow>>,
 }
 
-impl ScanSubmissionRateLimiter {
+impl FixedWindowLimiter {
     /// Crea un limitador que permite como máximo `max_requests` solicitudes
     /// por usuario dentro de cada `window`.
     pub fn new(max_requests: u32, window: Duration) -> Self {
@@ -373,7 +374,7 @@ async fn rate_limit_scan_submission(
 /// publicador de eventos de seguridad (feature `security_event_publisher`).
 #[derive(Clone)]
 struct RateLimitLayerState {
-    limiter: Arc<ScanSubmissionRateLimiter>,
+    limiter: Arc<FixedWindowLimiter>,
     security_events: Arc<dyn SecurityEventPublisher>,
 }
 
@@ -422,8 +423,8 @@ pub struct AppState {
     /// `scan_outcome_relay`, ver [`crate::realtime::RealtimeRegistry`]).
     pub realtime: Arc<RealtimeRegistry>,
     /// Limitador de tasa por usuario aplicado a `POST /api/scans` (RF-12,
-    /// feature `rate_limiting`, ver [`ScanSubmissionRateLimiter`]).
-    pub scan_submission_rate_limiter: Arc<ScanSubmissionRateLimiter>,
+    /// feature `rate_limiting`, ver [`FixedWindowLimiter`]).
+    pub scan_submission_rate_limiter: Arc<FixedWindowLimiter>,
     /// Publicador de eventos de seguridad hacia Kinesis (feature
     /// `security_event_publisher`, ver [`crate::security_events`]). Los
     /// handlers lo usan solo a través de [`crate::security_events::emit`]:
@@ -2200,7 +2201,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_allows_requests_up_to_the_threshold() {
-        let limiter = ScanSubmissionRateLimiter::new(3, Duration::from_secs(60));
+        let limiter = FixedWindowLimiter::new(3, Duration::from_secs(60));
 
         assert!(limiter.check_and_record("user-a"));
         assert!(limiter.check_and_record("user-a"));
@@ -2209,7 +2210,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_rejects_requests_beyond_the_threshold() {
-        let limiter = ScanSubmissionRateLimiter::new(2, Duration::from_secs(60));
+        let limiter = FixedWindowLimiter::new(2, Duration::from_secs(60));
 
         assert!(limiter.check_and_record("user-a"));
         assert!(limiter.check_and_record("user-a"));
@@ -2221,7 +2222,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_keeps_independent_counters_per_user() {
-        let limiter = ScanSubmissionRateLimiter::new(1, Duration::from_secs(60));
+        let limiter = FixedWindowLimiter::new(1, Duration::from_secs(60));
 
         assert!(limiter.check_and_record("user-a"));
         assert!(
@@ -2236,7 +2237,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_resets_after_the_window_elapses() {
-        let limiter = ScanSubmissionRateLimiter::new(1, Duration::from_millis(20));
+        let limiter = FixedWindowLimiter::new(1, Duration::from_millis(20));
 
         assert!(limiter.check_and_record("user-a"));
         assert!(!limiter.check_and_record("user-a"));

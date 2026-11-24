@@ -88,17 +88,18 @@ const ENV_SECURITY_EVENTS_STREAM_NAME: &str = "SECURITY_EVENTS_STREAM_NAME";
 /// `admin_realtime_feed`). Opcional, por defecto
 /// [`DEFAULT_ADMIN_EVENTS_ROLE_RECHECK_SECS`]; debe ser mayor que cero.
 const ENV_ADMIN_EVENTS_ROLE_RECHECK_SECS: &str = "ADMIN_EVENTS_ROLE_RECHECK_SECS";
-/// Allowlist opcional de CIDR (separados por coma) para el modo `network` de
-/// `POST /api/scans` (feature `network_scan_mode`). Vacía o ausente = cualquier
-/// objetivo que pase la denylist fija de [`crate::network_scan`].
 /// Bearer token of `POST /api/integrations/siem/alerts` (feature
-/// `siem_ingest`). Unset or blank leaves the route off (it answers 404).
+/// `siem_ingest`). Unset or blank leaves the route off: it is not mounted and
+/// answers like any unknown path.
 const ENV_SIEM_INGEST_TOKEN: &str = "SIEM_INGEST_TOKEN";
 /// Alerts accepted per [`crate::siem_ingest::DEFAULT_RATE_LIMIT_WINDOW`] by
 /// `POST /api/integrations/siem/alerts` (RF-06). Optional, default
 /// [`crate::siem_ingest::DEFAULT_RATE_LIMIT_MAX_REQUESTS`]; a positive `u32`.
 /// Read only when `SIEM_INGEST_TOKEN` is set.
 const ENV_SIEM_INGEST_RATE_LIMIT: &str = "SIEM_INGEST_RATE_LIMIT";
+/// Allowlist opcional de CIDR (separados por coma) para el modo `network` de
+/// `POST /api/scans` (feature `network_scan_mode`). Vacía o ausente = cualquier
+/// objetivo que pase la denylist fija de [`crate::network_scan`].
 const ENV_NETWORK_SCAN_ALLOWED_CIDRS: &str = "NETWORK_SCAN_ALLOWED_CIDRS";
 /// Tiempo máximo, en segundos, de la resolución DNS de un objetivo `network`
 /// dado por nombre o URL (feature `network_scan_url_target`). Opcional, por

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gateway::api::ScanSubmissionRateLimiter;
+use gateway::api::FixedWindowLimiter;
 use gateway::domain::Role;
 use gateway::security_events::{
     EventSource, EventType, NoopSecurityEventPublisher, RecordingSecurityEventPublisher,
@@ -71,8 +71,8 @@ async fn serve(ingest: SiemIngest) -> SocketAddr {
     addr
 }
 
-fn limiter(max: u32) -> Arc<ScanSubmissionRateLimiter> {
-    Arc::new(ScanSubmissionRateLimiter::new(max, Duration::from_secs(60)))
+fn limiter(max: u32) -> Arc<FixedWindowLimiter> {
+    Arc::new(FixedWindowLimiter::new(max, Duration::from_secs(60)))
 }
 
 async fn harness_with_limit(max: u32) -> Harness {

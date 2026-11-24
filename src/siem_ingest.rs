@@ -43,7 +43,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 
-use crate::api::ScanSubmissionRateLimiter;
+use crate::api::FixedWindowLimiter;
 use crate::security_events::{
     publish_with_retry, RetryPolicy, SecurityEvent, SecurityEventPublisher, SiemAlertFields,
     MAX_SIEM_AGENT_NAME_CHARS, MAX_SIEM_TEXT_CHARS, PUBLISH_TIMEOUT,
@@ -68,7 +68,7 @@ const RATE_LIMIT_KEY: &str = "siem-ingest";
 pub struct SiemIngest {
     token: Arc<SecretString>,
     publisher: Arc<dyn SecurityEventPublisher>,
-    limiter: Arc<ScanSubmissionRateLimiter>,
+    limiter: Arc<FixedWindowLimiter>,
     retry: RetryPolicy,
 }
 
@@ -89,7 +89,7 @@ impl SiemIngest {
     pub fn new(
         token: SecretString,
         publisher: Arc<dyn SecurityEventPublisher>,
-        limiter: Arc<ScanSubmissionRateLimiter>,
+        limiter: Arc<FixedWindowLimiter>,
     ) -> Self {
         Self {
             token: Arc::new(token),
@@ -110,7 +110,7 @@ impl SiemIngest {
         Self::new(
             token,
             publisher,
-            Arc::new(ScanSubmissionRateLimiter::new(
+            Arc::new(FixedWindowLimiter::new(
                 max_requests,
                 DEFAULT_RATE_LIMIT_WINDOW,
             )),
