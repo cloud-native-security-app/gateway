@@ -86,10 +86,12 @@ jobs:
           base_arn="$(jq -r '.taskDefinitionArn' task-definition.raw.json)"
           echo "Service runs: $task_def_arn"
           echo "Deploy base:  $base_arn"
-          # A manual rollback to an older revision does not stick: Terraform owns the
-          # revision, so roll back through Terraform (infra terraform/README.md).
+          # A different base is expected after a Terraform apply (a new revision the
+          # service does not run yet, or the service moved back to Terraform's revision
+          # after an earlier CI deploy). A manual rollback to an older revision also
+          # shows up here and does not stick: roll back through Terraform instead.
           if [ "$base_arn" != "$task_def_arn" ]; then
-            echo "::warning::The service runs $task_def_arn but this deploy copies the newer $base_arn. If the service was rolled back by hand, roll back through Terraform instead (infra terraform/README.md, Task definition ownership)."
+            echo "::notice::This deploy copies $base_arn, not the running $task_def_arn. Expected after a Terraform apply; if the service was rolled back by hand, roll back through Terraform instead (infra terraform/README.md, Task definition ownership)."
           fi
           # Drop read-only fields that RegisterTaskDefinition rejects.
           jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
