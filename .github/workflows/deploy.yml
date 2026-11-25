@@ -77,8 +77,20 @@ jobs:
           # resolves to its latest ACTIVE revision.
           family="${task_def_arn##*/}"
           family="${family%:*}"
+          if [ -z "$family" ]; then
+            echo "::error::Cannot read the task definition family from $task_def_arn"
+            exit 1
+          fi
           aws ecs describe-task-definition --task-definition "$family" \
             --query taskDefinition > task-definition.raw.json
+          base_arn="$(jq -r '.taskDefinitionArn' task-definition.raw.json)"
+          echo "Service runs: $task_def_arn"
+          echo "Deploy base:  $base_arn"
+          # A manual rollback to an older revision does not stick: Terraform owns the
+          # revision, so roll back through Terraform (infra terraform/README.md).
+          if [ "$base_arn" != "$task_def_arn" ]; then
+            echo "::warning::The service runs $task_def_arn but this deploy copies the newer $base_arn. If the service was rolled back by hand, roll back through Terraform instead (infra terraform/README.md, Task definition ownership)."
+          fi
           # Drop read-only fields that RegisterTaskDefinition rejects.
           jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
             task-definition.raw.json > task-definition.json
